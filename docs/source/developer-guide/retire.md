@@ -1,15 +1,16 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# RETIRE: request version identity
+# RETIRE: execution versions and authority
 
 RETIRE lets a runtime replace work when its context changes. The runtime decides
 what to replace and supplies the revised input. TRT-LLM will use that decision to
 stop obsolete work and safely hand useful KV to the replacement.
 
-The first step adds **metadata only** to the Python LLM and executor APIs.
-Supplying a version does not cancel requests, select an active version, change
-scheduling, protect KV, or affect cache matching.
+The Python LLM and executor APIs carry version metadata. A separate host-side
+`ScopeRegistry` records which version is current and accepts revisions from the
+runtime. It is not wired into request execution yet: supplying a version or
+advancing the registry does not stop work, block output, or protect KV.
 
 ## Identity
 
@@ -25,8 +26,8 @@ same execution version. The tag does not authenticate a tenant or establish that
 a version is current.
 
 `StateTag(version, generation)` additionally identifies an allocation generation.
-Generation belongs to the resource owner and is independent of epoch. This step
-defines the type; it does not attach state tags to KV allocations yet. A state
+Generation belongs to the resource owner and is independent of epoch. The type
+is defined, but it is not attached to KV allocations yet. A state
 tag is neither a memory hold nor proof of safe reuse.
 
 Both types are immutable and support Python pickle serialization. Tenant and
@@ -76,8 +77,72 @@ Native request serialization does not include dynamic Python attributes, so
 worker broadcast explicitly carries the tag in its existing Python metadata
 payload. This is not a new C++ wire field or an HTTP/gRPC protocol field.
 
-## Next step
+## Accepting a revision
 
-Add a scope authority that accepts a revision only against the current version.
-Mailbox publication, stale-work checks, fencing, KV alignment, resume, and
-reclamation follow in separate review steps.
+The runtime decides when context has changed and which work to replace. RETIRE
+checks that the runtime is replacing the current version. For example, if epoch
+7 is current, a revision expecting 7 can advance it to 8. If another revision
+already advanced it to 8, a competing revision still expecting 7 is rejected.
+The runtime then decides whether its change still applies to the newer context;
+it should not simply relabel an old revision with a newer expected epoch.
+
+`ScopeRegistry` provides this check and update under one lock. It keeps separate
+records for each `(tenant_id, scope_id)`. Cache salt and allocation generation
+are not part of this lookup.
+
+```python
+from tensorrt_llm.execution_authority import Revision, ScopeRegistry
+from tensorrt_llm.execution_version import ExecutionVersion
+
+authority = ScopeRegistry()
+old = ExecutionVersion("app", "task-42", 7)
+new = ExecutionVersion("app", "task-42", 8)
+authority.register(old)
+
+# The runtime keeps this ID when retrying the same revision.
+revision = Revision("edit-123", expected_version=old, successor_version=new)
+receipt = authority.advance(revision)
+
+assert authority.is_current(new)
+assert not authority.is_current(old)
+assert authority.snapshot("app", "task-42").pending_revision == revision
+assert authority.advance(revision) == receipt  # Retry: no second advance.
+```
+
+Registration creates a scope at the runtime's chosen initial epoch. Repeating
+registration at the current version is harmless; registering a different
+version for an existing scope fails. Revisions must advance exactly one epoch
+within the same tenant and scope. Unknown scopes fail instead of being created
+by a revision.
+
+`revision_id` identifies one runtime revision within a tenant and scope. It is
+separate from request IDs and execution versions. Retrying the same descriptor
+returns its original receipt, even if the scope has since advanced again. That
+historical receipt does not make its version current again. Reusing the ID for
+a different transition fails. A different ID claiming the same old version is
+a competing revision, not a retry.
+
+The descriptor currently contains version metadata only. Its pending successor
+is a record of the latest accepted revision, not a runnable request. Revised
+input and the KV inheritance contract will be added with ALIGN. The runtime
+must keep a revision ID bound to the same revision; this metadata layer cannot
+compare input that has not been supplied to it.
+
+The registry is an in-memory object in one process. The runtime must route all
+revisions for a scope through the same instance. Creating separate registries
+on each worker would not provide one authority. Records and retry receipts are
+retained for the registry's lifetime, so metadata grows with scopes and accepted
+revisions. Scope deletion, retry-history cleanup, and recovery after restart are
+not implemented yet; do not reset a registry while its versions are in use.
+
+An accepted revision changes logical authority only. Its receipt is not proof
+that workers saw the update, old work stopped, or KV is safe. Likewise,
+`is_current` and `snapshot` are observations that can become stale immediately;
+a check followed by a later launch or output is not an atomic authority gate.
+
+## Next steps
+
+The mailbox will publish accepted versions to workers. Later steps will check
+authority where work and output are admitted, establish FENCE, align the
+successor's KV, resume it, and reclaim old resources. RESUME will keep authority
+checks active so another revision can supersede the new work too.
