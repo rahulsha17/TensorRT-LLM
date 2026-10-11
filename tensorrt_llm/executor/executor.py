@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import faulthandler
 import json
@@ -23,6 +26,7 @@ from tensorrt_llm.logger import logger, set_level
 from .._utils import mpi_world_size
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
+from ..execution_version import ExecutionVersion
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
@@ -141,6 +145,7 @@ class GenerationExecutor(ABC):
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        execution_version: Optional[ExecutionVersion] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -170,7 +175,8 @@ class GenerationExecutor(ABC):
             cache_salt=cache_salt,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
-            priority=priority)
+            priority=priority,
+            execution_version=execution_version)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):
@@ -187,6 +193,8 @@ class GenerationExecutor(ABC):
         disaggregated_params: Optional[DisaggregatedParams] = None,
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
+        execution_version: Optional[Union[
+            ExecutionVersion, List[Optional[ExecutionVersion]]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -195,6 +203,12 @@ class GenerationExecutor(ABC):
 
         if unbatched:
             prompt_token_ids = [prompt_token_ids]
+
+        if isinstance(execution_version,
+                      list) and len(execution_version) != len(prompt_token_ids):
+            raise ValueError(
+                "execution_version list length must match the number of prompts"
+            )
 
         futures = []
         for i, p in enumerate(prompt_token_ids):
@@ -219,7 +233,9 @@ class GenerationExecutor(ABC):
                 streaming=False,
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,
-                cache_salt=cs)
+                cache_salt=cs,
+                execution_version=execution_version[i] if isinstance(
+                    execution_version, list) else execution_version)
             futures.append(future)
 
         for future in futures:

@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
+from ..execution_version import ExecutionVersion
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..logger import logger
@@ -1118,6 +1119,16 @@ class GenerationResult(GenerationResultBase):
     @property
     def request_id(self) -> int:
         return self._generation_request.id
+
+    @property
+    def execution_version(self) -> Optional[ExecutionVersion]:
+        """Optional[tensorrt_llm.execution_version.ExecutionVersion]: Runtime-supplied identity for this result."""
+        return self._generation_request.execution_version
+
+    @property
+    def cache_salt(self) -> Optional[str]:
+        """Optional[str]: Cache namespace supplied with this request's version."""
+        return self._generation_request.cache_salt
 
     @property
     def prompt_token_ids(self) -> List[int]:

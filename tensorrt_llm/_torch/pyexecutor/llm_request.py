@@ -15,6 +15,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
+from tensorrt_llm.execution_version import ExecutionVersion
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
@@ -922,7 +923,13 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
+            execution_version: Optional[ExecutionVersion] = None,
             **kwargs):
+        if execution_version is not None and not isinstance(
+                execution_version, ExecutionVersion):
+            raise TypeError(
+                "execution_version must be an ExecutionVersion or None")
+        self.py_execution_version = execution_version
         self.py_sampling_strategy: "Strategy | None" = None
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -1652,6 +1659,8 @@ def executor_request_to_llm_request(
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
+        execution_version=getattr(executor_request, "py_execution_version",
+                                  None),
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=py_multimodal_data,
         py_mm_item_order=getattr(executor_request, "py_mm_item_order", None),

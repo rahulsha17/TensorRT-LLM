@@ -33,6 +33,14 @@ methods:
         default: None
     return_annotation: None
 properties:
+  cache_salt:
+    annotation: Optional[str]
+    default: inspect._empty
+    status: prototype
+  execution_version:
+    annotation: Optional[tensorrt_llm.execution_version.ExecutionVersion]
+    default: inspect._empty
+    status: prototype
   error:
     annotation: Optional[str]
     default: inspect._empty

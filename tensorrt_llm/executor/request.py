@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -10,6 +13,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
+from ..execution_version import ExecutionVersion
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -113,7 +117,13 @@ class GenerationRequest:
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        execution_version: Optional[ExecutionVersion] = None,
     ):
+        if execution_version is not None and not isinstance(
+                execution_version, ExecutionVersion):
+            raise TypeError(
+                "execution_version must be an ExecutionVersion or None")
+        self._execution_version = execution_version
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
@@ -172,6 +182,11 @@ class GenerationRequest:
             raise ValueError(
                 f"priority must be a float in [0.0, 1.0], got {priority}")
         self.priority = priority
+
+    @property
+    def execution_version(self) -> Optional[ExecutionVersion]:
+        """Runtime-supplied identity, independent of the request ID and cache salt."""
+        return self._execution_version
 
     @staticmethod
     def _normalize_optional_token_ids(token_ids: Optional[Union[torch.Tensor,
@@ -251,6 +266,7 @@ class GenerationRequest:
         return state
 
     def __setstate__(self, state):
+        state.setdefault("_execution_version", None)
         buf = None
         pt = state.get("_prompt_token_ids")
         if type(pt) is tuple and len(

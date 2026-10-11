@@ -401,6 +401,10 @@ methods:
         annotation: Union[float, List[float]]
         default: 0.5
         status: prototype
+      execution_version:
+        annotation: Union[tensorrt_llm.execution_version.ExecutionVersion, Sequence[Optional[tensorrt_llm.execution_version.ExecutionVersion]], NoneType]
+        default: null
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -427,6 +431,10 @@ methods:
       priority:
         annotation: float
         default: 0.5
+        status: prototype
+      execution_version:
+        annotation: Optional[tensorrt_llm.execution_version.ExecutionVersion]
+        default: null
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   encode:

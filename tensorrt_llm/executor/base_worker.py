@@ -508,6 +508,7 @@ class BaseWorker(GenerationExecutor):
                 cache_salt=request.cache_salt,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
+            executor_request.py_execution_version = request.execution_version
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode

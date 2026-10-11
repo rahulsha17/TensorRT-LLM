@@ -41,6 +41,7 @@ from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
+from ..execution_version import ExecutionVersion
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
                         PostprocWorkerConfig, PromptAdapterRequest)
@@ -74,6 +75,8 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     Attributes:
         request_id (int): The unique ID of the request.
+        execution_version (tensorrt_llm.execution_version.ExecutionVersion, optional): Runtime-supplied version identity for the request.
+        cache_salt (str, optional): Cache namespace supplied with this request's version.
         prompt (str, optional): The prompt string of the request.
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
@@ -694,6 +697,8 @@ class BaseLLM:
                                             List[ConversationParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
         priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
+        execution_version: Optional[Union[
+            ExecutionVersion, Sequence[Optional[ExecutionVersion]]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -718,6 +723,7 @@ class BaseLLM:
                 Conversation parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            execution_version (tensorrt_llm.execution_version.ExecutionVersion, Sequence[Optional[tensorrt_llm.execution_version.ExecutionVersion]], optional): Runtime-supplied version identity for each request. Metadata only; does not enforce authority. Defaults to None.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.
@@ -734,6 +740,12 @@ class BaseLLM:
             request_inputs_list = [None]
         else:
             request_inputs_list = [prompt_inputs(i) for i in inputs]
+
+        if isinstance(execution_version, Sequence) and len(
+                execution_version) != len(request_inputs_list):
+            raise ValueError(
+                "execution_version sequence length must match the number of prompts"
+            )
 
         if isinstance(priority, list):
             if len(priority) != len(request_inputs_list):
@@ -763,6 +775,8 @@ class BaseLLM:
                 conversation_params=self._item_at(conversation_params, i),
                 cache_salt=self._item_at(cache_salt, i),
                 priority=self._item_at(priority, i),
+                execution_version=execution_version[i] if isinstance(
+                    execution_version, Sequence) else execution_version,
                 streaming=False,
             )
             futures.append(future)
@@ -794,6 +808,7 @@ class BaseLLM:
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        execution_version: Optional[ExecutionVersion] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -812,6 +827,7 @@ class BaseLLM:
             conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            execution_version (tensorrt_llm.execution_version.ExecutionVersion, optional): Runtime-supplied version identity for this request. Metadata only; does not enforce authority. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
@@ -884,6 +900,7 @@ class BaseLLM:
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
+            execution_version=execution_version,
         )
 
         if sampling_params.return_perf_metrics:
