@@ -16,6 +16,7 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from ..execution_mailbox import WorkerVersionTable
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -51,6 +52,12 @@ _MEGA_MOE_DEEPGEMM_MODULE = (
 
 class GenerationExecutorWorker(WorkerExecutionControlMixin, RpcWorkerMixin,
                                BaseWorker):
+
+    def _create_execution_version_table(self,
+                                        session_id: str) -> WorkerVersionTable:
+        table = WorkerVersionTable(session_id)
+        self.engine.configure_execution_authority(table)
+        return table
 
     def __init__(
         self,

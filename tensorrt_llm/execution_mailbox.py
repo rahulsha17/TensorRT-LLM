@@ -2,16 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Publish accepted execution versions without granting execution or reuse rights."""
 
+from collections.abc import Iterator
 from concurrent.futures import Future
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from queue import Queue
 from threading import Event, Lock, Thread
 from typing import Protocol
 
 from .execution_authority import AdvanceReceipt, Revision, ScopeRegistry, ScopeSnapshot
+from .execution_gate import ExecutionAuthorityError, HostExecution, HostExecutionGate
 from .execution_version import ExecutionVersion
 
 __all__ = [
+    "DeviceVersionPublisher",
     "ExecutionController",
     "LocalPublicationTransport",
     "PublicationReceipt",
@@ -103,6 +107,12 @@ class RevisionPublication:
     publication: VersionPublication
 
 
+class DeviceVersionPublisher(Protocol):
+    """Queue a device update without waiting for model execution."""
+
+    def publish(self, version: ExecutionVersion) -> None: ...
+
+
 class WorkerVersionTable:
     """Store one owner's versions; readers cannot choose or advance authority.
 
@@ -117,6 +127,24 @@ class WorkerVersionTable:
         self._lock = Lock()
         self._versions: dict[tuple[str, str], VersionUpdate] = {}
         self._closed = False
+        self._gate = HostExecutionGate(self._lock, self._current_version_locked)
+        self._device_publisher: DeviceVersionPublisher | None = None
+        self._publication_error: Exception | None = None
+
+    def bind_device_publisher(self, publisher: DeviceVersionPublisher) -> None:
+        """Bind the engine's device table before any authority is published."""
+        with self._lock:
+            self._require_open()
+            if self._versions or self._device_publisher is not None:
+                raise RuntimeError("device publication must be bound before registration")
+            self._device_publisher = publisher
+
+    @contextmanager
+    def guard_versions(self, versions: list[ExecutionVersion | None]) -> Iterator[list[bool]]:
+        """Order short host state commits with mailbox updates; never wait for CUDA here."""
+        with self._lock:
+            self._require_open()
+            yield [v is None or self._current_version_locked(v) == v for v in versions]
 
     @property
     def session_id(self) -> str:
@@ -143,7 +171,23 @@ class WorkerVersionTable:
                 if update.version.epoch < previous.version.epoch:
                     raise ValueError("newer publication sequence would rewind authority")
             self._versions[key] = update
+            self._gate.revoke_locked(update.version)
+            if self._device_publisher is not None:
+                try:
+                    self._device_publisher.publish(update.version)
+                except Exception as error:
+                    self._publication_error = error
+                    self._gate.close_locked()
+                    raise
             return PublicationReceipt(update, update.version)
+
+    def _current_version_locked(self, version: ExecutionVersion) -> ExecutionVersion | None:
+        update = self._versions.get((version.tenant_id, version.scope_id))
+        return None if update is None else update.version
+
+    def admission(self, version: ExecutionVersion) -> AbstractContextManager[HostExecution]:
+        """Order worker enqueue with mailbox updates; this does not fence GPU work."""
+        return self._gate.admission(version)
 
     def current_version(self, tenant_id: str, scope_id: str) -> ExecutionVersion | None:
         """Observe a worker's version at this instant; unknown scopes return None."""
@@ -156,10 +200,15 @@ class WorkerVersionTable:
         """Invalidate observations when the worker stops."""
         with self._lock:
             self._closed = True
+            self._gate.close_locked()
 
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("worker version table is closed")
+        if self._publication_error is not None:
+            raise RuntimeError(
+                "device authority publication failed; restart required"
+            ) from self._publication_error
 
 
 class PublicationTransport(Protocol):
@@ -216,6 +265,7 @@ class ExecutionController:
         self._max_pending = max_pending
         self._registry = ScopeRegistry()
         self._lock = Lock()
+        self._gate = HostExecutionGate(self._lock, self._current_version_locked)
         self._stop = Event()
         self._sequence = 0
         self._latest: dict[tuple[str, str], VersionPublication] = {}
@@ -238,7 +288,26 @@ class ExecutionController:
             receipt = self._registry.advance(revision)
             expected = revision.expected_version
             current = self._registry.snapshot(expected.tenant_id, expected.scope_id).current_version
+            self._gate.revoke_locked(current)
             return RevisionPublication(receipt, self._publish_current(current))
+
+    def _current_version_locked(self, version: ExecutionVersion) -> ExecutionVersion | None:
+        try:
+            return self._registry.snapshot(version.tenant_id, version.scope_id).current_version
+        except KeyError:
+            return None
+
+    @contextmanager
+    def admission(self, version: ExecutionVersion) -> Iterator[HostExecution]:
+        """Admit registered initial work after publication, never a pending successor."""
+        with self._gate.admission(version) as execution:
+            snapshot = self._registry.snapshot(version.tenant_id, version.scope_id)
+            if snapshot.pending_revision is not None:
+                raise ExecutionAuthorityError("successor is pending ALIGN and RESUME")
+            publication = self._latest[(version.tenant_id, version.scope_id)]
+            if not publication._future.done() or publication._future.exception() is not None:
+                raise ExecutionAuthorityError("execution authority has not been published")
+            yield execution
 
     def snapshot(self, tenant_id: str, scope_id: str) -> ScopeSnapshot:
         """Read accepted authority, including when publication has failed."""
@@ -249,6 +318,7 @@ class ExecutionController:
         with self._lock:
             if not self._stop.is_set():
                 self._stop.set()
+                self._gate.close_locked()
                 for publication in self._pending:
                     publication._future.set_exception(
                         RuntimeError("execution controller is closed")

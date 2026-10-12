@@ -5480,6 +5480,17 @@ class KVCacheManagerV2(BaseResourceManager):
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
+    def stop_request_committing(self, request: LlmRequest) -> None:
+        """Freeze one request's existing commit frontier before terminal release.
+
+        Called by the execution owner after its submitted readers finish. No
+        tokens are appended, no prefix-tree entry is invalidated, and other
+        requests sharing committed pages retain their own holds.
+        """
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is not None:
+            kv_cache.stop_committing()
+
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
 

@@ -1357,6 +1357,35 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertGreater(num_reused(None), 0)
         self.assertGreater(num_reused(default_scope), 0)
 
+    def test_stopped_owner_preserves_shared_prefix_without_publishing_tail(self) -> None:
+        self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        scope = ReuseScope(salt=11)
+        tokens = [TokenId(i) for i in range(16)]
+        committed = tokens[:6]  # Includes a partial block; the rest is uncommitted.
+        owner = self.manager.create_kv_cache(scope)
+        peer = None
+        try:
+            with TemporaryCudaStream([]) as holder:
+                stream = cast(CudaStream, holder.handle)
+                self.assertTrue(owner.resume(stream))
+                self.assertTrue(owner.resize(len(tokens), len(tokens)))
+                owner.commit(committed)
+                owner.stop_committing()
+            holder.take_finish_event().synchronize()
+            self.assertEqual(owner.num_committed_tokens, len(committed))
+            self.assertEqual(self.manager.probe_reuse(scope, tokens), len(committed))
+            peer = self.manager.create_kv_cache(scope, tokens)
+            self.assertEqual(peer.num_committed_tokens, len(committed))
+            owner.stop_committing()  # Repeated retirement doesn't change the frontier.
+            owner.close()
+            self.assertEqual(peer.num_committed_tokens, len(committed))
+            self.assertEqual(self.manager.probe_reuse(scope, tokens), len(committed))
+            self.assertEqual(self.manager.probe_reuse(ReuseScope(salt=12), tokens), 0)
+        finally:
+            for cache in (peer, owner):
+                if cache is not None and cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
     def test_create_kv_cache_accepts_sequence_input_tokens(self) -> None:
         self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
         prompt = [self.next_token() for _ in range(8)]

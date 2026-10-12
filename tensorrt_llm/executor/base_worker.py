@@ -20,6 +20,7 @@ import time
 import traceback
 import uuid
 import weakref
+from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
@@ -547,11 +548,19 @@ class BaseWorker(GenerationExecutor):
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
-            if self._is_pytorch_backend and result_wait_queue is not None:
-                req_id = self.engine.enqueue_request(
-                    executor_request, result_wait_queue=result_wait_queue)
-            else:
-                req_id = self.engine.enqueue_request(executor_request)
+            with self._execution_admission(
+                    request.execution_version) as execution:
+                if execution is not None:
+                    self._bind_execution_result(self._results[request.id],
+                                                execution)
+                if self._is_pytorch_backend and result_wait_queue is not None:
+                    req_id = self.engine.enqueue_request(
+                        executor_request, result_wait_queue=result_wait_queue)
+                else:
+                    req_id = self.engine.enqueue_request(executor_request)
+                if execution is not None:
+                    execution._cancel = partial(self.engine.cancel_request,
+                                                req_id)
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
@@ -582,7 +591,11 @@ class BaseWorker(GenerationExecutor):
 
         self._results[client_id] = result
 
-        request_id = self._enqueue_request(request)
+        try:
+            request_id = self._enqueue_request(request)
+        except Exception:
+            self._pop_result(client_id)
+            raise
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
 
@@ -1193,7 +1206,9 @@ class BaseWorker(GenerationExecutor):
         return json.dumps(KVCacheEventSerializer.serialize(events))
 
     def _pop_result(self, client_id: int):
-        self._results.pop(client_id, None)
+        result = self._results.pop(client_id, None)
+        if result is not None and result._execution is not None:
+            result._execution.finish()
         self._client_id_to_request_id.pop(client_id, None)
 
     def __enter__(self):
@@ -1426,6 +1441,9 @@ class AwaitResponseHelper:
         async_queues = []
         for response in responses:
             assert response is not None
+            result = self.worker._results.get(response.client_id)
+            if result is None:
+                continue
             queue = self.worker.return_queue(response.client_id)
 
             if not response.has_error():
@@ -1436,12 +1454,12 @@ class AwaitResponseHelper:
             # event notifications, thus put without wait here.
             if isinstance(queue, _SyncQueue):
                 global_tracer().log_instant("worker-rsp.put")
-                queue.put_nowait(response)
-                async_queues.append(queue)
+                if result._publish_response(lambda: queue.put_nowait(response)):
+                    async_queues.append(queue)
                 # all the loops are identical
                 event_loop = event_loop or queue.loop
             else:
-                queue.put(response)
+                result._publish_response(lambda: queue.put(response))
 
             if response.has_error() or response.result.is_final:
                 self.worker._pop_result(response.client_id)

@@ -41,6 +41,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.execution_mailbox import WorkerVersionTable
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
@@ -124,6 +125,7 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .execution_guard import ExecutionDeviceGuard
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -435,6 +437,7 @@ class PyExecutor:
         super(PyExecutor, self).__init__()
         self._metrics: dict[str, float | dict[str, float]] = {}
         self.device_id = torch.cuda.current_device()
+        self._execution_guard: Optional[ExecutionDeviceGuard] = None
         self.global_rank = dist.rank
         # Store the execution stream for decoder/model forward operations.
         # This stream is used for proper synchronization with
@@ -3775,10 +3778,14 @@ class PyExecutor:
 
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Commit one context frontier to target and draft caches."""
-        self.kv_cache_manager.update_context_resources(scheduled_batch)
-        if self.enable_joint_kv_cache_reuse:
-            self.draft_kv_cache_manager.update_context_resources(
-                scheduled_batch)
+        guard = getattr(self, '_execution_guard', None)
+        commit = (guard.context_commit(scheduled_batch)
+                  if guard is not None else nullcontext(scheduled_batch))
+        with commit as accepted_batch:
+            self.kv_cache_manager.update_context_resources(accepted_batch)
+            if self.enable_joint_kv_cache_reuse:
+                self.draft_kv_cache_manager.update_context_resources(
+                    accepted_batch)
 
     def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
         """Commit or roll back this iteration's tentative ADP dummy.
@@ -3964,6 +3971,17 @@ class PyExecutor:
         any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
         return all_ranks_fetched and any_rank_terminal_no_fit
 
+    def configure_execution_authority(self, table: WorkerVersionTable) -> None:
+        """Install RETIRE guards before any tagged request can be admitted."""
+        from .execution_guard import ExecutionDeviceGuard
+
+        if self._execution_guard is not None:
+            if self._execution_guard.table is not table:
+                raise RuntimeError(
+                    "executor already has an execution authority")
+            return
+        self._execution_guard = ExecutionDeviceGuard(self, table)
+
     def _prepare_and_schedule_batch(self):
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
@@ -3972,6 +3990,18 @@ class PyExecutor:
             return None, None
 
         self._handle_control_request()
+
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            obsolete = guard.revoke_obsolete_requests(self.active_requests)
+            if obsolete:
+                # Normal result processing drains prior sampling state before
+                # releasing these slots for a different request.
+                obsolete_ids = {request.py_request_id for request in obsolete}
+                new_requests = [
+                    request for request in new_requests
+                    if request.py_request_id not in obsolete_ids
+                ]
 
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
@@ -5869,6 +5899,9 @@ class PyExecutor:
                     f"beam_width={request.py_beam_width}).")
 
     def _validate_request(self, request: LlmRequest):
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.validate_request(request)
         # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
         if (self.kv_cache_transceiver is not None
@@ -7829,8 +7862,16 @@ class PyExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
-                outputs = forward(scheduled_requests, self.resource_manager,
-                                  new_tensors_device, cache_indirection_buffer)
+                guard = getattr(self, '_execution_guard', None)
+                submission = (guard.forward(scheduled_requests)
+                              if guard is not None else nullcontext())
+                if guard is not None and new_tensors_device is not None:
+                    new_tensors_device.new_tokens.record_stream(
+                        self.execution_stream)
+                with submission:
+                    outputs = forward(scheduled_requests, self.resource_manager,
+                                      new_tensors_device,
+                                      cache_indirection_buffer)
                 self._maybe_record_hang_diagnostic_phase(
                     "forward_returned",
                     scheduled_requests,
@@ -7888,12 +7929,13 @@ class PyExecutor:
             self.active_requests.remove(request)
 
         for request in scheduled_requests.context_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
-                request.py_last_context_chunk = (
-                    request.context_current_position,
-                    request.context_current_position +
-                    request.context_chunk_size)
-                request.move_to_next_context_chunk()
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                # A canceled or failed prefill must not reenter generation.
+                continue
+            request.py_last_context_chunk = (request.context_current_position,
+                                             request.context_current_position +
+                                             request.context_chunk_size)
+            request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
                 # Prefill is done for this request; drop pinned encoder outputs
                 # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed
@@ -7919,7 +7961,11 @@ class PyExecutor:
             else:
                 raise NotImplementedError(
                     f'Unsupported cp type {cp_type.name}.')
-        self._update_request_states_tp(scheduled_requests)
+        guard = getattr(self, '_execution_guard', None)
+        commit = (guard.context_commit(scheduled_requests)
+                  if guard is not None else nullcontext(scheduled_requests))
+        with commit as accepted_batch:
+            self._update_request_states_tp(accepted_batch)
 
     def _sample_in_graph(self, model_outputs) -> None:
         """Sample at the tail of the model's forward graph.
@@ -7939,35 +7985,41 @@ class PyExecutor:
         self._maybe_record_hang_diagnostic_phase("sampling", scheduled_batch)
         try:
             if batch_outputs is not None:
-                num_context_logits_prefix_sum = [0]
-                prefix_sum = 0
-                num_context_tokens = 0
-                for request in scheduled_batch.context_requests:
-                    context_chunk_size = request.context_chunk_size
-                    prefix_sum += context_chunk_size if request.py_return_context_logits else 1
-                    num_context_logits_prefix_sum.append(prefix_sum)
-                    num_context_tokens += context_chunk_size
+                guard = getattr(self, '_execution_guard', None)
+                sampling = (guard.sampling(scheduled_batch)
+                            if guard is not None else nullcontext())
+                with sampling:
+                    num_context_logits_prefix_sum = [0]
+                    prefix_sum = 0
+                    num_context_tokens = 0
+                    for request in scheduled_batch.context_requests:
+                        context_chunk_size = request.context_chunk_size
+                        prefix_sum += context_chunk_size if request.py_return_context_logits else 1
+                        num_context_logits_prefix_sum.append(prefix_sum)
+                        num_context_tokens += context_chunk_size
 
-                beam_width = self.sampler.beam_width(
-                    scheduled_batch.all_requests())
+                    beam_width = self.sampler.beam_width(
+                        scheduled_batch.all_requests())
 
-                HandleLogits()(scheduled_batch.context_requests,
-                               scheduled_batch.generation_requests,
-                               batch_outputs["logits"], beam_width,
-                               num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model())
+                    HandleLogits()(scheduled_batch.context_requests,
+                                   scheduled_batch.generation_requests,
+                                   batch_outputs["logits"], beam_width,
+                                   num_context_logits_prefix_sum,
+                                   self.sampler.is_generation_model())
 
-                HandleAdditionalOutputs()(scheduled_batch.context_requests,
-                                          scheduled_batch.generation_requests,
-                                          batch_outputs, beam_width,
-                                          num_context_tokens)
+                    HandleAdditionalOutputs()(
+                        scheduled_batch.context_requests,
+                        scheduled_batch.generation_requests, batch_outputs,
+                        beam_width, num_context_tokens)
 
-                sample_state = self.sampler.sample_async(
-                    scheduled_batch, batch_outputs,
-                    num_context_logits_prefix_sum)
-                self._maybe_record_hang_diagnostic_phase(
-                    "sampling_returned", scheduled_batch)
-                return sample_state
+                    sample_state = self.sampler.sample_async(
+                        scheduled_batch, batch_outputs,
+                        num_context_logits_prefix_sum)
+                    if guard is not None:
+                        guard.commit_sample(scheduled_batch, sample_state)
+                    self._maybe_record_hang_diagnostic_phase(
+                        "sampling_returned", scheduled_batch)
+                    return sample_state
             self._maybe_record_hang_diagnostic_phase("sampling_skipped",
                                                      scheduled_batch)
         except Exception as e:
@@ -7982,7 +8034,11 @@ class PyExecutor:
     @torch.inference_mode()
     def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
-            return self.sampler.setup_sampler_step(requests)
+            guard = getattr(self, '_execution_guard', None)
+            submission = (guard.sampling(requests)
+                          if guard is not None else nullcontext())
+            with submission:
+                return self.sampler.setup_sampler_step(requests)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -7994,8 +8050,12 @@ class PyExecutor:
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
         try:
-            self.sampler.update_requests(sample_state, resource_manager)
-            self._accumulate_spec_dec_stats(sample_state)
+            guard = getattr(self, '_execution_guard', None)
+            commit = (guard.token_commit(sample_state)
+                      if guard is not None else nullcontext())
+            with commit:
+                self.sampler.update_requests(sample_state, resource_manager)
+                self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -8266,6 +8326,9 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.before_release(request)
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)

@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
+from ..execution_gate import ExecutionAuthorityError, HostExecution
 from ..execution_version import ExecutionVersion
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
@@ -1100,6 +1101,7 @@ class GenerationResult(GenerationResultBase):
             postproc_params=generation_request.postproc_params,
         )
         self._generation_request = generation_request
+        self._execution: Optional[HostExecution] = None
         self._streaming = generation_request.streaming
         self._disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation
@@ -1154,7 +1156,28 @@ class GenerationResult(GenerationResultBase):
     def _handle_ray_response(self, response: Any):
         return response
 
+    def _publish_response(self, publish: Callable[[], None]) -> bool:
+        if self._execution is None:
+            publish()
+            return True
+        try:
+            self._execution.commit(publish)
+        except ExecutionAuthorityError:
+            # ADVANCE has already queued a terminal notification for this result.
+            return False
+        return True
+
+    def _check_execution_authority(self) -> None:
+        if self._execution is not None:
+            try:
+                self._execution.check()
+            except ExecutionAuthorityError as error:
+                self._terminal_error = error
+                self._done = True
+                raise
+
     def _result_step(self, timeout: Optional[float] = None):
+        self._check_execution_authority()
         # Honor `timeout`: a bounded `queue.get()` lets the caller regain control if the executor
         # worker dies silently without pushing a terminal response, instead of blocking potentially
         # indefinitely.
@@ -1166,21 +1189,26 @@ class GenerationResult(GenerationResultBase):
         # error and mark the result done before raising, so subsequent
         # result()/aresult()/_exception() calls keep surfacing the failure
         # instead of re-blocking on an empty queue or looking successful.
-        if isinstance(response, EngineDeadError):
+        if isinstance(response, (EngineDeadError, ExecutionAuthorityError)):
             self._terminal_error = response
             self._done = True
             raise response
+        self._check_execution_authority()
         self._handle_response(response)
+        self._check_execution_authority()
 
     async def _aresult_step(self):
+        self._check_execution_authority()
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
-        if isinstance(response, EngineDeadError):
+        if isinstance(response, (EngineDeadError, ExecutionAuthorityError)):
             self._terminal_error = response
             self._done = True
             raise response
+        self._check_execution_authority()
         self._handle_response(response)
+        self._check_execution_authority()
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.
@@ -1197,6 +1225,7 @@ class GenerationResult(GenerationResultBase):
             TimeoutError: If the request does not complete within `timeout` seconds. Bounding the
                 wait prevents a silently-dead executor worker from hanging the caller forever.
         """
+        self._check_execution_authority()
         if self._terminal_error is not None:
             raise self._terminal_error
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -1209,6 +1238,7 @@ class GenerationResult(GenerationResultBase):
                 raise TimeoutError(
                     f"Request {self.request_id} did not complete within "
                     f"{timeout} seconds.") from None
+        self._check_execution_authority()
         return self
 
     async def aresult(self) -> "GenerationResult":
@@ -1217,10 +1247,12 @@ class GenerationResult(GenerationResultBase):
         Returns:
             tensorrt_llm.executor.result.GenerationResult: generation result.
         """
+        self._check_execution_authority()
         if self._terminal_error is not None:
             raise self._terminal_error
         while not self._done:
             await self._aresult_step()
+        self._check_execution_authority()
         return self
 
     def __await__(self):
@@ -1230,6 +1262,7 @@ class GenerationResult(GenerationResultBase):
         return self
 
     def __next__(self):
+        self._check_execution_authority()
         if self._terminal_error is not None:
             raise self._terminal_error
         if self._done:
@@ -1242,6 +1275,7 @@ class GenerationResult(GenerationResultBase):
         return self
 
     async def __anext__(self):
+        self._check_execution_authority()
         if self._terminal_error is not None:
             raise self._terminal_error
         if self._done:

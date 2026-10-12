@@ -2,13 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Lazy execution-authority wiring for the direct and single-worker IPC executors."""
 
+from contextlib import AbstractContextManager, nullcontext
 from threading import RLock
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from ..execution_gate import ExecutionAuthorityError, HostExecution
 from ..execution_mailbox import ExecutionController, LocalPublicationTransport, WorkerVersionTable
+from ..execution_version import ExecutionVersion
 from .execution_mailbox import ExecutionMailboxServer, IpcPublicationTransport
 
 __all__ = ["ExecutionControlMixin", "ProxyExecutionControlMixin", "WorkerExecutionControlMixin"]
+
+if TYPE_CHECKING:
+    from .result import GenerationResult
 
 
 class ExecutionControlMixin:
@@ -27,7 +34,8 @@ class ExecutionControlMixin:
 
         Register and revise scopes through this controller to publish accepted
         versions automatically. Access starts the control path on first use.
-        This does not enable stale-work or stale-output enforcement.
+        Tagged submissions require registered authority. Host enqueue and result
+        delivery are gated; GPU and transfer quiescence are separate work.
         """
         with self._execution_control_lock:
             self._require_execution_control_open()
@@ -41,6 +49,27 @@ class ExecutionControlMixin:
 
     def _create_execution_controller(self) -> ExecutionController:
         raise NotImplementedError("execution publication is not supported by this executor")
+
+    def _execution_admission(
+        self, version: ExecutionVersion | None
+    ) -> AbstractContextManager[HostExecution | None]:
+        if version is None:
+            return nullcontext(None)
+        with self._execution_control_lock:
+            self._require_execution_control_open()
+            owner = self._execution_controller or self._execution_version_table
+        if owner is None:
+            raise ExecutionAuthorityError(
+                "register execution authority before submitting tagged work"
+            )
+        return owner.admission(version)
+
+    @staticmethod
+    def _bind_execution_result(result: "GenerationResult", execution: HostExecution | None) -> None:
+        # Called under admission, before any request can be revoked.
+        result._execution = execution
+        if execution is not None:
+            execution._wake = result.queue.put
 
     def _shutdown_execution_control(self) -> None:
         # Shutdown can run after only part of executor initialization completed.
@@ -78,10 +107,14 @@ class WorkerExecutionControlMixin:
     def _bind_execution_version_table(self, session_id: str) -> WorkerVersionTable:
         self._check_execution_publication_support()
         if self._execution_version_table is None:
-            self._execution_version_table = WorkerVersionTable(session_id)
+            self._execution_version_table = self._create_execution_version_table(session_id)
         elif self._execution_version_table.session_id != session_id:
             raise RuntimeError("worker already has a different authority owner")
         return self._execution_version_table
+
+    def _create_execution_version_table(self, session_id: str) -> WorkerVersionTable:
+        """Create host storage; concrete GPU workers also bind their device publisher."""
+        return WorkerVersionTable(session_id)
 
     def get_execution_version_table(self) -> WorkerVersionTable:
         """Read the host table populated by this worker's authority owner."""

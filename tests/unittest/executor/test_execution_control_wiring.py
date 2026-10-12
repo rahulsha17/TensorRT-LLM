@@ -50,12 +50,18 @@ def test_direct_worker_shutdown_closes_publication_before_engine(monkeypatch) ->
         with pytest.raises(RuntimeError, match="closed"):
             worker.get_execution_controller()
 
-    worker.engine = SimpleNamespace(can_enqueue_requests=lambda: False, shutdown=engine_shutdown)
+    configure = MagicMock()
+    worker.engine = SimpleNamespace(
+        can_enqueue_requests=lambda: False,
+        shutdown=engine_shutdown,
+        configure_execution_authority=configure,
+    )
     worker._handle_background_error = MagicMock()
     monkeypatch.setattr("tensorrt_llm.executor.worker.mpi_rank", lambda: 0)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     controller = worker.get_execution_controller()
+    configure.assert_called_once_with(worker.get_execution_version_table())
     try:
         version = ExecutionVersion("tenant", "scope", 0)
         assert controller.register(version).wait().observed_version == version

@@ -13,6 +13,7 @@ must drop those late responses via ``self._results.get(client_id)`` rather than
 from types import SimpleNamespace
 
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.result import GenerationResult
 
 
 class _FakeResultQueue:
@@ -66,7 +67,10 @@ def test_final_response_is_delivered_and_popped():
     """
     proxy = _make_proxy()
     queue = _RecordingQueue()
-    proxy._results = {7: SimpleNamespace(queue=queue)}
+    result = object.__new__(GenerationResult)
+    result.queue = queue
+    result._execution = None
+    proxy._results = {7: result}
 
     resp = SimpleNamespace(client_id=7, has_error=False, result=SimpleNamespace(is_final=True))
     proxy.result_queue = _FakeResultQueue([resp])

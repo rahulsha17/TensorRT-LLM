@@ -760,12 +760,12 @@ class GenerationExecutorProxy(ProxyExecutionControlMixin, GenerationExecutor):
                 return
             queue = result.queue
             if isinstance(queue, _SyncQueue):
-                queue.put_nowait(res)
-                async_queues.append(queue)
+                if result._publish_response(lambda: queue.put_nowait(res)):
+                    async_queues.append(queue)
                 # all the loops are identical
                 event_loop = event_loop or queue.loop
             else:
-                queue.put(res)
+                result._publish_response(lambda: queue.put(res))
 
             # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
             #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
@@ -774,6 +774,8 @@ class GenerationExecutorProxy(ProxyExecutionControlMixin, GenerationExecutor):
                     ErrorResponse) or (isinstance(res, PostprocWorker.Output)
                                        and res.is_final):
                 self._results.pop(client_id, None)
+                if result._execution is not None:
+                    result._execution.finish()
 
         res = res if isinstance(res, list) else [res]
 
@@ -1176,19 +1178,28 @@ class GenerationExecutorProxy(ProxyExecutionControlMixin, GenerationExecutor):
             executor=self,
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
-        self._results[request.id] = result
-
-        # Close the submit-vs-death race: _mark_engine_dead() runs on the
-        # error-monitor thread and its one-shot sweep snapshots _results, so a
-        # result registered just after that snapshot would never be unblocked
-        # and would hang forever on a dead worker. Re-check after registering
-        # and fail fast if the engine died in that window.
-        if self._engine_dead or self._fatal_error is not None:
-            self._results.pop(request.id, None)
-            raise EngineDeadError(self._fatal_error)
-
-        with nvtx_range_debug("request_queue.put"):
-            self.request_queue.put(request)
+        with self._execution_admission(request.execution_version) as execution:
+            self._bind_execution_result(result, execution)
+            self._results[request.id] = result
+            try:
+                # The engine-death sweep must see this result or the recheck
+                # must reject it before enqueue.
+                if self._engine_dead or self._fatal_error is not None:
+                    raise EngineDeadError(self._fatal_error)
+                with nvtx_range_debug("request_queue.put"):
+                    if execution is None:
+                        self.request_queue.put(request)
+                    else:
+                        # A congested IPC peer must not hold up ADVANCE.
+                        try:
+                            self.request_queue.put_nowait(request)
+                        except zmq.Again as error:
+                            raise RequestError(
+                                "Tagged request ingress is busy; retry submission"
+                            ) from error
+            except Exception:
+                self._results.pop(request.id, None)
+                raise
 
         self._handle_background_error()
 

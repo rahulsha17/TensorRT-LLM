@@ -322,6 +322,7 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
 
 def test_result_step_raises_on_engine_dead():
     res = GenerationResult.__new__(GenerationResult)
+    res._execution = None
     res.queue = _queue.Queue()
     res.queue.put(EngineDeadError(RuntimeError("boom")))
     with pytest.raises(EngineDeadError):
@@ -334,6 +335,7 @@ def test_aresult_step_raises_on_engine_dead():
 
     async def run():
         res = GenerationResult.__new__(GenerationResult)
+        res._execution = None
         res.aqueue = AsyncQueue()
         res.queue = res.aqueue.sync_q
         res.queue.put(EngineDeadError(RuntimeError("boom")))
@@ -346,6 +348,7 @@ def test_aresult_step_raises_on_engine_dead():
 def test_result_stays_failed_after_engine_dead():
     """A dead engine is a sticky terminal failure surfaced on every access."""
     res = GenerationResult.__new__(GenerationResult)
+    res._execution = None
     res.queue = _queue.Queue()
     res._done = False
     res._terminal_error = None
@@ -372,6 +375,7 @@ def test_aresult_stays_failed_after_engine_dead():
 
     async def run():
         res = GenerationResult.__new__(GenerationResult)
+        res._execution = None
         res.aqueue = AsyncQueue()
         res.queue = res.aqueue.sync_q
         res._done = False

@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -44,6 +45,9 @@ from typing import (
 )
 
 import torch
+
+if TYPE_CHECKING:
+    from ..execution_device import DeviceTokenCommitTicket
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
@@ -483,6 +487,8 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+    execution_ticket: "DeviceTokenCommitTicket | None" = None
+    """RETIRE's asynchronous commit, retaining this batch's identity and token buffers."""
     sample_type: SampleType = SampleType.FULL
     """Tier this batch was sampled at.
 
@@ -1489,6 +1495,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         if self._track_pending_steps and not self._is_draft_batch(state.requests):
             for req in state.requests:
+                # A canceled overlap result can outlive its request's slot.
+                # Setup resets the counter when a new request claims that slot.
+                if req.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
                 slot = req.py_seq_slot
                 if slot is not None and self._pending_steps[slot] > 0:
                     self._pending_steps[slot] -= 1
