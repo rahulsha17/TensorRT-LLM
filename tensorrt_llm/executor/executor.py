@@ -38,6 +38,7 @@ from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
 from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
                                SamplingParams)
 from ..scheduling_params import SchedulingParams
+from .execution_control import ExecutionControlMixin
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
@@ -83,12 +84,13 @@ class IterationResultQueue:
     aqueue: Optional[AsyncQueue] = None
 
 
-class GenerationExecutor(ABC):
+class GenerationExecutor(ExecutionControlMixin, ABC):
 
     def __init__(self,
                  num_postprocess_workers: int = 0,
                  postprocess_tokenizer_dir: Optional[str] = None,
                  is_llm_executor: Optional[bool] = None):
+        self._init_execution_control()
         self.postproc_config = PostprocWorkerConfig(
             num_postprocess_workers=num_postprocess_workers,
             postprocess_tokenizer_dir=postprocess_tokenizer_dir)

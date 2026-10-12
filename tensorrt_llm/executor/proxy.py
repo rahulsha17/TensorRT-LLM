@@ -38,6 +38,7 @@ from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
+from .execution_control import ProxyExecutionControlMixin
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
@@ -99,7 +100,7 @@ def _check_collective_rpc_guard(
             "this shim only reaches rank-0.")
 
 
-class GenerationExecutorProxy(GenerationExecutor):
+class GenerationExecutorProxy(ProxyExecutionControlMixin, GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
 
@@ -1021,6 +1022,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
+        self._shutdown_execution_control()
         self._worker_process_monitor.close()
 
         # Wake the error monitor thread immediately so it exits cleanly

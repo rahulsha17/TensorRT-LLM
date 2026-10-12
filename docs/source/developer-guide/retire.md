@@ -9,8 +9,9 @@ stop obsolete work and safely hand useful KV to the replacement.
 
 The Python LLM and executor APIs carry version metadata. A separate host-side
 `ScopeRegistry` records which version is current and accepts revisions from the
-runtime. It is not wired into request execution yet: supplying a version or
-advancing the registry does not stop work, block output, or protect KV.
+runtime. An executor controller now publishes accepted versions to a worker's
+host table. Supplying a version or publishing an update does not yet stop work,
+block output, or protect KV.
 
 ## Identity
 
@@ -140,9 +141,89 @@ that workers saw the update, old work stopped, or KV is safe. Likewise,
 `is_current` and `snapshot` are observations that can become stale immediately;
 a check followed by a later launch or output is not an atomic authority gate.
 
+## Publishing to a worker
+
+Runtime integrations that own a `GenerationExecutor` should use its controller
+to register and revise scopes. The controller owns one registry and schedules
+publication as part of each call. Using a standalone `ScopeRegistry` still only
+changes that local registry.
+
+```python
+from tensorrt_llm.execution_authority import Revision
+from tensorrt_llm.execution_version import ExecutionVersion
+
+control = executor.get_execution_controller()
+old = ExecutionVersion("app", "task-42", 7)
+new = ExecutionVersion("app", "task-42", 8)
+
+initial_publication = control.register(old)
+initial_publication.wait(timeout=5)
+
+result = control.advance(Revision("edit-123", old, new))
+accepted = result.advance_receipt
+observed = result.publication.wait(timeout=5)
+assert accepted.revision.successor_version == new
+assert observed.observed_version == new
+```
+
+There are two distinct results:
+
+- **Acceptance:** the authority selected the new version. This happens before
+  `advance` returns.
+- **Observation:** the worker recorded that version, or a newer version of the
+  same scope. This is what the publication handle waits for. It is not FENCE,
+  GPU visibility, or permission to launch a successor.
+
+For direct execution, a publisher thread updates the worker's host table. For
+IPC execution, the existing authenticated RPC connection opens a dedicated
+mailbox on first use. Subsequent updates use that mailbox's own listener,
+independently of the normal request queue and model execution loop. Each socket
+is created, used, and closed on its owning thread.
+
+```text
+Runtime -> executor controller -> ScopeRegistry accepts epoch 8
+                       |
+                       +-> publisher -> worker mailbox -> host table records 8
+                                                |
+                       publication handle <-----+ acknowledgement
+```
+
+The first supported setup is one frontend and one PyTorch rank, using the direct
+`GenerationExecutorWorker` or classic IPC `GenerationExecutorProxy`. RPC/Ray
+executors, attached frontends, and multi-rank configurations reject controller
+creation. Publication starts only when the runtime explicitly requests the
+controller. Existing generation calls continue to carry metadata only.
+
+Updates carry the full execution version, a publication sequence, and an
+executor-session identity. Epochs retain their full 64-bit range. Worker tables
+are isolated by tenant and scope; an unknown scope is not treated as epoch zero.
+Duplicate updates are harmless, and delayed updates cannot move the table
+backward. A worker can have only one authority owner for its lifetime.
+
+An old revision retry returns its original acceptance receipt, but its
+publication handle refers to the scope's latest accepted version. On a failed
+publication, retrying registration or revision resends that latest version.
+Acceptance is never rolled back. A timeout from `wait` alone does not cancel an
+in-flight publication; its acknowledgement may still arrive.
+
+The controller limits queued and in-flight publications to 256. When full, it
+keeps the authority decision and returns a publication handle that raises an
+error. The runtime can retry after capacity becomes available. Registry history
+still has the lifetime described above. Shutdown fails outstanding waits and
+closes the control channel before worker teardown. Restart recovery is not
+implemented; a new controller cannot attach to an already owned worker table.
+
+## Testing
+
+The CPU CI list includes authority, mailbox, IPC, and executor-wiring tests.
+They cover concurrent revisions, lost acknowledgements, delayed updates,
+publication to a spawned process while its main thread is occupied, real RPC
+bootstrap, topology guards, bounded pending work, and shutdown. These tests do
+not run model inference or establish GPU execution safety.
+
 ## Next steps
 
-The mailbox will publish accepted versions to workers. Later steps will check
-authority where work and output are admitted, establish FENCE, align the
+The next step will check authority where work and output are admitted. Later
+steps establish GPU publication and FENCE, align the
 successor's KV, resume it, and reclaim old resources. RESUME will keep authority
 checks active so another revision can supersede the new work too.

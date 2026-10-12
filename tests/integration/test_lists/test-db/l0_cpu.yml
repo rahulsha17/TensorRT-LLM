@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 version: 0.0.1
 l0_cpu:
 - condition:
@@ -141,6 +143,9 @@ l0_cpu:
   - unittest/executor/test_execution_version.py
   - unittest/executor/test_execution_version_propagation.py
   - unittest/executor/test_execution_authority.py
+  - unittest/executor/test_execution_mailbox.py
+  - unittest/executor/test_execution_mailbox_ipc.py
+  - unittest/executor/test_execution_control_wiring.py
   - unittest/grpc/openengine/test_coordinator.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py
   - unittest/grpc/openengine/test_control.py

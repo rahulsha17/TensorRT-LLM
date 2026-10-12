@@ -1,0 +1,292 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as WaitTimeout
+from dataclasses import replace
+from threading import Barrier, Event
+
+import pytest
+
+from tensorrt_llm.execution_authority import Revision
+from tensorrt_llm.execution_mailbox import (
+    ExecutionController,
+    LocalPublicationTransport,
+    PublicationReceipt,
+    VersionUpdate,
+    WorkerVersionTable,
+)
+from tensorrt_llm.execution_version import ExecutionVersion
+
+pytestmark = pytest.mark.cpu_only
+
+VERSION = ExecutionVersion("tenant", "scope", 7)
+
+
+@pytest.fixture
+def local_controller():
+    table = WorkerVersionTable("session")
+    controller = ExecutionController("session", LocalPublicationTransport(table))
+    yield controller, table
+    controller.close()
+    table.close()
+
+
+def test_register_and_advance_publish_full_version(local_controller) -> None:
+    controller, table = local_controller
+    version = replace(VERSION, epoch=(1 << 64) - 2)
+    initial = controller.register(version)
+    assert initial.wait().observed_version == version
+    assert table.current_version("tenant", "scope") == version
+
+    successor = replace(version, epoch=version.epoch + 1)
+    result = controller.advance(Revision("edit-1", version, successor))
+    assert result.advance_receipt.revision.successor_version == successor
+    assert result.publication.wait().observed_version == successor
+    assert table.current_version("tenant", "scope") == successor
+    assert controller.snapshot("tenant", "scope").current_version == successor
+
+
+def test_late_retry_publishes_current_version_and_keeps_original_acceptance(
+    local_controller,
+) -> None:
+    controller, table = local_controller
+    controller.register(VERSION).wait()
+    revision = Revision("edit-1", VERSION, replace(VERSION, epoch=8))
+    first = controller.advance(revision)
+    first.publication.wait()
+    second = controller.advance(
+        Revision("edit-2", replace(VERSION, epoch=8), replace(VERSION, epoch=9))
+    )
+    second.publication.wait()
+
+    retried = controller.advance(revision)
+    assert retried.advance_receipt == first.advance_receipt
+    assert retried.publication is second.publication
+    assert retried.publication.wait().observed_version.epoch == 9
+    assert table.current_version("tenant", "scope").epoch == 9
+
+
+@pytest.mark.parametrize(
+    "other", [replace(VERSION, tenant_id="another"), replace(VERSION, scope_id="another")]
+)
+def test_scope_and_tenant_namespaces_are_independent(
+    local_controller, other: ExecutionVersion
+) -> None:
+    controller, table = local_controller
+    controller.register(VERSION).wait()
+    controller.register(other).wait()
+    newer = replace(VERSION, epoch=8)
+    controller.advance(Revision("edit", VERSION, newer)).publication.wait()
+    assert table.current_version("tenant", "scope") == newer
+    assert table.current_version(other.tenant_id, other.scope_id) == other
+    assert table.current_version("unknown", "scope") is None
+
+
+def test_worker_handles_delayed_and_duplicate_updates_without_rollback() -> None:
+    table = WorkerVersionTable("session")
+    older = VersionUpdate("session", 1, VERSION)
+    newer = VersionUpdate("session", 2, replace(VERSION, epoch=8))
+    table.apply(newer)
+    assert table.apply(older) == PublicationReceipt(older, newer.version)
+    assert table.apply(newer) == PublicationReceipt(newer, newer.version)
+    assert table.current_version("tenant", "scope") == newer.version
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        VersionUpdate("foreign", 3, replace(VERSION, epoch=9)),
+        VersionUpdate("session", 2, replace(VERSION, epoch=9)),
+        VersionUpdate("session", 1, replace(VERSION, epoch=9)),
+        VersionUpdate("session", 3, VERSION),
+    ],
+)
+def test_worker_rejects_foreign_or_inconsistent_updates(invalid: VersionUpdate) -> None:
+    table = WorkerVersionTable("session")
+    current = replace(VERSION, epoch=8)
+    table.apply(VersionUpdate("session", 2, current))
+    with pytest.raises(ValueError):
+        table.apply(invalid)
+    assert table.current_version("tenant", "scope") == current
+
+
+def test_closed_worker_table_cannot_acknowledge_or_report_authority() -> None:
+    table = WorkerVersionTable("session")
+    table.apply(VersionUpdate("session", 1, VERSION))
+    table.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        table.apply(VersionUpdate("session", 2, replace(VERSION, epoch=8)))
+    with pytest.raises(RuntimeError, match="closed"):
+        table.current_version("tenant", "scope")
+
+
+class _LostAckTransport(LocalPublicationTransport):
+    def __init__(self, table: WorkerVersionTable) -> None:
+        super().__init__(table)
+        self.lose_ack = False
+        self.sent = []
+
+    def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
+        self.sent.append(update)
+        receipt = super().publish(update, stop)
+        if self.lose_ack:
+            self.lose_ack = False
+            raise TimeoutError("acknowledgement lost")
+        return receipt
+
+
+def test_lost_ack_preserves_authority_and_retry_reuses_publication_identity() -> None:
+    table = WorkerVersionTable("session")
+    transport = _LostAckTransport(table)
+    controller = ExecutionController("session", transport)
+    try:
+        controller.register(VERSION).wait()
+        transport.lose_ack = True
+        revision = Revision("edit", VERSION, replace(VERSION, epoch=8))
+        attempt = controller.advance(revision)
+        with pytest.raises(TimeoutError, match="lost"):
+            attempt.publication.wait()
+        assert controller.snapshot("tenant", "scope").current_version.epoch == 8
+        assert table.current_version("tenant", "scope").epoch == 8
+
+        retry = controller.advance(revision)
+        assert retry.advance_receipt == attempt.advance_receipt
+        assert retry.publication.update == attempt.publication.update
+        assert retry.publication.wait().observed_version.epoch == 8
+        assert transport.sent[-1] == transport.sent[-2]
+    finally:
+        controller.close()
+
+
+def test_old_retry_recovers_failed_latest_publication() -> None:
+    table = WorkerVersionTable("session")
+    transport = _LostAckTransport(table)
+    controller = ExecutionController("session", transport)
+    try:
+        controller.register(VERSION).wait()
+        first = Revision("first", VERSION, replace(VERSION, epoch=8))
+        controller.advance(first).publication.wait()
+        transport.lose_ack = True
+        latest = controller.advance(
+            Revision("second", replace(VERSION, epoch=8), replace(VERSION, epoch=9))
+        )
+        with pytest.raises(TimeoutError):
+            latest.publication.wait()
+        retry = controller.advance(first)
+        assert retry.advance_receipt.revision == first
+        assert retry.publication.update == latest.publication.update
+        assert retry.publication.wait().observed_version.epoch == 9
+    finally:
+        controller.close()
+
+
+class _BlockedTransport(LocalPublicationTransport):
+    def __init__(self, table: WorkerVersionTable) -> None:
+        super().__init__(table)
+        self.entered = Event()
+        self.release = Event()
+
+    def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
+        self.entered.set()
+        while not self.release.wait(0.01):
+            if stop.is_set():
+                raise RuntimeError("closed")
+        return super().publish(update, stop)
+
+
+def test_acceptance_can_advance_while_publication_is_pending() -> None:
+    table = WorkerVersionTable("session")
+    transport = _BlockedTransport(table)
+    controller = ExecutionController("session", transport)
+    try:
+        initial = controller.register(VERSION)
+        assert transport.entered.wait(5)
+        revised = controller.advance(Revision("edit", VERSION, replace(VERSION, epoch=8)))
+        assert controller.snapshot("tenant", "scope").current_version.epoch == 8
+        assert table.current_version("tenant", "scope") is None
+        with pytest.raises(WaitTimeout):
+            initial.wait(timeout=0.01)
+        assert controller.register(replace(VERSION, epoch=8)) is revised.publication
+        transport.release.set()
+        assert revised.publication.wait().observed_version.epoch == 8
+    finally:
+        controller.close()
+
+
+def test_shutdown_fails_all_outstanding_waiters_and_stops_publisher() -> None:
+    table = WorkerVersionTable("session")
+    transport = _BlockedTransport(table)
+    controller = ExecutionController("session", transport)
+    first = controller.register(VERSION)
+    assert transport.entered.wait(5)
+    second = controller.advance(Revision("edit", VERSION, replace(VERSION, epoch=8)))
+    controller.close()
+    for publication in (first, second.publication):
+        with pytest.raises(RuntimeError, match="closed"):
+            publication.wait()
+    assert not controller._thread.is_alive()
+    assert controller.snapshot("tenant", "scope").current_version.epoch == 8
+    with pytest.raises(RuntimeError, match="closed"):
+        controller.register(VERSION)
+    controller.close()
+
+
+def test_publication_backlog_is_bounded_and_latest_version_can_be_retried() -> None:
+    table = WorkerVersionTable("session")
+    transport = _BlockedTransport(table)
+    controller = ExecutionController("session", transport, max_pending=1)
+    try:
+        initial = controller.register(VERSION)
+        assert transport.entered.wait(5)
+        revision = Revision("edit", VERSION, replace(VERSION, epoch=8))
+        accepted = controller.advance(revision)
+        with pytest.raises(RuntimeError, match="backlog is full"):
+            accepted.publication.wait()
+        assert controller.snapshot("tenant", "scope").current_version.epoch == 8
+        transport.release.set()
+        initial.wait()
+        retry = controller.advance(revision)
+        assert retry.publication.update == accepted.publication.update
+        assert retry.publication.wait().observed_version.epoch == 8
+    finally:
+        controller.close()
+
+
+def test_concurrent_exact_retries_share_one_publication(local_controller) -> None:
+    controller, _ = local_controller
+    controller.register(VERSION).wait()
+    revision = Revision("edit", VERSION, replace(VERSION, epoch=8))
+    start = Barrier(8)
+
+    def retry():
+        start.wait(timeout=5)
+        return controller.advance(revision)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = [future.result(timeout=5) for future in [pool.submit(retry) for _ in range(8)]]
+    assert all(result.publication is results[0].publication for result in results)
+    assert results[0].publication.wait().observed_version.epoch == 8
+
+
+def test_mismatched_acknowledgement_cannot_complete_publication() -> None:
+    class WrongAck(LocalPublicationTransport):
+        def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
+            return PublicationReceipt(replace(update, session_id="old-worker"), update.version)
+
+    controller = ExecutionController("session", WrongAck(WorkerVersionTable("session")))
+    try:
+        with pytest.raises(ValueError, match="does not match"):
+            controller.register(VERSION).wait()
+    finally:
+        controller.close()
+
+
+@pytest.mark.parametrize(
+    "observed", [replace(VERSION, epoch=6), replace(VERSION, tenant_id="other")]
+)
+def test_receipt_requires_observation_of_the_requested_scope_and_epoch(
+    observed: ExecutionVersion,
+) -> None:
+    with pytest.raises(ValueError):
+        PublicationReceipt(VersionUpdate("session", 1, VERSION), observed)

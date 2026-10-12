@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import os
 import sys
@@ -20,6 +23,7 @@ from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker, _init_hf_modules
+from .execution_control import WorkerExecutionControlMixin
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
@@ -45,7 +49,8 @@ _MEGA_MOE_DEEPGEMM_MODULE = (
     "tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm")
 
 
-class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
+class GenerationExecutorWorker(WorkerExecutionControlMixin, RpcWorkerMixin,
+                               BaseWorker):
 
     def __init__(
         self,
@@ -118,6 +123,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         else:
             self.doing_shutdown = True
 
+        self._shutdown_execution_control()
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
         if self.engine is not None:
