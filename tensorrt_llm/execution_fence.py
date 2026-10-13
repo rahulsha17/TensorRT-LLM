@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Scope-wide drain receipts, separate from publication and KV inheritance."""
+
+from collections.abc import Callable
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from threading import Lock
+
+from .execution_authority import Revision
+from .execution_version import ExecutionVersion
+
+__all__ = ["FenceRequest", "FenceReceipt", "RevisionFence", "RequestDrainTracker"]
+
+
+@dataclass(frozen=True)
+class FenceRequest:
+    """Identify a revision's drain within one worker lifetime."""
+
+    session_id: str
+    revision: Revision
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id:
+            raise ValueError("session_id must be a nonempty string")
+        if not isinstance(self.revision, Revision):
+            raise TypeError("revision must be a Revision")
+
+
+@dataclass(frozen=True)
+class FenceReceipt:
+    """All admitted work through the replaced epoch has finished resource access.
+
+    This is historical evidence, not permission to resume or a KV reservation.
+    """
+
+    request: FenceRequest
+
+
+@dataclass(frozen=True)
+class RevisionFence:
+    """Wait for drain without treating a timeout as completion or cancellation."""
+
+    request: FenceRequest
+    _future: Future[FenceReceipt] = field(repr=False, compare=False)
+
+    def wait(self, timeout: float | None = 5.0) -> FenceReceipt:
+        """Return the receipt or raise; waiting never grants successor authority."""
+        return self._future.result(timeout=timeout)
+
+
+class RequestDrainTracker:
+    """Track engine admissions until terminal cleanup, including queued work.
+
+    Enqueue and registration share a lock so fast completion cannot overtake
+    registration. The owner must close admission before asking whether a scope
+    has drained. Resource-only release for recomputation is not completion.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._requests: dict[int, ExecutionVersion] = {}
+        self._error: Exception | None = None
+
+    def enqueue(self, version: ExecutionVersion, submit: Callable[[], int]) -> int:
+        """Register an enqueue atomically with terminal completion."""
+        with self._lock:
+            self._require_healthy()
+            try:
+                request_id = submit()
+                if request_id in self._requests:
+                    raise RuntimeError("request ID reused before terminal cleanup")
+                self._requests[request_id] = version
+                return request_id
+            except Exception as error:
+                # A failing enqueue may already have made work visible. Without
+                # an ID there is no safe way to certify its completion.
+                self._error = error
+                raise
+
+    def add_child(self, parent_id: int, child_id: int, version: ExecutionVersion) -> None:
+        """Expand a still-pending parent before any of its children can execute."""
+        with self._lock:
+            self._require_healthy()
+            if self._requests.get(parent_id) != version or child_id in self._requests:
+                self._error = RuntimeError("child execution has no unique pending parent")
+                raise self._error
+            self._requests[child_id] = version
+
+    def complete(self, request_id: int, version: ExecutionVersion | None) -> None:
+        """Record terminal cleanup, or removal of a never-activated queue item."""
+        with self._lock:
+            recorded = self._requests.get(request_id)
+            if recorded is not None and recorded != version:
+                self._error = RuntimeError("request execution identity changed before cleanup")
+                raise self._error
+            self._requests.pop(request_id, None)
+
+    def drained(self, version: ExecutionVersion) -> bool:
+        """Check all epochs through version; callers must already exclude new admission."""
+        with self._lock:
+            self._require_healthy()
+            return not any(
+                (v.tenant_id, v.scope_id) == (version.tenant_id, version.scope_id)
+                and v.epoch <= version.epoch
+                for v in self._requests.values()
+            )
+
+    def _require_healthy(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("request drain is unknown; restart required") from self._error

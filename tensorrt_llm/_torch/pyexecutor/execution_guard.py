@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Execution authority at scheduling, GPU token commit, and KV ownership boundaries."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from ...bindings.executor import FinishReason
+from ...execution_fence import RequestDrainTracker
+from ...execution_gate import ExecutionAuthorityError
 from ...execution_mailbox import WorkerVersionTable
+from ...execution_version import ExecutionVersion
 from .execution_device import DeviceExecutionAuthority
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -68,6 +71,32 @@ class ExecutionDeviceGuard:
         self._kv_manager = executor.kv_cache_manager if executor._is_kv_manager_v2 else None
         self._uses: dict[int, _RequestUse] = {}
         table.bind_device_publisher(self.device)
+        table.drain_tracker = RequestDrainTracker()
+
+    def enqueue(self, version: ExecutionVersion | None, submit: Callable[[], int]) -> int:
+        """Track admission before a queued request can become visible to FENCE."""
+        if version is None:
+            return submit()
+        with self.table.guard_versions([version]) as allowed:
+            if not allowed[0]:
+                raise ExecutionAuthorityError("cannot enqueue an obsolete execution")
+            assert self.table.drain_tracker is not None
+            return self.table.drain_tracker.enqueue(version, submit)
+
+    def register_children(self, requests: list[LlmRequest]) -> None:
+        """Include extra returned sequences before activation or parent cleanup."""
+        tracker = self.table.drain_tracker
+        assert tracker is not None
+        for request in requests:
+            if request.is_child and request.py_execution_version is not None:
+                tracker.add_child(
+                    request.parent_request_id, request.py_request_id, request.py_execution_version
+                )
+
+    def terminal(self, request_id: int, version: ExecutionVersion | None) -> None:
+        """Complete only after terminal cleanup or removal before activation."""
+        if self.table.drain_tracker is not None:
+            self.table.drain_tracker.complete(request_id, version)
 
     @staticmethod
     def validate_request(request: LlmRequest) -> None:
@@ -211,7 +240,7 @@ class ExecutionDeviceGuard:
 
         A failed wait leaves the ownership record and KV intact. V2 freezes only
         this request's commit frontier; it keeps the tree and other owners' holds.
-        This local cleanup check does not implement RETIRE's successor FENCE API.
+        Terminal cleanup reports completion to FENCE after resource release succeeds.
         """
         use = self._uses.get(id(request))
         if use is not None:

@@ -3,8 +3,7 @@
 """Host admission and response commits ordered with execution authority changes."""
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from threading import Lock
+from contextlib import AbstractContextManager, contextmanager
 from weakref import WeakSet
 
 from .execution_version import ExecutionVersion
@@ -83,7 +82,9 @@ class HostExecutionGate:
     """
 
     def __init__(
-        self, lock: Lock, current: Callable[[ExecutionVersion], ExecutionVersion | None]
+        self,
+        lock: AbstractContextManager[object],
+        current: Callable[[ExecutionVersion], ExecutionVersion | None],
     ) -> None:
         self.lock = lock
         self._current = current

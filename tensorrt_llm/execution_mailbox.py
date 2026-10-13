@@ -6,11 +6,12 @@ from collections.abc import Iterator
 from concurrent.futures import Future
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
-from queue import Queue
-from threading import Event, Lock, Thread
+from queue import Empty, Queue
+from threading import Event, Lock, RLock, Thread
 from typing import Protocol
 
 from .execution_authority import AdvanceReceipt, Revision, ScopeRegistry, ScopeSnapshot
+from .execution_fence import FenceReceipt, FenceRequest, RequestDrainTracker, RevisionFence
 from .execution_gate import ExecutionAuthorityError, HostExecution, HostExecutionGate
 from .execution_version import ExecutionVersion
 
@@ -101,10 +102,12 @@ class RevisionPublication:
     Args:
         advance_receipt: Acceptance receipt, possibly historical on an old retry.
         publication: Publication of the scope's current version at this call.
+        fence: Drain through this revision's replaced epoch, possibly historical.
     """
 
     advance_receipt: AdvanceReceipt
     publication: VersionPublication
+    fence: RevisionFence
 
 
 class DeviceVersionPublisher(Protocol):
@@ -124,12 +127,29 @@ class WorkerVersionTable:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a nonempty string")
         self._session_id = session_id
-        self._lock = Lock()
+        self._lock = RLock()
         self._versions: dict[tuple[str, str], VersionUpdate] = {}
         self._closed = False
         self._gate = HostExecutionGate(self._lock, self._current_version_locked)
         self._device_publisher: DeviceVersionPublisher | None = None
         self._publication_error: Exception | None = None
+        self.drain_tracker: RequestDrainTracker | None = None
+
+    def poll_fence(self, request: FenceRequest) -> FenceReceipt | None:
+        """Check a drain without blocking publication or waiting on the GPU."""
+        with self._lock:
+            self._require_open()
+            if request.session_id != self.session_id:
+                raise ValueError("fence belongs to a different authority session")
+            old = request.revision.expected_version
+            current = self._current_version_locked(old)
+            if current is None or current.epoch < request.revision.successor_version.epoch:
+                return None
+            if self.drain_tracker is None:
+                raise RuntimeError("worker does not provide execution drain tracking")
+            if not self.drain_tracker.drained(old):
+                return None
+            return FenceReceipt(request)
 
     def bind_device_publisher(self, publisher: DeviceVersionPublisher) -> None:
         """Bind the engine's device table before any authority is published."""
@@ -218,6 +238,8 @@ class PublicationTransport(Protocol):
         """Publish with bounded waits, checking stop while waiting."""
         ...
 
+    def poll_fence(self, request: FenceRequest, stop: Event) -> FenceReceipt | None: ...
+
     def close(self) -> None:
         """Release transport resources on their owning thread."""
         ...
@@ -233,6 +255,11 @@ class LocalPublicationTransport:
         if stop.is_set():
             raise RuntimeError("execution controller is closed")
         return self._table.apply(update)
+
+    def poll_fence(self, request: FenceRequest, stop: Event) -> FenceReceipt | None:
+        if stop.is_set():
+            raise RuntimeError("execution controller is closed")
+        return self._table.poll_fence(request)
 
     def close(self) -> None:
         pass
@@ -270,7 +297,9 @@ class ExecutionController:
         self._sequence = 0
         self._latest: dict[tuple[str, str], VersionPublication] = {}
         self._pending: set[VersionPublication] = set()
-        self._queue: Queue[VersionPublication | None] = Queue()
+        self._fences: dict[FenceRequest, RevisionFence] = {}
+        self._pending_fences: dict[FenceRequest, RevisionFence] = {}
+        self._queue: Queue[VersionPublication | FenceRequest | None] = Queue()
         self._thread = Thread(target=self._run, name="retire_publication", daemon=True)
         self._thread.start()
 
@@ -289,7 +318,20 @@ class ExecutionController:
             expected = revision.expected_version
             current = self._registry.snapshot(expected.tenant_id, expected.scope_id).current_version
             self._gate.revoke_locked(current)
-            return RevisionPublication(receipt, self._publish_current(current))
+            publication = self._publish_current(current)
+            request = FenceRequest(self._session_id, receipt.revision)
+            fence = self._fences.get(request)
+            if fence is None or (fence._future.done() and fence._future.exception() is not None):
+                fence = RevisionFence(request, Future())
+                self._fences[request] = fence
+                if len(self._pending_fences) >= self._max_pending:
+                    fence._future.set_exception(
+                        RuntimeError("fence backlog is full; retry revision")
+                    )
+                else:
+                    self._pending_fences[request] = fence
+                    self._queue.put(request)
+            return RevisionPublication(receipt, publication, fence)
 
     def _current_version_locked(self, version: ExecutionVersion) -> ExecutionVersion | None:
         try:
@@ -324,6 +366,9 @@ class ExecutionController:
                         RuntimeError("execution controller is closed")
                     )
                 self._pending.clear()
+                for fence in self._pending_fences.values():
+                    fence._future.set_exception(RuntimeError("execution controller is closed"))
+                self._pending_fences.clear()
                 self._queue.put(None)
         self._thread.join(timeout=5)
         if self._thread.is_alive():
@@ -354,10 +399,44 @@ class ExecutionController:
         self._queue.put(publication)
         return publication
 
+    def _poll_one_fence(self) -> None:
+        with self._lock:
+            if not self._pending_fences:
+                return
+            request = next(iter(self._pending_fences))
+            fence = self._pending_fences.pop(request)
+            self._pending_fences[request] = fence
+        try:
+            receipt = self._transport.poll_fence(request, self._stop)
+            if receipt is not None and (
+                not isinstance(receipt, FenceReceipt) or receipt.request != request
+            ):
+                raise ValueError("acknowledgement does not match the fence")
+        except Exception as error:
+            with self._lock:
+                if not fence._future.done():
+                    fence._future.set_exception(error)
+                self._pending_fences.pop(request, None)
+        else:
+            if receipt is not None:
+                with self._lock:
+                    if not fence._future.done():
+                        fence._future.set_result(receipt)
+                    self._pending_fences.pop(request, None)
+
     def _run(self) -> None:
         try:
-            while (publication := self._queue.get()) is not None:
-                if self._stop.is_set():
+            while not self._stop.is_set():
+                self._poll_one_fence()
+                with self._lock:
+                    timeout = 0.01 if self._pending_fences else None
+                try:
+                    publication = self._queue.get(timeout=timeout)
+                except Empty:
+                    continue
+                if publication is None or self._stop.is_set():
+                    break
+                if isinstance(publication, FenceRequest):
                     continue
                 try:
                     receipt = self._transport.publish(publication.update, self._stop)

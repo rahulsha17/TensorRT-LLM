@@ -11,6 +11,7 @@ from time import monotonic
 
 import zmq
 
+from ..execution_fence import FenceReceipt, FenceRequest
 from ..execution_mailbox import PublicationReceipt, VersionUpdate, WorkerVersionTable
 from .ipc import IpcQueue
 
@@ -19,8 +20,14 @@ __all__ = ["ExecutionMailboxServer", "IpcPublicationTransport"]
 
 @dataclass(frozen=True)
 class _PublicationFailure:
-    update: VersionUpdate
+    update: VersionUpdate | FenceRequest
     message: str
+
+
+@dataclass(frozen=True)
+class _FenceStatus:
+    update: FenceRequest
+    receipt: FenceReceipt | None
 
 
 class IpcPublicationTransport:
@@ -40,6 +47,21 @@ class IpcPublicationTransport:
 
     def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
         """Send and await a matching acknowledgement, ignoring replies to earlier attempts."""
+        response = self._exchange(update, stop)
+        if not isinstance(response, PublicationReceipt):
+            raise ValueError("invalid publication response")
+        return response
+
+    def poll_fence(self, request: FenceRequest, stop: Event) -> FenceReceipt | None:
+        response = self._exchange(request, stop)
+        if not isinstance(response, _FenceStatus):
+            raise ValueError("invalid fence response")
+        return response.receipt
+
+    def _exchange(
+        self, update: VersionUpdate | FenceRequest, stop: Event
+    ) -> PublicationReceipt | _FenceStatus:
+        """Exchange one bounded status query on the publisher's socket."""
         if self._queue is None:
             self._queue = IpcQueue(self._address, is_server=False, name="retire_publisher")
             self._queue.socket.setsockopt(zmq.LINGER, 0)
@@ -61,7 +83,7 @@ class IpcPublicationTransport:
                 response = self._queue.get(timeout=min(remaining, 0.05))
             except Empty:
                 continue
-            if not isinstance(response, (PublicationReceipt, _PublicationFailure)):
+            if not isinstance(response, (PublicationReceipt, _PublicationFailure, _FenceStatus)):
                 raise ValueError("invalid execution publication acknowledgement")
             if response.update != update:
                 continue
@@ -122,10 +144,14 @@ class ExecutionMailboxServer:
                     update = queue.get(timeout=0.05)
                 except Empty:
                     continue
-                if not isinstance(update, VersionUpdate):
+                if not isinstance(update, (VersionUpdate, FenceRequest)):
                     raise ValueError("invalid execution publication")
+                response: PublicationReceipt | _FenceStatus | _PublicationFailure
                 try:
-                    response = self._table.apply(update)
+                    if isinstance(update, FenceRequest):
+                        response = _FenceStatus(update, self._table.poll_fence(update))
+                    else:
+                        response = self._table.apply(update)
                 except (TypeError, ValueError, RuntimeError) as error:
                     response = _PublicationFailure(update, str(error))
                 try:

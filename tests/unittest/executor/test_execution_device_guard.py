@@ -472,3 +472,97 @@ def test_optimized_mode_matrix_is_accepted(v2, overlap, mode, in_graph_sampling)
     executor.model_engine.torch_compile_config = object() if "compiled" in mode else None
     executor.model_engine.enable_in_graph_sampling = in_graph_sampling
     ExecutionDeviceGuard.validate_executor(executor)
+
+
+def test_fence_covers_enqueue_until_terminal_cleanup(guard):
+    from tensorrt_llm.execution_authority import Revision
+    from tensorrt_llm.execution_fence import FenceRequest, RequestDrainTracker
+
+    guard.table.drain_tracker = RequestDrainTracker()
+    request = _request()
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.enqueue_request.return_value = request.py_request_id
+    with guard.table.admission(VERSION):
+        assert executor.enqueue_request(request) == request.py_request_id
+    guard.table.apply(VersionUpdate("session", 2, NEXT))
+    query = FenceRequest("session", Revision("edit", VERSION, NEXT))
+    assert guard.table.poll_fence(query) is None
+    with guard.forward(_batch(request)):
+        pass
+    executor.resource_manager = Mock()
+    executor._prefetched_request_ids = set()
+    executor.disagg = Mock()
+    executor.gather_all_responses = True
+    executor.result_wait_queues = {}
+    # Missing GPU completion cannot become a successful fence.
+    event = guard._uses[id(request)].event
+    guard._uses[id(request)].event = None
+    with pytest.raises(RuntimeError, match="completion is unknown"):
+        executor._do_terminate_request(request)
+    assert guard.table.poll_fence(query) is None
+    guard._uses[id(request)].event = event
+    # Resource-only release can be used for recomputation and is not terminal.
+    executor._free_request_resources(request)
+    assert guard.table.poll_fence(query) is None
+    # A failed cleanup must not certify completion.
+    executor.resource_manager.free_resources.side_effect = RuntimeError("cleanup failed")
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        executor._do_terminate_request(request)
+    assert guard.table.poll_fence(query) is None
+    executor.resource_manager.free_resources.side_effect = None
+    executor._do_terminate_request(request)
+    assert guard.table.poll_fence(query).request == query
+    guard.device.wait_event.assert_called_once()
+
+
+def test_fence_enqueue_rejects_late_obsolete_work(guard):
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+    from tensorrt_llm.execution_gate import ExecutionAuthorityError
+
+    guard.table.drain_tracker = RequestDrainTracker()
+    guard.table.apply(VersionUpdate("session", 2, NEXT))
+    submit = Mock(return_value=42)
+    with pytest.raises(ExecutionAuthorityError):
+        guard.enqueue(VERSION, submit)
+    submit.assert_not_called()
+    assert guard.table.drain_tracker.drained(VERSION)
+
+
+def test_waiting_cancellation_completes_only_removed_items(guard):
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    guard.table.drain_tracker = RequestDrainTracker()
+    for request_id in (1, 2):
+        guard.enqueue(VERSION, lambda request_id=request_id: request_id)
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.canceled_req_ids = [1, 2]
+    # Request 2 may still be in an earlier ingress queue; cancellation alone
+    # cannot certify its removal or absence of future resource access.
+    executor.waiting_queue = Mock()
+    executor.waiting_queue.__iter__ = Mock(
+        return_value=iter([SimpleNamespace(id=1, request=_request())])
+    )
+    executor.active_requests = []
+    executor._handle_canceled_requests()
+    assert not guard.table.drain_tracker.drained(VERSION)
+    guard.terminal(2, VERSION)
+    assert guard.table.drain_tracker.drained(VERSION)
+
+
+def test_child_registration_keeps_fence_pending_after_parent_cleanup(guard):
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    guard.table.drain_tracker = RequestDrainTracker()
+    guard.enqueue(VERSION, lambda: 42)
+    child = _request()
+    child.is_child = True
+    child.parent_request_id = 42
+    child.py_request_id = 43
+    guard.register_children([child])
+    guard.terminal(42, VERSION)
+    assert not guard.table.drain_tracker.drained(VERSION)
+    guard.terminal(43, VERSION)
+    assert guard.table.drain_tracker.drained(VERSION)

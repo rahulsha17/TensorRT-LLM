@@ -383,8 +383,8 @@ revoked by ADVANCE.
 These checks are admission points, not kernel preemption. An already submitted
 forward can still write KV, and sampling can write candidate scratch. Step 5
 prevents rejected tokens from becoming committed request state; it does not
-guard every attention/KV store. The local cleanup wait is not the successor FENCE
-protocol. Successors remain pending until FENCE, ALIGN, and RESUME are implemented.
+guard every attention/KV store. The local cleanup wait supplies the GPU completion proof for step 6 below.
+Successors remain pending until ALIGN and RESUME are implemented.
 
 Commit buffers are allocated per step. No performance gain is claimed yet.
 Device failures never roll authority back. Publication failures close host gates;
@@ -393,6 +393,67 @@ buffers are retained until their CUDA events complete. Unknown completion keeps
 the affected buffers and ownership records alive. At most 256 unfinished device
 operations may retain staging buffers; reaching that limit fails authority
 instead of growing the queue indefinitely.
+
+## FENCE (step 6)
+
+A revision now has a separate fence handle:
+
+```python
+result = control.advance(Revision("edit-123", old, new))
+result.publication.wait(timeout=5)  # Worker observed the authority update.
+receipt = result.fence.wait(timeout=5)  # Old execution has drained.
+assert receipt.request.revision.expected_version == old
+```
+
+FENCE covers every tagged request in the scope through the replaced epoch,
+including earlier epochs still draining. It counts work from engine enqueue,
+through waiting and active execution, until terminal cleanup. Additional return
+sequences are counted separately before activation, so a parent finishing cannot
+hide a running child. Other scopes, tenants, and untagged requests do not delay
+this fence.
+
+```text
+ADVANCE closes old admission and output
+  -> worker observes the new epoch
+  -> queued requests are removed or proceed to ordinary cancellation
+  -> active requests finish their recorded GPU uses
+  -> terminal cleanup completes
+  -> FENCE receipt is returned
+
+Successor stays pending -> ALIGN -> RESUME
+```
+
+The receipt requires both closed worker admission and an empty drain record for
+the affected epochs. Admission and polling share the worker authority lock;
+enqueue registration also orders with terminal completion. The engine's existing
+GPU waits happen outside those locks. Freeing resources for recomputation does
+not complete a request. A canceled queue item counts as drained only after it is
+actually removed from the waiting queue, before activation.
+
+The same API works for direct and single-worker IPC execution. The publisher
+queries fence status without blocking the worker mailbox on GPU completion.
+Pending queries rotate so one busy scope does not prevent other fences from
+completing. At most 256 fences are pending by default; overflow returns an error
+handle and can be retried. Completed receipts are retained for the controller's
+lifetime, like revision retry history.
+
+A wait timeout leaves the fence pending. Retrying the same revision reuses its
+successful or pending fence; a failed status exchange can be retried. A later
+revision does not change the meaning of an older receipt. Shutdown fails pending
+waits. Unknown enqueue completion or inconsistent request identity fails closed;
+unknown GPU completion or failed cleanup never removes the pending request.
+
+This first fence uses ordinary terminal cleanup. It proves that the old execution
+has finished accessing its resources, but does not reserve KV or certify that a
+prefix remains cached. ALIGN must acquire a handoff hold before the old owner's
+last hold is released; that hook belongs before resource release, after the GPU
+completion wait. A fence receipt is neither an allocation-generation token nor
+permission to run the successor. It also does not wait for obsolete IPC responses
+to disappear; existing output gates prevent those responses from being delivered.
+
+The supported configurations remain those of step 5. Multi-rank execution and
+KV transfers/connectors need their own completion evidence before they can
+participate in this protocol.
 
 ## Testing
 
@@ -422,7 +483,7 @@ revisions during prefill, generation, and cleanup.
 
 ## Next steps
 
-The next step is FENCE: prove that old work can no longer access the memory we
-intend to preserve or release. Then ALIGN establishes the successor's KV,
-RESUME allows it to run, and RECLAIM releases obsolete holds. RESUME will keep authority
+The next step is ALIGN: accept revised input, validate the reusable prefix, and
+establish successor KV holds before releasing the old owner. RESUME allows the
+prepared successor to run, and RECLAIM releases obsolete handoff holds. RESUME will keep authority
 checks active so another revision can supersede the new work too.

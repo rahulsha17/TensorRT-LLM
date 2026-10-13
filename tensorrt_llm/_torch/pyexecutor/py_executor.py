@@ -1688,7 +1688,11 @@ class PyExecutor:
         """
         Enqueue new requests
         """
-        req_ids = self.executor_request_queue.enqueue_requests(requests)
+        guard = getattr(self, '_execution_guard', None)
+        if guard is None:
+            req_ids = self.executor_request_queue.enqueue_requests(requests)
+        else:
+            req_ids = [self.enqueue_request(request) for request in requests]
         if result_wait_queue is not None:
             with self.response_cv:
                 for req_id in req_ids:
@@ -1974,7 +1978,13 @@ class PyExecutor:
         """
         Enqueue a new request.
         """
-        req_id = self.executor_request_queue.enqueue_request(request)
+        guard = getattr(self, '_execution_guard', None)
+        if guard is None:
+            req_id = self.executor_request_queue.enqueue_request(request)
+        else:
+            req_id = guard.enqueue(
+                getattr(request, 'py_execution_version', None),
+                lambda: self.executor_request_queue.enqueue_request(request))
         if result_wait_queue is not None:
             with self.response_cv:
                 self.result_wait_queues[req_id] = result_wait_queue
@@ -6270,12 +6280,16 @@ class PyExecutor:
             new_requests = new_requests_cur_rank
 
         # 7. Merge requests
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+        merged = merge_requests(new_requests,
+                                cp_config=self.dist.cp_config,
+                                cp_rank=self.dist.cp_rank,
+                                cp_size=self.dist.cp_size,
+                                exclude_last_generation_logits=self.
+                                _should_exclude_last_generation_logits())
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.register_children(merged)
+        return merged
 
     def _handle_special_queue_items(
             self,
@@ -8340,6 +8354,9 @@ class PyExecutor:
         _strip_py_multimodal_data_post_prefill(request)
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.terminal(request.py_request_id, request.py_execution_version)
 
     def _on_disagg_pp_termination(self, request: LlmRequest) -> None:
         """Finish a PP-synchronized termination and any deferred recompute."""
@@ -8416,8 +8433,16 @@ class PyExecutor:
         # Create set from list of canceled request ids to speed up canceled test
         canceled_req_ids_set = set(self.canceled_req_ids)
 
-        # Remove canceled requests from the waiting queue
+        # Only removed queue items have proof that they never became active.
+        guard = getattr(self, '_execution_guard', None)
+        removed = ([
+            item for item in self.waiting_queue
+            if item.id in canceled_req_ids_set
+        ] if guard is not None else [])
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
+        for item in removed:
+            guard.terminal(item.id,
+                           getattr(item.request, 'py_execution_version', None))
 
         still_pending_canceled_ids = []
         for request in self.active_requests:
