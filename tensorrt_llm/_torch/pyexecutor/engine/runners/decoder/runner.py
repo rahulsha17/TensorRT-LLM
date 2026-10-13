@@ -217,6 +217,8 @@ def _make_single_token_context_graph_batch(
 NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
     temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
 )
+# TorchSampler's FAST tier supports top-k/top-p, but not min-p.
+FAST_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7, top_k=50, top_p=0.9)
 
 
 class ExtraInputsCollector:
@@ -2041,6 +2043,7 @@ class DecoderRunner(ScheduledModelRunner):
                             draft_len,
                             max_seq_len,
                             force_non_greedy=force_non_greedy,
+                            sample_type=sample_type,
                         )
                         with self._release_batch_context(warmup_request, resource_manager) as batch:
                             if batch is None:
@@ -2480,9 +2483,12 @@ class DecoderRunner(ScheduledModelRunner):
         draft_len: int,
         max_seq_len: int = None,
         force_non_greedy: bool = False,
+        sample_type: SampleType | None = None,
     ) -> ScheduledRequests | None:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
+        if sample_type is SampleType.FAST:
+            capture_sampling_params = FAST_CAPTURE_SAMPLING_PARAMS
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
 

@@ -1554,5 +1554,38 @@ class TestWarmupCleanup(unittest.TestCase):
         self.assertFalse(method.needs_native_autotune)
 
 
+@pytest.mark.parametrize("fast", [False, True])
+def test_capture_warmup_sampling_params_match_selected_tier(fast):
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler import (
+        SampleType,
+        _fast_strategy_params,
+        _request_strategy,
+    )
+
+    engine, resource_manager = _build_engine_and_resource_manager()
+    runner = engine._runner
+    batch = runner._create_cuda_graph_warmup_request(
+        resource_manager,
+        2,
+        0,
+        max_seq_len=16,
+        force_non_greedy=True,
+        sample_type=SampleType.FAST if fast else None,
+    )
+    with runner._release_batch_context(batch, resource_manager):
+        assert batch is not None
+        # Check both the longest request and the short filler.
+        assert len(batch.generation_requests) == 2
+        for request in batch.generation_requests:
+            strategy = _request_strategy(request, vocab_size=2**31)
+            if fast:
+                temperature, top_k, top_p = _fast_strategy_params(strategy)
+                assert temperature == pytest.approx(0.7)
+                assert top_k == 50
+                assert top_p == pytest.approx(0.9)
+            else:
+                assert strategy[0] == "min_p"
+
+
 if __name__ == "__main__":
     unittest.main()
