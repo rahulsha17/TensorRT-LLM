@@ -334,10 +334,12 @@ class WorkerAlignmentState:
         """Mark an abandoned claim; defer native release to an engine safe point."""
         with self._lock:
             for request, record in self._records.items():
-                if (
-                    request.revision.successor_version == version
-                    and record.request_id == request_id
+                if request.revision.successor_version == version and (
+                    record.request_id == request_id
+                    or (record.resumed and record.request_id is None)
                 ):
+                    # Cancellation may arrive before activation binds the input.
+                    record.request_id = request_id
                     record.error = RuntimeError("RESUME request is terminal")
                     if record.reservation is not None and not self._wake_pending:
                         self._wake_pending = True

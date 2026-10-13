@@ -495,3 +495,19 @@ def test_reclaimed_reservation_frees_capacity_without_reacquiring_on_retry(setup
     state.process()
     assert pending.alignment.wait().reusable_prefix_length == 3
     assert reserve.call_count == 2
+
+
+def test_cancel_before_activation_reclaims_unclaimed_resumed_hold(setup):
+    controller, _, _, state, _, _ = setup
+    controller.resume(_aligned(setup)).wait()
+    record = next(iter(state._records.values()))
+    hold = record.reservation
+    assert record.request_id is None
+    state.terminal(NEW, 10)
+    hold.close.assert_not_called()
+    state.process()
+    hold.settle.assert_called_once()
+    hold.close.assert_called_once()
+    assert record.reservation is None
+    with pytest.raises(RuntimeError):
+        state.claim(NEW, 11, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
