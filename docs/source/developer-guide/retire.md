@@ -133,7 +133,7 @@ a competing revision, not a retry.
 `AlignmentInput` alongside it to `control.advance`, as shown in step 7 below.
 The controller binds those exact tokens and cache namespace to the revision ID.
 Retries must supply the same input, including whether ALIGN was requested.
-An accepted successor remains pending until RESUME is implemented.
+An accepted successor remains pending until RESUME is acknowledged.
 
 The registry is an in-memory object in one process. The runtime must route all
 revisions for a scope through the same instance. Creating separate registries
@@ -245,7 +245,7 @@ Runtime accepts epoch 8
        -> worker rejects new epoch 7 enqueues
        -> worker enqueues cancellation for admitted epoch 7 requests
 
-Epoch 8 remains pending until RESUME is implemented.
+Epoch 8 remains pending until RESUME is acknowledged.
 ```
 
 Waiting result consumers receive `ExecutionAuthorityError`. Sync, async, and
@@ -268,8 +268,8 @@ restoring output authority. Scheduling iterations, kernels, and transfers alread
 in flight may continue until the engine processes cancellation. No new KV holds,
 early resource releases or FENCE guarantees are introduced by these host gates.
 
-An accepted successor cannot be submitted yet, even after its publication is
-acknowledged. It remains pending. Registering the same version or retrying an
+ADVANCE publication alone does not allow successor submission. The successor
+remains pending until ALIGN and RESUME complete. Registering the same version or retrying an
 old revision does not bypass this restriction.
 
 ## GPU authority and token commit (step 5)
@@ -383,7 +383,7 @@ These checks are admission points, not kernel preemption. An already submitted
 forward can still write KV, and sampling can write candidate scratch. Step 5
 prevents rejected tokens from becoming committed request state; it does not
 guard every attention/KV store. The local cleanup wait supplies the GPU completion proof for step 6 below.
-Successors remain pending until RESUME is implemented.
+Successors remain pending until RESUME is acknowledged.
 
 Commit buffers are allocated per step. No performance gain is claimed yet.
 Device failures never roll authority back. Publication failures close host gates;
@@ -538,6 +538,86 @@ submitted input, and acquire the successor's own KV before releasing this hold.
 No GPU pointers are exposed. Successor submission is still rejected at this
 step, and no performance gain is claimed before native validation.
 
+## RESUME (step 8)
+
+RESUME lets the runtime submit the revised request after ALIGN is complete:
+
+```python
+from tensorrt_llm.sampling_params import SamplingParams
+
+aligned = result.alignment.wait()
+control.resume(aligned).wait()
+successor = executor.generate_async(
+    prompt_token_ids=list(revised_input.input_token_ids),
+    sampling_params=SamplingParams(max_tokens=64),
+    cache_salt=revised_input.cache_salt,
+    execution_version=aligned.request.revision.successor_version,
+)
+```
+
+The worker rechecks the session, current version, reservation ID, and completed
+FENCE. Only after its acknowledgement does the frontend clear the pending
+revision and allow submission. A timeout does not roll back worker acceptance;
+retry `resume` with the same receipt. A newer revision always wins over a late
+RESUME acknowledgement.
+
+The successor must use exactly the tokens, cache salt, and LoRA identity supplied
+to ALIGN. The worker checks them before scheduling and binds the reservation to
+one physical request. A changed prompt, another request ID, or an invalidated
+reservation is rejected. This step supports one returned sequence per revision;
+additional physical requests need their own revision or scope. Once claimed,
+a failed or canceled successor requires a new revision to try a different request.
+
+V1 and V2 use their normal request allocation paths to acquire their own cache
+references while the ALIGN hold is still present. Before the first model
+forward, RETIRE verifies that the acquired prefix is at least the length ALIGN
+promised. If it is shorter, the request fails before model execution. An aligned
+cache miss (zero tokens) allows ordinary recomputation. Later scheduler-driven
+recomputation of the same request uses the normal cache path.
+
+```text
+ALIGN hold remains alive
+  -> RESUME acknowledgement opens admission
+  -> validate revised input and bind request ID
+  -> normal V1/V2 allocation acquires successor KV
+  -> verify prefix before first forward
+  -> execute with all authority checks still active
+```
+
+This check runs at the common forward boundary, outside model capture. Eager,
+compiled, CUDA graph, and overlap execution use the same handoff logic; RESUME
+does not remove the host or device fences, including for in-graph sampling.
+Native GPU runs are still required to validate these combinations end to end.
+The existing one-rank, text-only, single-beam restrictions still apply; this
+does not add disaggregated transfer, speculative decoding, or multimodal support.
+
+RECLAIM releases the extra ALIGN hold after successful attachment, as described
+below. Cache resets remain blocked while a pending hold protects a prefix.
+
+## RECLAIM (step 9)
+
+RECLAIM runs automatically on the engine thread. Once RESUME verifies that the
+successor acquired the promised prefix, it waits for the cache allocation copies
+to finish, then releases only the separate ALIGN hold. The successor keeps its
+own references. V1 removes the cache-only sequence without publishing its unused
+tail; V2 closes the suspended cache without closing the successor cache.
+
+A claimed successor that terminates before attachment also releases its hold at
+the next engine safe point. Terminal notification itself never calls CUDA.
+A later revision acquires its new hold before releasing an older unused hold.
+An unsubmitted revision stays reserved until the runtime supersedes it or closes
+the executor; a timeout alone does not abandon it.
+
+Copy-wait or native-release failure stops further cleanup and requires worker
+restart. The ownership record remains present rather than assuming release was
+safe. Successful release returns reservation capacity. A small retry record
+remains, so replaying RESUME cannot acquire a second hold or bind another request.
+This is KV reclamation, not deletion of scope or epoch history.
+
+These operations stay outside graph capture and use the same boundary with
+V1/V2, eager, overlap, graph, and compiled execution. The copy wait occurs once
+per handoff, not on every decoding step.
+
 ## Testing
 
 The CPU CI list includes authority, mailbox, IPC, host gates, and executor wiring.
@@ -566,7 +646,7 @@ revisions during prefill, generation, and cleanup.
 
 ## Next steps
 
-The next step is RESUME: validate the prepared reservation against the current
-version and submitted input, attach its KV to the successor, and allow that
-request to run. RECLAIM then releases obsolete handoff holds. RESUME keeps
-authority checks active so another revision can supersede the new work too.
+Validate the complete lifecycle on native GPU runs across V1/V2 and execution
+modes. Distributed authority, disaggregated transfers, scope-history compaction,
+and recovery after restart remain separate work. Authority checks stay active
+after RESUME so another revision can supersede the new work too.

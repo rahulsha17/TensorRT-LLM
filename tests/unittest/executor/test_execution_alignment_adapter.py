@@ -116,3 +116,20 @@ def test_manager_limit_used_when_executor_limit_is_unset(engine):
     engine.kv_cache_manager.max_seq_len = 4
     with pytest.raises(ValueError, match="max_seq_len"):
         KVAlignmentAdapter(engine).reserve(INPUT)
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_reclaim_waits_on_manager_copy_stream(engine, v2):
+    engine._is_kv_manager_v2 = v2
+    manager = engine.kv_cache_manager
+    manager.impl.create_kv_cache.return_value = Mock(num_committed_tokens=7)
+    hold = KVAlignmentAdapter(engine).reserve(INPUT)
+    manager._stream.synchronize.reset_mock()
+    hold.settle()
+    manager._stream.synchronize.assert_called_once()
+    hold.close()
+    hold.close()
+    if v2:
+        manager.impl.create_kv_cache.return_value.close.assert_called_once()
+    else:
+        manager.impl.remove_sequence.assert_called_once_with(99, None, False)

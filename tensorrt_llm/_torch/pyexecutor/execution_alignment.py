@@ -18,7 +18,11 @@ if TYPE_CHECKING:
 class _Reservation:
     num_tokens: int
     _release: Callable[[], None]
+    _settle: Callable[[], None] = lambda: None
     _closed: bool = False
+
+    def settle(self) -> None:
+        self._settle()
 
     def close(self) -> None:
         if not self._closed:
@@ -58,7 +62,9 @@ class KVAlignmentAdapter:
         # Suspended caches retain native PageHolders without occupying an
         # executor slot. Pages may migrate between tiers but cannot be dropped.
         try:
-            return _Reservation(int(cache.num_committed_tokens), cache.close)
+            return _Reservation(
+                int(cache.num_committed_tokens), cache.close, manager._stream.synchronize
+            )
         except Exception:
             cache.close()
             raise
@@ -89,7 +95,11 @@ class KVAlignmentAdapter:
             lora_task_id=revised.lora_task_id,
             cache_salt=revised.cache_salt,
         )
-        reservation = _Reservation(0, lambda: manager.impl.remove_sequence(request_id, None, False))
+        reservation = _Reservation(
+            0,
+            lambda: manager.impl.remove_sequence(request_id, None, False),
+            manager._stream.synchronize,
+        )
         try:
             manager.impl.sync_transfer_manager_with_buffer_manager()
             manager.impl.add_sequence_batch([(request_id, len(tokens), 1)], [request])

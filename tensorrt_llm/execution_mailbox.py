@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Publish accepted execution versions without granting execution or reuse rights."""
+"""Publish execution authority and acknowledge revision lifecycle transitions."""
 
 from collections.abc import Iterator
 from concurrent.futures import Future
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from threading import Event, Lock, RLock, Thread
@@ -49,6 +49,7 @@ class VersionUpdate:
     sequence: int
     version: ExecutionVersion
     alignment: AlignmentRequest | None = None
+    resume: AlignmentReceipt | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id:
@@ -63,6 +64,10 @@ class VersionUpdate:
             or self.alignment.revision.successor_version != self.version
         ):
             raise ValueError("alignment must belong to this publication")
+        if self.resume is not None and (
+            not isinstance(self.resume, AlignmentReceipt) or self.resume.request != self.alignment
+        ):
+            raise ValueError("RESUME must match this publication's alignment")
 
 
 @dataclass(frozen=True)
@@ -228,6 +233,11 @@ class WorkerVersionTable:
                     return PublicationReceipt(update, previous.version)
                 if update.version.epoch < previous.version.epoch:
                     raise ValueError("newer publication sequence would rewind authority")
+            if update.resume is not None:
+                if self.poll_alignment(update.resume.request) != update.resume:
+                    raise RuntimeError("RESUME requires the live ALIGN receipt and completed FENCE")
+                assert self.alignment_state is not None
+                self.alignment_state.authorize_resume(update.resume)
             if self.alignment_state is not None:
                 self.alignment_state.observe(update.version, update.alignment)
             self._versions[key] = update
@@ -245,9 +255,14 @@ class WorkerVersionTable:
         update = self._versions.get((version.tenant_id, version.scope_id))
         return None if update is None else update.version
 
-    def admission(self, version: ExecutionVersion) -> AbstractContextManager[HostExecution]:
-        """Order worker enqueue with mailbox updates; this does not fence GPU work."""
-        return self._gate.admission(version)
+    @contextmanager
+    def admission(self, version: ExecutionVersion) -> Iterator[HostExecution]:
+        """Order worker enqueue with authority and acknowledged RESUME."""
+        with self._gate.admission(version) as execution:
+            update = self._versions[(version.tenant_id, version.scope_id)]
+            if update.alignment is not None and update.resume is None:
+                raise ExecutionAuthorityError("successor is pending ALIGN and RESUME")
+            yield execution
 
     def current_version(self, tenant_id: str, scope_id: str) -> ExecutionVersion | None:
         """Observe a worker's version at this instant; unknown scopes return None."""
@@ -352,6 +367,7 @@ class ExecutionController:
         self._alignments: dict[AlignmentRequest, RevisionAlignment] = {}
         self._pending_alignments: dict[AlignmentRequest, RevisionAlignment] = {}
         self._alignment_current: dict[ExecutionVersion, AlignmentRequest] = {}
+        self._resumes: dict[ExecutionVersion, AlignmentReceipt] = {}
         self._queue: Queue[VersionPublication | FenceRequest | AlignmentRequest | None] = Queue()
         self._thread = Thread(target=self._run, name="retire_publication", daemon=True)
         self._thread.start()
@@ -413,6 +429,30 @@ class ExecutionController:
                         self._queue.put(align_request)
             return RevisionPublication(receipt, publication, fence, aligned)
 
+    def resume(self, aligned: AlignmentReceipt) -> VersionPublication:
+        """Open successor admission after a live worker recheck of ALIGN and FENCE.
+
+        Wait for the returned publication before submitting exactly the aligned
+        input with its successor execution version. A timeout is retryable with
+        the same receipt and does not undo the worker's acceptance.
+        """
+        if not isinstance(aligned, AlignmentReceipt):
+            raise TypeError("aligned must be an AlignmentReceipt")
+        with self._lock:
+            self._require_open()
+            request = aligned.request
+            version = request.revision.successor_version
+            if request.session_id != self._session_id or not self._registry.is_current(version):
+                raise ValueError("RESUME belongs to a different session or obsolete version")
+            handle = self._alignments.get(request)
+            if handle is None or not handle._future.done() or handle._future.result() != aligned:
+                raise ValueError("RESUME requires this controller's completed ALIGN receipt")
+            previous = self._resumes.get(version)
+            if previous is not None and previous != aligned:
+                raise ValueError("RESUME changed the reservation")
+            self._resumes[version] = aligned
+            return self._publish_current(version)
+
     def _current_version_locked(self, version: ExecutionVersion) -> ExecutionVersion | None:
         try:
             return self._registry.snapshot(version.tenant_id, version.scope_id).current_version
@@ -421,7 +461,7 @@ class ExecutionController:
 
     @contextmanager
     def admission(self, version: ExecutionVersion) -> Iterator[HostExecution]:
-        """Admit registered initial work after publication, never a pending successor."""
+        """Admit published initial work or an acknowledged, resumed successor."""
         with self._gate.admission(version) as execution:
             snapshot = self._registry.snapshot(version.tenant_id, version.scope_id)
             if snapshot.pending_revision is not None:
@@ -464,14 +504,22 @@ class ExecutionController:
     def _publish_current(self, version: ExecutionVersion) -> VersionPublication:
         key = (version.tenant_id, version.scope_id)
         previous = self._latest.get(key)
-        if previous is not None and previous.update.version == version:
+        if (
+            previous is not None
+            and previous.update.version == version
+            and previous.update.resume == self._resumes.get(version)
+        ):
             if not previous._future.done() or previous._future.exception() is None:
                 return previous
             update = previous.update
         else:
             self._sequence += 1
             update = VersionUpdate(
-                self._session_id, self._sequence, version, self._alignment_current.get(version)
+                self._session_id,
+                self._sequence,
+                version,
+                self._alignment_current.get(version),
+                self._resumes.get(version),
             )
         publication = VersionPublication(update, Future())
         self._latest[key] = publication
@@ -554,6 +602,10 @@ class ExecutionController:
                     if (
                         not isinstance(receipt, PublicationReceipt)
                         or receipt.update != publication.update
+                        or (
+                            publication.update.resume is not None
+                            and receipt.observed_version != publication.update.version
+                        )
                     ):
                         raise ValueError("acknowledgement does not match the publication")
                 except Exception as error:
@@ -566,7 +618,17 @@ class ExecutionController:
                 else:
                     with self._lock:
                         if not publication._future.done():
-                            publication._future.set_result(receipt)
+                            resume = publication.update.resume
+                            if resume is not None and not self._registry.is_current(
+                                publication.update.version
+                            ):
+                                publication._future.set_exception(
+                                    RuntimeError("RESUME was superseded before acknowledgement")
+                                )
+                            else:
+                                if resume is not None:
+                                    self._registry.resume(resume.request.revision)
+                                publication._future.set_result(receipt)
                         self._pending.discard(publication)
         finally:
             self._transport.close()

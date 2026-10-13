@@ -118,6 +118,8 @@ class PrefixReservation(Protocol):
     @property
     def num_tokens(self) -> int: ...
 
+    def settle(self) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -127,6 +129,9 @@ class _AlignmentRecord:
     reservation: PrefixReservation | None = None
     receipt: AlignmentReceipt | None = None
     error: Exception | None = None
+    resumed: bool = False
+    request_id: int | None = None
+    attached: bool = False
 
 
 class WorkerAlignmentState:
@@ -169,6 +174,7 @@ class WorkerAlignmentState:
                     (r.revision.successor_version.tenant_id, r.revision.successor_version.scope_id)
                     for r, entry in self._records.items()
                     if entry.error is None
+                    and (entry.receipt is None or entry.reservation is not None)
                 }
                 if key not in occupied and len(occupied) >= self._max_reservations:
                     record.error = RuntimeError("ALIGN reservation capacity exhausted")
@@ -212,9 +218,7 @@ class WorkerAlignmentState:
                         record.error = error
             for request, record in list(self._records.items()):
                 if self._closed or not self._is_current(request) or record.error is not None:
-                    if record.reservation is not None:
-                        record.reservation.close()
-                        record.reservation = None
+                    self._reclaim(record)
                     if self._closed or not self._is_current(request):
                         del self._records[request]
 
@@ -238,6 +242,107 @@ class WorkerAlignmentState:
             if record.error is not None:
                 raise RuntimeError(f"ALIGN failed: {record.error}") from record.error
             return record.receipt
+
+    def authorize_resume(self, receipt: AlignmentReceipt) -> None:
+        """Validate a live reservation before opening worker admission; no CUDA calls."""
+        with self._lock:
+            if self.poll(receipt.request) != receipt:
+                raise RuntimeError("RESUME does not match the live ALIGN reservation")
+            self._records[receipt.request].resumed = True
+
+    def _record_for_version(self, version: ExecutionVersion) -> _AlignmentRecord | None:
+        # Callers hold the state lock. Initial versions have no alignment record.
+        if self._closed:
+            raise RuntimeError("ALIGN is closed")
+        if self._current.get((version.tenant_id, version.scope_id)) != version:
+            raise RuntimeError("successor authority is no longer current")
+        return next(
+            (
+                record
+                for request, record in self._records.items()
+                if request.revision.successor_version == version
+            ),
+            None,
+        )
+
+    def claim(
+        self,
+        version: ExecutionVersion,
+        request_id: int,
+        input_token_ids: tuple[int, ...],
+        cache_salt: str | None,
+        lora_task_id: int | None,
+    ) -> None:
+        """Bind a resumed revision to one physical request before scheduling."""
+        with self._lock:
+            record = self._record_for_version(version)
+            if record is None:
+                return
+            if not record.resumed or record.error is not None:
+                raise RuntimeError("successor is pending RESUME")
+            revised = record.request.revised_input
+            if (input_token_ids, cache_salt, lora_task_id) != (
+                revised.input_token_ids,
+                revised.cache_salt,
+                revised.lora_task_id,
+            ):
+                raise ValueError("successor input does not match ALIGN")
+            if record.request_id is not None and record.request_id != request_id:
+                raise RuntimeError("RESUME already belongs to another request")
+            record.request_id = request_id
+
+    def confirm_attachment(
+        self, version: ExecutionVersion, request_id: int, reused_tokens: int
+    ) -> None:
+        """Check normal cache allocation acquired the promised prefix before forward."""
+        with self._lock:
+            # A revision can race the scheduler. Stale candidates still pass
+            # through the existing device/host fences; do not fail other rows.
+            if self._current.get((version.tenant_id, version.scope_id)) != version:
+                return
+            record = self._record_for_version(version)
+            if record is None:
+                return
+            if not record.resumed or record.request_id != request_id or record.error is not None:
+                raise RuntimeError("request does not own this RESUME")
+            if not record.attached:
+                if record.receipt is None or reused_tokens < record.receipt.reusable_prefix_length:
+                    raise RuntimeError("successor did not acquire the aligned KV prefix")
+                record.attached = True
+            self._reclaim(record, settle=True)
+
+    def _reclaim(self, record: _AlignmentRecord, *, settle: bool = True) -> None:
+        # Native calls belong to the engine thread. Preserve ownership and stop
+        # further cleanup when a copy wait or release has unknown completion.
+        if self._unsafe_error is not None:
+            raise self._unsafe_error
+        if record.reservation is None:
+            return
+        try:
+            if settle:
+                record.reservation.settle()
+            record.reservation.close()
+        except Exception as error:
+            self._unsafe_error = AlignmentSafetyError(
+                "RECLAIM completion is unknown; restart required"
+            )
+            record.error = self._unsafe_error
+            raise self._unsafe_error from error
+        record.reservation = None
+
+    def terminal(self, version: ExecutionVersion, request_id: int) -> None:
+        """Mark an abandoned claim; defer native release to an engine safe point."""
+        with self._lock:
+            for request, record in self._records.items():
+                if (
+                    request.revision.successor_version == version
+                    and record.request_id == request_id
+                ):
+                    record.error = RuntimeError("RESUME request is terminal")
+                    if record.reservation is not None and not self._wake_pending:
+                        self._wake_pending = True
+                        self._wake()
+                    break
 
     @contextmanager
     def resetting_cache(self) -> Iterator[None]:

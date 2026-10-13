@@ -67,8 +67,8 @@ class ScopeSnapshot:
     Args:
         current_version: Version selected by the most recent accepted revision,
             or by initial registration.
-        pending_revision: Most recent accepted revision, or None before ADVANCE.
-            Pending means that this registry has not launched the successor.
+        pending_revision: Most recent accepted revision, or None before ADVANCE and after acknowledged RESUME.
+            Clearing pending permits admission; it does not itself launch work.
 
     A snapshot can become stale as soon as another revision is accepted. It is
     not a permit to perform work or publish output.
@@ -162,6 +162,18 @@ class ScopeRegistry:
             # The authority and pending successor change together under the lock.
             record.snapshot = snapshot
             return receipt
+
+    def resume(self, revision: Revision) -> ScopeSnapshot:
+        """Clear pending state after the controller validates worker RESUME acknowledgement."""
+        with self._lock:
+            version = revision.successor_version
+            record = self._get_record(version.tenant_id, version.scope_id)
+            if record.snapshot.current_version != version:
+                raise ValueError("cannot resume a superseded revision")
+            if record.receipts.get(revision.revision_id) != AdvanceReceipt(revision):
+                raise ValueError("cannot resume an unknown revision")
+            record.snapshot = ScopeSnapshot(version, pending_revision=None)
+            return record.snapshot
 
     def snapshot(self, tenant_id: str, scope_id: str) -> ScopeSnapshot:
         """Return an immutable view of a registered scope.

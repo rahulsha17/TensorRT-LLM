@@ -6362,6 +6362,9 @@ class PyExecutor:
             """
             try:
                 self._validate_request(request)
+                guard = getattr(self, '_execution_guard', None)
+                if guard is not None:
+                    guard.validate_successor(request)
                 if self._mm_encoder_item_scheduling_enabled:
                     initialize_multimodal_encoder_request(
                         request,

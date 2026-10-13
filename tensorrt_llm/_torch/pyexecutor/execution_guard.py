@@ -121,6 +121,8 @@ class ExecutionDeviceGuard:
 
     def terminal(self, request_id: int, version: ExecutionVersion | None) -> None:
         """Complete only after terminal cleanup or removal before activation."""
+        if version is not None and self.table.alignment_state is not None:
+            self.table.alignment_state.terminal(version, request_id)
         if self.table.drain_tracker is not None:
             self.table.drain_tracker.complete(request_id, version)
 
@@ -135,6 +137,19 @@ class ExecutionDeviceGuard:
         ):
             raise ValueError(
                 "RETIRE device guards require text-only, single-beam, non-speculative requests without logits callbacks"
+            )
+
+    def validate_successor(self, request: LlmRequest) -> None:
+        """Bind revised input before scheduling can allocate KV or submit a graph."""
+        state = self.table.alignment_state
+        version = request.py_execution_version
+        if state is not None and version is not None:
+            state.claim(
+                version,
+                request.py_request_id,
+                tuple(request.get_tokens(0)),
+                request.cache_salt,
+                request.lora_task_id,
             )
 
     def revoke_obsolete_requests(self, requests: list[LlmRequest]) -> list[LlmRequest]:
@@ -161,6 +176,14 @@ class ExecutionDeviceGuard:
         Calls run on the engine's execution stream, outside model graph capture.
         """
         requests = [r for r in batch.all_requests() if r.py_execution_version is not None]
+        state = self.table.alignment_state
+        if state is not None:
+            for request in requests:
+                state.confirm_attachment(
+                    request.py_execution_version,
+                    request.py_request_id,
+                    request.prepopulated_prompt_len,
+                )
         with self.device.submission():
             for request in requests:
                 self._uses[id(request)] = _RequestUse(request, None)

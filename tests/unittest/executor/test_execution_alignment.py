@@ -51,8 +51,9 @@ def setup(request):
         server.close()
     else:
         table.close()
-    # Native ownership belongs to the engine thread, even after mailbox closure.
-    state.process()
+    # Unknown native completion intentionally retains ownership until restart.
+    if state._unsafe_error is None:
+        state.process()
 
 
 def test_reserve_before_old_release_and_acknowledge_only_after_fence(setup):
@@ -275,3 +276,222 @@ def test_invalidated_alignment_does_not_prevent_further_revocation(setup):
     result.fence.wait()
     with pytest.raises(RuntimeError, match="closed"):
         result.alignment.wait()
+
+
+def _aligned(setup):
+    controller, _, _, state, _, _ = setup
+    publication = controller.advance(REVISION, alignment=INPUT)
+    publication.publication.wait()
+    state.process()
+    return publication.alignment.wait()
+
+
+def test_resume_opens_admission_only_after_worker_accepts(setup):
+    controller, table, _, state, _, _ = setup
+    aligned = _aligned(setup)
+    with pytest.raises(ExecutionAuthorityError, match="pending"):
+        with table.admission(NEW):
+            pass
+    with pytest.raises(RuntimeError, match="pending RESUME"):
+        state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    resumed = controller.resume(aligned)
+    resumed.wait()
+    assert controller.snapshot("tenant", "scope").pending_revision is None
+    with controller.admission(NEW):
+        pass
+    with table.admission(NEW):
+        pass
+    assert controller.resume(aligned) is resumed
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    state.confirm_attachment(NEW, 10, 3)
+    # Recompute of an already attached request may subsequently have a cache miss.
+    state.confirm_attachment(NEW, 10, 0)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("input_token_ids", (1, 2, 3, 4, 9)), ("cache_salt", "other"), ("lora_task_id", 2)],
+)
+def test_resume_rejects_changed_input_without_consuming_claim(setup, field, value):
+    controller, _, _, state, _, _ = setup
+    controller.resume(_aligned(setup)).wait()
+    changed = replace(INPUT, **{field: value})
+    with pytest.raises(ValueError, match="input does not match"):
+        state.claim(NEW, 10, changed.input_token_ids, changed.cache_salt, changed.lora_task_id)
+    state.claim(NEW, 11, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    with pytest.raises(RuntimeError, match="another request"):
+        state.claim(NEW, 12, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+
+
+def test_resume_requires_native_prefix_attachment_before_reclaim(setup):
+    controller, _, _, state, reserve, _ = setup
+    controller.resume(_aligned(setup)).wait()
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    with pytest.raises(RuntimeError, match="aligned KV prefix"):
+        state.confirm_attachment(NEW, 10, 2)
+    with pytest.raises(RuntimeError, match="does not own"):
+        state.confirm_attachment(NEW, 11, 3)
+    record = next(iter(state._records.values()))
+    hold = record.reservation
+    state.confirm_attachment(NEW, 10, 3)
+    assert record.attached and record.reservation is None
+    assert [call[0] for call in hold.mock_calls] == ["settle", "close"]
+    state.confirm_attachment(NEW, 10, 3)
+    hold.close.assert_called_once()
+    reserve.assert_called_once()
+
+
+def test_resume_rejects_forged_or_superseded_receipt(setup):
+    controller, _, _, state, _, _ = setup
+    aligned = _aligned(setup)
+    with pytest.raises(ValueError, match="completed ALIGN"):
+        controller.resume(replace(aligned, reservation_id="wrong"))
+    newer = Revision("next", NEW, replace(NEW, epoch=9))
+    controller.advance(newer).publication.wait()
+    with pytest.raises(ValueError, match="obsolete"):
+        controller.resume(aligned)
+    with pytest.raises(RuntimeError, match="no longer current"):
+        state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+
+
+def test_resume_worker_rechecks_reservation_after_control_invalidation(setup):
+    controller, _, _, state, _, _ = setup
+    aligned = _aligned(setup)
+    state.close()
+    state.process()
+    with pytest.raises(RuntimeError, match="closed"):
+        controller.resume(aligned).wait()
+    assert controller.snapshot("tenant", "scope").pending_revision == REVISION
+    with pytest.raises(ExecutionAuthorityError, match="pending"):
+        with controller.admission(NEW):
+            pass
+
+
+def test_resume_retry_after_lost_ack_does_not_duplicate_ownership(setup):
+    controller, table, _, state, reserve, _ = setup
+    aligned = _aligned(setup)
+    publish = controller._transport.publish
+    failed = False
+
+    def lose_ack(update, stop):
+        nonlocal failed
+        receipt = publish(update, stop)
+        if update.resume is not None and not failed:
+            failed = True
+            raise TimeoutError("lost RESUME ack")
+        return receipt
+
+    controller._transport.publish = lose_ack
+    with pytest.raises(TimeoutError, match="lost RESUME"):
+        controller.resume(aligned).wait()
+    assert controller.snapshot("tenant", "scope").pending_revision == REVISION
+    with pytest.raises(ExecutionAuthorityError, match="pending"):
+        with controller.admission(NEW):
+            pass
+    controller.resume(aligned).wait()
+    assert controller.snapshot("tenant", "scope").pending_revision is None
+    reserve.assert_called_once()
+    assert next(iter(state._records.values())).resumed
+    with table.admission(NEW):
+        pass
+
+
+def test_new_revision_during_resume_ack_keeps_new_authority_pending(setup):
+    controller, _, _, _, _, _ = setup
+    aligned = _aligned(setup)
+    accepted, release = Event(), Event()
+    publish = controller._transport.publish
+
+    def delay_ack(update, stop):
+        receipt = publish(update, stop)
+        if update.resume is not None:
+            accepted.set()
+            assert release.wait(3)
+        return receipt
+
+    controller._transport.publish = delay_ack
+    resumed = controller.resume(aligned)
+    try:
+        assert accepted.wait(2)
+        newer = Revision("next", NEW, replace(NEW, epoch=9))
+        advanced = controller.advance(newer)
+    finally:
+        release.set()
+    with pytest.raises(RuntimeError, match="superseded"):
+        resumed.wait()
+    advanced.publication.wait()
+    assert controller.snapshot("tenant", "scope").pending_revision == newer
+    with pytest.raises(ExecutionAuthorityError):
+        with controller.admission(NEW):
+            pass
+
+
+def test_zero_prefix_can_resume_for_ordinary_recomputation(setup):
+    controller, _, _, state, reserve, _ = setup
+    reserve.side_effect = lambda _: Mock(num_tokens=0)
+    controller.resume(_aligned(setup)).wait()
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    state.confirm_attachment(NEW, 10, 0)
+
+
+@pytest.mark.parametrize("failure", ["settle", "close"])
+def test_reclaim_failure_retains_ownership_and_blocks_further_cleanup(setup, failure):
+    controller, _, _, state, _, _ = setup
+    controller.resume(_aligned(setup)).wait()
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    record = next(iter(state._records.values()))
+    hold = record.reservation
+    getattr(hold, failure).side_effect = RuntimeError("device failure")
+    with pytest.raises(AlignmentSafetyError, match="RECLAIM"):
+        state.confirm_attachment(NEW, 10, 3)
+    assert record.reservation is hold
+    if failure == "settle":
+        hold.close.assert_not_called()
+    with pytest.raises(AlignmentSafetyError):
+        with state.releasing_owner():
+            pytest.fail("must not release more resources after unknown completion")
+
+
+def test_terminal_claim_reclaimed_by_engine_and_cannot_be_replayed(setup):
+    controller, _, _, state, _, _ = setup
+    aligned = _aligned(setup)
+    controller.resume(aligned).wait()
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    record = next(iter(state._records.values()))
+    hold = record.reservation
+    state.terminal(NEW, 99)
+    assert record.error is None
+    state.terminal(NEW, 10)
+    hold.close.assert_not_called()
+    state.process()
+    hold.close.assert_called_once()
+    assert record.reservation is None
+    with pytest.raises(RuntimeError):
+        state.authorize_resume(aligned)
+    with pytest.raises(RuntimeError):
+        state.claim(NEW, 11, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    state.process()
+    hold.close.assert_called_once()
+
+
+def test_reclaimed_reservation_frees_capacity_without_reacquiring_on_retry(setup):
+    controller, _, _, state, reserve, _ = setup
+    state._max_reservations = 1
+    aligned = _aligned(setup)
+    controller.resume(aligned).wait()
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+    state.confirm_attachment(NEW, 10, 3)
+    state.process()
+    controller.advance(REVISION, alignment=INPUT).publication.wait()
+    state.process()
+    reserve.assert_called_once()
+    with state.resetting_cache():
+        pass
+    other = replace(OLD, scope_id="other")
+    controller.register(other).wait()
+    revision = Revision("other-edit", other, replace(other, epoch=8))
+    pending = controller.advance(revision, alignment=INPUT)
+    pending.publication.wait()
+    state.process()
+    assert pending.alignment.wait().reusable_prefix_length == 3
+    assert reserve.call_count == 2

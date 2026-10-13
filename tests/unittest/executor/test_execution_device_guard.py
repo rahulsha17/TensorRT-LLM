@@ -627,3 +627,55 @@ def test_alignment_wake_is_consumed_without_becoming_inference(guard):
     queue.active = False
     queue.wake_alignment()
     assert queue.request_queue.empty()
+
+
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("mode", ["eager", "graph", "compiled", "compiled-graph"])
+def test_resume_handoff_before_common_forward_boundary(guard, v2, overlap, mode):
+    from tensorrt_llm.execution_alignment import (
+        AlignmentInput,
+        AlignmentRequest,
+        WorkerAlignmentState,
+    )
+    from tensorrt_llm.execution_authority import Revision
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    executor = _executor()
+    executor._is_kv_manager_v2 = v2
+    executor.disable_overlap_scheduler = not overlap
+    executor.model_engine.cuda_graph_config = object() if "graph" in mode else None
+    executor.model_engine.torch_compile_config = object() if "compiled" in mode else None
+    ExecutionDeviceGuard.validate_executor(executor)
+    native_hold = Mock(num_tokens=3)
+    state = guard.table.alignment_state = WorkerAlignmentState(lambda _: native_hold, lambda: None)
+    guard.table.drain_tracker = RequestDrainTracker()
+    revised = AlignmentInput((1, 2, 3, 4, 5), cache_salt="cache")
+    alignment = AlignmentRequest("session", Revision("edit", VERSION, NEXT), revised)
+    guard.table.apply(VersionUpdate("session", 2, NEXT, alignment))
+    state.process()
+    receipt = guard.table.poll_alignment(alignment)
+    guard.table.apply(VersionUpdate("session", 3, NEXT, alignment, receipt))
+    request = _request(NEXT)
+    request.get_tokens = Mock(return_value=list(revised.input_token_ids))
+    request.cache_salt = revised.cache_salt
+    request.lora_task_id = None
+    guard.validate_successor(request)
+    request.prepopulated_prompt_len = 2
+    with pytest.raises(RuntimeError, match="aligned KV prefix"):
+        with guard.forward(_batch(request, context=True)):
+            pytest.fail("must not submit the model without its prefix")
+    guard.device.submission.assert_not_called()
+    request.prepopulated_prompt_len = 3
+    with guard.forward(_batch(request, context=True)):
+        assert next(iter(state._records.values())).attached
+    native_hold.settle.assert_called_once()
+    native_hold.close.assert_called_once()
+    # A later revision still cancels this resumed execution.
+    later = replace(NEXT, epoch=9)
+    guard.table.apply(VersionUpdate("session", 4, later))
+    assert guard.revoke_obsolete_requests([request]) == [request]
+    # A stale row racing submission is handled by normal fences, not a
+    # batch-wide alignment exception that would poison unrelated requests.
+    with guard.forward(_batch(request)):
+        pass
