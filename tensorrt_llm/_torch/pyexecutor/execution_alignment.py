@@ -95,11 +95,15 @@ class KVAlignmentAdapter:
             lora_task_id=revised.lora_task_id,
             cache_salt=revised.cache_salt,
         )
-        reservation = _Reservation(
-            0,
-            lambda: manager.impl.remove_sequence(request_id, None, False),
-            manager._stream.synchronize,
-        )
+
+        def release() -> None:
+            # The binding requires a request. Mark it dummy only at release:
+            # allocation must match cached blocks, but cleanup must never
+            # publish this unexecuted sequence's private blocks for reuse.
+            request.is_dummy_request = True
+            manager.impl.remove_sequence(request_id, request, False)
+
+        reservation = _Reservation(0, release, manager._stream.synchronize)
         try:
             manager.impl.sync_transfer_manager_with_buffer_manager()
             manager.impl.add_sequence_batch([(request_id, len(tokens), 1)], [request])

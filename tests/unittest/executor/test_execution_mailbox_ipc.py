@@ -112,7 +112,8 @@ def test_publication_reaches_busy_spawned_worker_and_preserves_uint64_epoch(monk
     child.close()
     controller = None
     try:
-        assert parent.poll(10), "worker did not start"
+        # Native package imports in a spawned interpreter may take tens of seconds.
+        assert parent.poll(60), "worker did not start"
         address = parent.recv()
         controller = ExecutionController("session", IpcPublicationTransport(address, timeout=2))
         original = replace(VERSION, epoch=(1 << 64) - 2)
@@ -182,7 +183,7 @@ def test_abrupt_worker_death_fails_publication_without_resetting_authority() -> 
     child.close()
     controller = None
     try:
-        assert parent.poll(10)
+        assert parent.poll(60), "worker did not start"
         controller = ExecutionController(
             "session", IpcPublicationTransport(parent.recv(), timeout=0.5)
         )

@@ -32,7 +32,7 @@ def _request(
 ) -> GenerationRequest:
     request = GenerationRequest(
         [1, 2, 3],
-        SamplingParams(max_tokens=5, seed=1, n=2),
+        SamplingParams(max_tokens=5, seed=1, n=2, top_k=2),
         cache_salt=cache_salt,
         execution_version=version,
     )

@@ -237,8 +237,12 @@ def test_proxy_submit_checks_authority_at_request_queue(controller) -> None:
     assert result._execution is not None
     proxy.request_queue.put_nowait.assert_called_once_with(request)
     controller.advance(REVISION)
+    stale_request = GenerationRequest(
+        [1, 2], SamplingParams(max_tokens=1), execution_version=VERSION
+    )
+    proxy._get_next_client_id.return_value = 43
     with pytest.raises(ExecutionAuthorityError):
-        GenerationExecutorProxy.submit(proxy, request)
+        GenerationExecutorProxy.submit(proxy, stale_request)
     assert proxy.request_queue.put_nowait.call_count == 1
 
 

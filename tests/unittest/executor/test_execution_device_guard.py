@@ -493,7 +493,7 @@ def test_fence_covers_enqueue_until_terminal_cleanup(guard):
         pass
     executor.resource_manager = Mock()
     executor._prefetched_request_ids = set()
-    executor.disagg = Mock()
+    executor._disagg_coordinator = Mock()
     executor.gather_all_responses = True
     executor.result_wait_queues = {}
     # Missing GPU completion cannot become a successful fence.
@@ -594,7 +594,7 @@ def test_alignment_hold_acquired_before_old_resources_are_freed(guard):
     executor.resource_manager = Mock()
     executor.resource_manager.free_resources.side_effect = lambda request: order.append("free old")
     executor._prefetched_request_ids = set()
-    executor.disagg = Mock()
+    executor._disagg_coordinator = Mock()
     executor._free_request_resources(request)
     assert order == ["acquire hold", "free old"]
     hold.close.assert_not_called()

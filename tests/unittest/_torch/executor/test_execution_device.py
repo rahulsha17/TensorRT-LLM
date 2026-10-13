@@ -325,3 +325,80 @@ def test_native_in_graph_sampling_is_guarded_after_replay() -> None:
     assert rejected.allowed == [False, True]
     assert rejected.tokens_host.tolist() == [0, 5]
     assert sampler.store.new_tokens[0, 2, 0].item() == 3
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_native_v1_alignment_release_never_publishes_unexecuted_blocks(cached, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tensorrt_llm._torch.pyexecutor.execution_alignment import KVAlignmentAdapter
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.bindings import DataType, LayerType
+    from tensorrt_llm.bindings import ModelConfig as NativeModelConfig
+    from tensorrt_llm.bindings.executor import SamplingConfig
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType, LlmRequest
+    from tensorrt_llm.execution_alignment import AlignmentInput
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    config = NativeModelConfig(
+        vocab_size=64,
+        num_layers=1,
+        num_attention_layers=1,
+        num_rnn_layers=0,
+        num_heads=2,
+        hidden_size=64,
+        data_type=DataType.HALF,
+    )
+    config.layer_types = [LayerType.ATTENTION]
+    config.set_num_kv_heads(2)
+    manager = KVCacheManager(
+        kv_cache_config=KvCacheConfig(max_tokens=256, enable_block_reuse=True),
+        kv_cache_type=CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=32,
+        tokens_per_block=16,
+        max_seq_len=64,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        model_config=config,
+        max_beam_width=1,
+    )
+    tokens = [1] * 33
+    if cached:
+        seed = LlmRequest(
+            request_id=10,
+            max_new_tokens=1,
+            input_tokens=tokens,
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+            cache_salt="shared",
+        )
+        manager.impl.add_sequence_batch([(10, len(tokens), 1)], [seed])
+        manager.impl.refresh_blocks()
+        manager._stream.synchronize()
+        # Seed native ownership metadata; no model reads these synthetic values.
+        manager.impl.store_blocks_for_reuse(10, seed, False)
+    executor = SimpleNamespace(
+        kv_cache_manager=manager,
+        max_seq_len=64,
+        _is_kv_manager_v2=False,
+        executor_request_queue=Mock(),
+    )
+    executor.executor_request_queue.reserve_request_id.return_value = 11
+    probe = manager.probe_prefix_match_length
+    # Exercise an advisory hit that has disappeared before native allocation.
+    monkeypatch.setattr(manager, "probe_prefix_match_length", lambda *args: 32)
+    hold = KVAlignmentAdapter(executor).reserve(AlignmentInput(tuple(tokens), cache_salt="shared"))
+    assert hold.num_tokens == (32 if cached else 0)
+    if cached:
+        seed.is_dummy_request = True
+        manager.impl.remove_sequence(10, seed, False)
+    hold.settle()
+    hold.close()
+    hold.close()
+    assert probe(tokens, None, "shared") == (32 if cached else 0)
+    assert probe(tokens, None, "other") == 0

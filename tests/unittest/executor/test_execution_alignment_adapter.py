@@ -14,6 +14,12 @@ pytestmark = pytest.mark.cpu_only
 INPUT = AlignmentInput(tuple(range(17)), cache_salt="shared", lora_task_id=3)
 
 
+def assert_v1_release(manager):
+    request = manager.impl.add_sequence_batch.call_args.args[1][0]
+    assert request.is_dummy_request
+    manager.impl.remove_sequence.assert_called_once_with(99, request, False)
+
+
 @pytest.fixture
 def engine():
     manager = Mock(enable_block_reuse=True, tokens_per_block=4)
@@ -53,6 +59,7 @@ def test_v1_acquires_native_sequence_and_reports_actual_match(engine):
     def allocate(infos, requests):
         assert infos == [(99, 13, 1)]
         req = requests[0]
+        assert not req.is_dummy_request
         assert req.cache_salt == "shared" and req.lora_task_id == 3
         # Native allocation may acquire less than the advisory probe predicted.
         req.set_prepopulated_prompt_len(8, 4)
@@ -64,7 +71,7 @@ def test_v1_acquires_native_sequence_and_reports_actual_match(engine):
     assert hold.num_tokens == 8
     assert order == ["allocate", "wait copies"]
     hold.close()
-    manager.impl.remove_sequence.assert_called_once_with(99, None, False)
+    assert_v1_release(manager)
     manager.impl.store_blocks_for_reuse.assert_not_called()
 
 
@@ -76,7 +83,7 @@ def test_v1_failure_settles_copies_before_releasing_partial_allocation(engine):
         KVAlignmentAdapter(engine).reserve(INPUT)
     manager.impl.refresh_blocks.assert_called_once()
     manager._stream.synchronize.assert_called_once()
-    manager.impl.remove_sequence.assert_called_once_with(99, None, False)
+    assert_v1_release(manager)
 
 
 def test_v1_unknown_copy_completion_retains_native_sequence(engine):
@@ -132,4 +139,4 @@ def test_reclaim_waits_on_manager_copy_stream(engine, v2):
     if v2:
         manager.impl.create_kv_cache.return_value.close.assert_called_once()
     else:
-        manager.impl.remove_sequence.assert_called_once_with(99, None, False)
+        assert_v1_release(manager)

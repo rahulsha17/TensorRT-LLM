@@ -75,6 +75,8 @@ def test_direct_worker_shutdown_closes_publication_before_engine(monkeypatch) ->
 
 def test_proxy_pre_shutdown_closes_publication_before_worker_shutdown_message() -> None:
     proxy = object.__new__(GenerationExecutorProxy)
+    # This shell owns no transport resources for __del__ to shut down.
+    proxy.shutdown = MagicMock()
     proxy._init_execution_control()
     proxy.workers_started = True
     proxy.doing_shutdown = False
@@ -94,6 +96,8 @@ def test_proxy_pre_shutdown_closes_publication_before_worker_shutdown_message() 
 
 def test_attached_frontend_rejects_publication_without_worker_attributes() -> None:
     proxy = object.__new__(GenerationExecutorFrontendProxy)
+    # This shell owns no transport resources for __del__ to shut down.
+    proxy.shutdown = MagicMock()
     proxy._init_execution_control()
     proxy.doing_shutdown = False
     proxy._num_frontends = 2
