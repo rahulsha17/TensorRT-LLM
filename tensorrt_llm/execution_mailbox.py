@@ -149,6 +149,11 @@ class WorkerVersionTable:
         self._session_id = session_id
         self._lock = RLock()
         self._versions: dict[tuple[str, str], VersionUpdate] = {}
+        # Forward submission holds the device lock. Its advisory polls must not
+        # take _lock, which the publisher holds while acquiring the device lock.
+        self._observation_lock = Lock()
+        self._observed_versions: dict[tuple[str, str], ExecutionVersion] = {}
+        self._observation_failed = False
         self._closed = False
         self._gate = HostExecutionGate(self._lock, self._current_version_locked)
         self._device_publisher: DeviceVersionPublisher | None = None
@@ -209,6 +214,24 @@ class WorkerVersionTable:
             self._require_open()
             yield [v is None or self._current_version_locked(v) == v for v in versions]
 
+    def observe_allowed(self, versions: tuple[ExecutionVersion | None, ...]) -> tuple[bool, ...]:
+        """Poll authority for early exit, never for admission or token/KV commit.
+
+        A positive observation can immediately become stale. A revoked version
+        cannot become current again. This lock is never held across a CUDA call
+        or while acquiring the main authority lock.
+        """
+        with self._observation_lock:
+            return tuple(
+                version is None
+                or (
+                    not self._observation_failed
+                    and self._observed_versions.get((version.tenant_id, version.scope_id))
+                    == version
+                )
+                for version in versions
+            )
+
     @property
     def session_id(self) -> str:
         """Identity of the authority owner bound for this table's lifetime."""
@@ -241,12 +264,16 @@ class WorkerVersionTable:
             if self.alignment_state is not None:
                 self.alignment_state.observe(update.version, update.alignment)
             self._versions[key] = update
+            with self._observation_lock:
+                self._observed_versions[key] = update.version
             self._gate.revoke_locked(update.version)
             if self._device_publisher is not None:
                 try:
                     self._device_publisher.publish(update.version)
                 except Exception as error:
                     self._publication_error = error
+                    with self._observation_lock:
+                        self._observation_failed = True
                     self._gate.close_locked()
                     raise
             return PublicationReceipt(update, update.version)
@@ -275,6 +302,8 @@ class WorkerVersionTable:
         """Invalidate observations when the worker stops."""
         with self._lock:
             self._closed = True
+            with self._observation_lock:
+                self._observation_failed = True
             self._gate.close_locked()
             if self.alignment_state is not None:
                 self.alignment_state.close()

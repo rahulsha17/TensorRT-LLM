@@ -402,3 +402,46 @@ def test_native_v1_alignment_release_never_publishes_unexecuted_blocks(cached, m
     hold.close()
     assert probe(tokens, None, "shared") == (32 if cached else 0)
     assert probe(tokens, None, "other") == 0
+
+
+def test_breakable_graph_revocation_preserves_unsubmitted_segments() -> None:
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import BreakableCUDAGraph
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        early_exit_scope,
+    )
+
+    values = torch.zeros(3, device="cuda")
+    views = list(values.unbind())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = BreakableCUDAGraph()
+    revoked = False
+
+    def revoke():
+        nonlocal revoked
+        revoked = True
+
+    with torch.cuda.stream(stream):
+        for value in views:
+            value.add_(1)
+        stream.synchronize()
+        for value in views:
+            segment = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(segment, stream=stream):
+                value.add_(1)
+            graph._segments.append(segment)
+        graph._break_functions = [revoke, lambda: None]
+        values.zero_()
+        with early_exit_scope(lambda: revoked):
+            with pytest.raises(ExecutionEarlyExit):
+                graph.replay()
+        done = torch.cuda.Event()
+        done.record()
+    done.synchronize()
+    assert values.tolist() == [1, 0, 0]
+    with torch.cuda.stream(stream):
+        graph.replay()
+        done.record()
+    done.synchronize()
+    assert values.tolist() == [2, 1, 1]

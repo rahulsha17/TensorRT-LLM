@@ -15,6 +15,7 @@ from cuda.bindings import runtime as rt
 from tensorrt_llm._utils import CUASSERT
 
 from ...utils import make_weak_ref
+from ..execution_early_exit import execution_early_exit_point
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,7 @@ class BreakableCUDAGraph:
         replay_token = _current_replay_token.set(next(_replay_token_counter))
         try:
             for index, segment in enumerate(self._segments):
+                execution_early_exit_point()
                 segment.replay()
                 if index < len(self._break_functions):
                     self._break_functions[index]()

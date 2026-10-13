@@ -147,9 +147,12 @@ class WorkerAlignmentState:
         reserve: Callable[[AlignmentInput], PrefixReservation],
         wake: Callable[[], None],
         max_reservations: int = 256,
+        *,
+        prepare: Callable[[AlignmentRequest], None] | None = None,
     ) -> None:
         self._lock = RLock()
         self._reserve = reserve
+        self._prepare = prepare
         self._wake = wake
         self._max_reservations = max_reservations
         self._current: dict[tuple[str, str], ExecutionVersion] = {}
@@ -198,6 +201,8 @@ class WorkerAlignmentState:
                     if not self._is_current(request) or record.receipt is not None or record.error:
                         continue
                     try:
+                        if self._prepare is not None:
+                            self._prepare(request)
                         reservation = self._reserve(request.revised_input)
                         record.reservation = reservation
                         count = reservation.num_tokens

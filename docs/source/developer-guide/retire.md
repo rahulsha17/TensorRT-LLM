@@ -476,10 +476,11 @@ The worker matches the revised tokens in its existing cache tree, using the
 supplied salt and LoRA identity. Its manager fixes the model and KV layout.
 Neither epoch nor scope ID changes the cache namespace. A token mismatch ends
 the usable prefix; a changed salt or LoRA identity searches a different namespace.
-The match can use compatible KV from other requests too. Only prefixes already
-published for ordinary reuse are eligible; unpublished computed tails are
-recomputed. In particular, a V1 interruption before its context publication can
-produce a shorter match than the amount of prefill work already performed.
+The match can use compatible KV from other requests too. V2 uses prefixes published by its ordinary commit protocol. V1 also publishes the
+old request's completed, block-aligned prefill prefix after draining its GPU uses,
+before ALIGN probes the tree. A native frozen frontier bounds every subsequent
+V1 store and release, including a zero-token frontier. An interrupted chunk that
+did not finish all layers is never inherited.
 
 A probe alone does not count as ALIGN. The worker acquires native ownership:
 
@@ -617,6 +618,77 @@ This is KV reclamation, not deletion of scope or epoch history.
 These operations stay outside graph capture and use the same boundary with
 V1/V2, eager, overlap, graph, and compiled execution. The copy wait occurs once
 per handoff, not on every decoding step.
+
+## Early exit during prefill
+
+REVISION can now save unfinished computation as well as retain completed KV.
+The runtime still calls ADVANCE with the revised input; no new runtime API is
+needed. Chunked prefill must be enabled and the prompt must span multiple chunks
+if the revision is to inherit an earlier completed chunk.
+
+```text
+Chunk 1 completes all layers -> accepted prefix frontier
+Chunk 2 starts -> runtime sends ADVANCE
+  -> next supported execution boundary observes revocation
+  -> stop submitting the rest of the wholly revoked batch
+  -> record completion of work already submitted
+  -> drain old GPU uses
+  -> V1 publishes only the frozen completed prefix; V2 retains committed pages
+  -> ALIGN acquires ownership -> FENCE/ALIGN receipts -> RESUME
+  -> successor prefills the remaining input
+```
+
+| Execution path | Early-exit boundary |
+| --- | --- |
+| Eager Qwen3 prefill, at least 32 scheduled context tokens | Before each group of four decoder layers |
+| Breakable prefill CUDA graph | Before each replay segment |
+| Monolithic CUDA graph or compiled model | Before submitting the model/graph |
+| Other eager models | Before submitting the model |
+
+Both KV managers and eager/overlap schedulers use the same batch guard and
+completion tracking. These boundaries are implemented, not yet performance
+qualified. Already-launched kernels are not preempted. Compilation and capture
+never record a Python authority decision into the graph. A monolithic graph has
+no internal host interruption point; adding one requires graph partitioning.
+
+Only a batch whose every real row has lost authority may exit. A live request
+from another scope or an untagged neighbor makes the complete batch continue.
+Output and context-commit gates still reject the obsolete rows. This preserves
+live neighbors but does not eliminate the stale row's dense computation in a
+mixed batch. Per-row compaction is separate work.
+
+Layer checks use a separate read-only authority observation lock. They never
+acquire the worker's main authority lock while holding the device-submission
+lock. A positive observation is advisory; admission and commit still use their
+existing gates. Short decode steps do not run the per-layer polls.
+
+An early-exit signal skips sampling and context advancement for that batch. It
+is not a model failure and does not cancel other active requests. The guard's
+completion events remain live until normal terminal cleanup. Source preparation
+waits only for obsolete executions in the revised scope, not unrelated scopes.
+FENCE still requires cleanup; this change does not move unsafe release past RESUME.
+
+**Build requirement:** the frozen V1 frontier adds a native request field and
+binding. Rebuild the C++ library and Python bindings from this branch together.
+The earlier performance campaign's wheel plus a Python-only overlay is not a
+matching build for this change.
+
+For validation, run the existing execution mailbox/guard/alignment suites, the
+native `LlmRequestTest.retiredKvFrontierCannotGrow` and
+`KVCacheManagerTest.RetiredPrefillPublishesOnlyFrozenCompletePrefix` tests, and
+`tests/unittest/_torch/executor/test_execution_device.py` on CUDA. The host tests
+cover early-exit unwinding, mixed/live neighbors, blocked publication, zero and
+partial frontiers, graph replay cleanup, and failed completion evidence. The
+CUDA test checks that skipped graph segments do not write and that the graph
+can subsequently replay normally.
+
+The next performance campaign must interrupt during active prefill, verify the
+observed completed frontier and skipped work, and compare against native prefix
+reuse as well as cold restart. Submit the revision's successor as soon as its
+handoff permits, without waiting for unrelated cache churn. Report
+revision-to-first-token, no-revision overhead, and live-neighbor latency. The
+older post-prefill campaign does not measure these new hooks, and its speedup
+numbers must not be presented as validation of this change.
 
 ## Testing
 

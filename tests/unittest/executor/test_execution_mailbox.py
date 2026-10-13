@@ -290,3 +290,47 @@ def test_receipt_requires_observation_of_the_requested_scope_and_epoch(
 ) -> None:
     with pytest.raises(ValueError):
         PublicationReceipt(VersionUpdate("session", 1, VERSION), observed)
+
+
+def test_execution_poll_observes_revision_while_device_publication_is_blocked():
+    from threading import Thread
+
+    table = WorkerVersionTable("session")
+    entered, release = Event(), Event()
+
+    class Publisher:
+        def publish(self, version):
+            if version.epoch == 8:
+                entered.set()
+                assert release.wait(5)
+
+    table.bind_device_publisher(Publisher())
+    table.apply(VersionUpdate("session", 1, VERSION))
+    next_version = replace(VERSION, epoch=8)
+    publisher = Thread(target=lambda: table.apply(VersionUpdate("session", 2, next_version)))
+    publisher.start()
+    try:
+        assert entered.wait(5)
+        # The publisher still owns the main authority lock here. A layer hook
+        # must observe revocation without waiting for that publisher to finish.
+        assert table.observe_allowed((VERSION, next_version, None)) == (False, True, True)
+    finally:
+        release.set()
+        publisher.join(5)
+    assert not publisher.is_alive()
+    table.apply(VersionUpdate("session", 1, VERSION))
+    assert table.observe_allowed((VERSION, next_version)) == (False, True)
+    table.close()
+    assert table.observe_allowed((next_version, None)) == (False, True)
+
+
+def test_failed_publication_closes_advisory_execution_observation():
+    class Publisher:
+        def publish(self, version):
+            raise RuntimeError("device unavailable")
+
+    table = WorkerVersionTable("session")
+    table.bind_device_publisher(Publisher())
+    with pytest.raises(RuntimeError, match="device unavailable"):
+        table.apply(VersionUpdate("session", 1, VERSION))
+    assert table.observe_allowed((VERSION, None)) == (False, True)

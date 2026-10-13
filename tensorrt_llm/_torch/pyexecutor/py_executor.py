@@ -83,6 +83,7 @@ from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
+from .execution_early_exit import ExecutionEarlyExit
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
@@ -5632,7 +5633,12 @@ class PyExecutor:
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
 
-                    assert sample_state is not None, "Sampling failed"
+                    assert sample_state is not None or (
+                        getattr(self, '_execution_guard', None) is not None
+                        and batch_outputs is None
+                        and all(r.is_finished
+                                for r in scheduled_batch.all_requests())
+                    ), "Sampling failed"
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,
@@ -7925,6 +7931,15 @@ class PyExecutor:
                                                      scheduled_requests)
 
             return outputs
+        except ExecutionEarlyExit:
+            # The guard's finally block recorded every submitted GPU use before
+            # unwinding. Keep those events and all KV until ordinary cleanup.
+            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if route_capture is not None:
+                route_capture.abort_forward()
+            guard.revoke_obsolete_requests(
+                list(scheduled_requests.all_requests()))
+            return None
         except Exception as e:
             self._maybe_record_hang_diagnostic_phase("forward_error",
                                                      scheduled_requests)
@@ -8083,6 +8098,8 @@ class PyExecutor:
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
+        if sample_state is None:
+            return
         try:
             guard = getattr(self, '_execution_guard', None)
             commit = (guard.token_commit(sample_state)

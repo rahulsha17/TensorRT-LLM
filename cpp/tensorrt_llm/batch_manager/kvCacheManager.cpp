@@ -81,6 +81,12 @@ SizeType32 getUsableUniqueTokenCountForReuse(
     VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
     auto const materializedUniqueTokenCount = getMaterializedUniqueTokenCountForReuse(uniqueTokens, llmRequest);
+    if (auto const frontier = llmRequest.getRetireKvFrontier(); frontier.has_value())
+    {
+        // A retired prefix needs KV, not logits for its last token. The bound
+        // includes only complete layers and excludes any interrupted chunk.
+        return std::min(std::max(materializedUniqueTokenCount, 0), frontier.value());
+    }
     return materializedUniqueTokenCount > 0 ? materializedUniqueTokenCount - 1 : 0;
 }
 
@@ -927,7 +933,8 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
     // pre-#13029 single-shot test semantics without affecting production (production
     // always sets contextCurrentPosition > 0 before invoking storeContextBlocks).
     SizeType32 usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, llmRequest);
-    if (usableUniqueTokenCount == 0 && llmRequest.getContextCurrentPosition() == 0)
+    if (usableUniqueTokenCount == 0 && llmRequest.getContextCurrentPosition() == 0
+        && !llmRequest.getRetireKvFrontier().has_value())
     {
         usableUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size()) - 1;
     }
@@ -3068,7 +3075,8 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
     // regardless of whether earlier blocks are already in the trie.  See
     // storeContextBlocks for the legacy-test fallback used when contextCurrentPosition==0.
     auto usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
-    if (usableUniqueTokenCount == 0 && llmRequest->getContextCurrentPosition() == 0 && !uniqueTokens.empty())
+    if (usableUniqueTokenCount == 0 && llmRequest->getContextCurrentPosition() == 0 && !uniqueTokens.empty()
+        && !llmRequest->getRetireKvFrontier().has_value())
     {
         usableUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size()) - 1;
     }
@@ -3123,7 +3131,8 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
         // Respect chunked prefill (see storeContextBlocks for detail + legacy-test fallback).
         SizeType32 usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
-        if (usableUniqueTokenCount == 0 && llmRequest->getContextCurrentPosition() == 0 && !uniqueTokens.empty())
+        if (usableUniqueTokenCount == 0 && llmRequest->getContextCurrentPosition() == 0 && !uniqueTokens.empty()
+            && !llmRequest->getRetireKvFrontier().has_value())
         {
             usableUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size()) - 1;
         }

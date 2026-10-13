@@ -743,3 +743,19 @@ INSTANTIATE_TEST_SUITE_P(LlmRequestTest, ParamTest,
         // numReturnSequences
         testing::Values(1, 2)),
     generateTestName);
+
+TEST_F(LlmRequestTest, retiredKvFrontierCannotGrow)
+{
+    texec::Request execReq(VecTokens{1, 2, 3, 4, 5}, 4);
+    tb::LlmRequest request(77, execReq);
+    EXPECT_FALSE(request.getRetireKvFrontier().has_value());
+    EXPECT_ANY_THROW(request.freezeRetireKvFrontier(-1));
+    EXPECT_ANY_THROW(request.freezeRetireKvFrontier(6));
+    request.freezeRetireKvFrontier(4);
+    EXPECT_EQ(request.getRetireKvFrontier().value(), 4);
+    EXPECT_NO_THROW(request.freezeRetireKvFrontier(4));
+    EXPECT_ANY_THROW(request.freezeRetireKvFrontier(5));
+    request.freezeRetireKvFrontier(0);
+    EXPECT_EQ(request.getRetireKvFrontier().value(), 0);
+    EXPECT_ANY_THROW(request.freezeRetireKvFrontier(1));
+}

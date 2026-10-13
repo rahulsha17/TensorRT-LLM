@@ -11,13 +11,14 @@ from typing import TYPE_CHECKING
 import torch
 
 from ...bindings.executor import FinishReason
-from ...execution_alignment import WorkerAlignmentState
+from ...execution_alignment import AlignmentRequest, AlignmentSafetyError, WorkerAlignmentState
 from ...execution_fence import RequestDrainTracker
 from ...execution_gate import ExecutionAuthorityError
 from ...execution_mailbox import WorkerVersionTable
 from ...execution_version import ExecutionVersion
 from .execution_alignment import KVAlignmentAdapter
 from .execution_device import DeviceExecutionAuthority
+from .execution_early_exit import early_exit_scope
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .sampler import SampleStateTorch, TorchSampler
@@ -68,15 +69,40 @@ class ExecutionDeviceGuard:
 
     def __init__(self, executor: "PyExecutor", table: WorkerVersionTable) -> None:
         self.validate_executor(executor)
+        if not executor._is_kv_manager_v2 and not hasattr(LlmRequest, "freeze_retire_kv_frontier"):
+            raise RuntimeError("RETIRE V1 prefill inheritance requires rebuilt native bindings")
         self.table = table
         self.device = DeviceExecutionAuthority(executor.device_id)
         self._kv_manager = executor.kv_cache_manager if executor._is_kv_manager_v2 else None
+        self._v1_manager = None if executor._is_kv_manager_v2 else executor.kv_cache_manager
+        self._alignment_adapter = KVAlignmentAdapter(executor)
         self._uses: dict[int, _RequestUse] = {}
+        self._prefill_frontiers: dict[int, int] = {}
         table.bind_device_publisher(self.device)
         table.drain_tracker = RequestDrainTracker()
         table.alignment_state = WorkerAlignmentState(
-            KVAlignmentAdapter(executor).reserve, executor.executor_request_queue.wake_alignment
+            self._alignment_adapter.reserve,
+            executor.executor_request_queue.wake_alignment,
+            prepare=self._prepare_prefix,
         )
+
+    def _prepare_prefix(self, alignment: AlignmentRequest) -> None:
+        # Prepare only this scope's obsolete sources. Unrelated work must not
+        # delay the handoff. Old owners stay alive throughout tree acquisition.
+        old = alignment.revision.expected_version
+        for use in list(self._uses.values()):
+            version = use.request.py_execution_version
+            if (
+                version is not None
+                and (version.tenant_id, version.scope_id) == (old.tenant_id, old.scope_id)
+                and version.epoch <= old.epoch
+            ):
+                try:
+                    self._settle_prefix(use.request)
+                except Exception as error:
+                    raise AlignmentSafetyError(
+                        "source KV preparation failed; restart required"
+                    ) from error
 
     def process_alignment(self) -> None:
         """Drive native prefix reservations on the engine thread outside capture."""
@@ -184,7 +210,21 @@ class ExecutionDeviceGuard:
                     request.py_request_id,
                     request.prepopulated_prompt_len,
                 )
-        with self.device.submission():
+        for request in requests:
+            self._prefill_frontiers.setdefault(id(request), request.prepopulated_prompt_len)
+        # Include untagged rows: one live neighbor prohibits a whole-batch exit.
+        versions = tuple(r.py_execution_version for r in batch.all_requests())
+
+        def wholly_obsolete() -> bool:
+            return bool(versions) and not any(self.table.observe_allowed(versions))
+
+        with (
+            self.device.submission(),
+            early_exit_scope(
+                wholly_obsolete if versions and all(v is not None for v in versions) else None,
+                layer_checks=sum(r.context_chunk_size for r in batch.context_requests) >= 32,
+            ),
+        ):
             for request in requests:
                 self._uses[id(request)] = _RequestUse(request, None)
             try:
@@ -283,6 +323,27 @@ class ExecutionDeviceGuard:
                 r for r in batch.context_requests_last_chunk if id(r) not in rejected
             ]
             yield accepted
+            for request in accepted.context_requests:
+                if request.py_execution_version is not None and not request.is_finished:
+                    self._prefill_frontiers[id(request)] = request.context_current_position
+
+    def _settle_prefix(self, request: LlmRequest) -> None:
+        use = self._uses.get(id(request))
+        if use is not None:
+            if use.event is None:
+                raise RuntimeError("request GPU completion is unknown; refusing resource release")
+            self.device.wait_event(use.event)
+        if request.py_execution_version is None:
+            return
+        if self._v1_manager is not None:
+            block_size = self._v1_manager.tokens_per_block
+            frontier = self._prefill_frontiers.get(id(request), 0) // block_size * block_size
+            request.freeze_retire_kv_frontier(frontier)
+            if frontier and self._v1_manager.enable_block_reuse:
+                self._v1_manager.store_blocks_for_reuse(request)
+        elif self._kv_manager is not None:
+            # V2 already publishes accepted chunks through its commit protocol.
+            self._kv_manager.stop_request_committing(request)
 
     def before_release(self, request: LlmRequest) -> None:
         """Settle this request's latest submitted use before ordinary cleanup.
@@ -291,14 +352,29 @@ class ExecutionDeviceGuard:
         this request's commit frontier; it keeps the tree and other owners' holds.
         Terminal cleanup reports completion to FENCE after resource release succeeds.
         """
-        use = self._uses.get(id(request))
-        if use is not None:
-            if use.event is None:
-                raise RuntimeError("request GPU completion is unknown; refusing resource release")
-            self.device.wait_event(use.event)
-        if request.py_execution_version is not None and self._kv_manager is not None:
-            self._kv_manager.stop_request_committing(request)
+        version = request.py_execution_version
+        interrupted = (
+            version is not None
+            and request.is_finished
+            and (
+                request.context_remaining_length > 0
+                or not self.table.observe_allowed((version,))[0]
+            )
+        )
+        if interrupted:
+            self._settle_prefix(request)
+        else:
+            use = self._uses.get(id(request))
+            if use is not None:
+                if use.event is None:
+                    raise RuntimeError(
+                        "request GPU completion is unknown; refusing resource release"
+                    )
+                self.device.wait_event(use.event)
+            if request.py_execution_version is not None and self._kv_manager is not None:
+                self._kv_manager.stop_request_committing(request)
         self._uses.pop(id(request), None)
+        self._prefill_frontiers.pop(id(request), None)
 
     @staticmethod
     def _cancel(request: LlmRequest) -> None:

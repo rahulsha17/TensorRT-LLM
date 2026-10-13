@@ -4613,7 +4613,9 @@ class DecoderRunner(ScheduledModelRunner):
             self._prepare_inputs_event.record()
 
             breakable_runner = self.breakable_cuda_graph_runner
+            from ....execution_early_exit import execution_early_exit_point
 
+            execution_early_exit_point()
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
 
                 def forward_step():

@@ -11137,3 +11137,36 @@ TEST_F(KVCacheManagerTest, VswaDisaggDtypeMismatchTriggersGuard)
     EXPECT_THROW({ CacheTransBufferManager const ctbm(kvCacheManager.get(), /*maxNumTokens=*/std::nullopt); },
         tensorrt_llm::common::TllmException);
 }
+
+TEST_F(KVCacheManagerTest, RetiredPrefillPublishesOnlyFrozenCompletePrefix)
+{
+    for (SizeType32 const frontier : {0, 4, 8})
+    {
+        SCOPED_TRACE(frontier);
+        auto const stream = std::make_shared<tr::CudaStream>();
+        auto manager = makeVSWAManager(12, /*enableBlockReuse=*/true, stream);
+        tle::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+        auto tokens = std::make_shared<VecTokens>(11);
+        std::iota(tokens->begin(), tokens->end(), kVSWA_FIRST_TOKEN);
+        auto old = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, tokens, samplingConfig, kVSWA_IS_STREAMING);
+        addSequenceForTest(*manager, 0, 11, kVSWA_BEAM_WIDTH, old);
+        old->setContextCurrentPosition(frontier);
+        old->freezeRetireKvFrontier(frontier);
+        manager->storeBlocksForReuse(0, old, /*pinBlocks=*/false);
+        // Exercise both publication paths, including the legacy zero-position
+        // fallback. Neither may expose the unwritten tail.
+        manager->storeContextBlocks(*old);
+        auto successor
+            = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, tokens, samplingConfig, kVSWA_IS_STREAMING);
+        addSequenceForTest(*manager, 1, 11, kVSWA_BEAM_WIDTH, successor);
+        EXPECT_EQ(successor->getPrepopulatedPromptLen(), frontier);
+        static_cast<void>(manager->removeSequence(1, std::nullopt));
+        // A late progress update cannot enlarge the frozen publication bound.
+        old->setContextCurrentPosition(11);
+        static_cast<void>(manager->removeSequence(0, old));
+        auto later = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, tokens, samplingConfig, kVSWA_IS_STREAMING);
+        addSequenceForTest(*manager, 2, 11, kVSWA_BEAM_WIDTH, later);
+        EXPECT_EQ(later->getPrepopulatedPromptLen(), frontier);
+        static_cast<void>(manager->removeSequence(2, std::nullopt));
+    }
+}

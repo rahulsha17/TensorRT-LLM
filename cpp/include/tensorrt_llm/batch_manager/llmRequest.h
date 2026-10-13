@@ -1498,6 +1498,22 @@ public:
         }
     }
 
+    // The execution owner must drain writers before freezing a complete prompt
+    // prefix. No later store or release may publish KV beyond this bound.
+    void freezeRetireKvFrontier(SizeType32 frontier)
+    {
+        TLLM_CHECK_WITH_INFO(
+            frontier >= 0 && frontier <= getPromptLen(), "RETIRE KV frontier must lie within the prompt");
+        TLLM_CHECK_WITH_INFO(!mRetireKvFrontier.has_value() || frontier <= mRetireKvFrontier.value(),
+            "RETIRE KV frontier cannot grow after retirement");
+        mRetireKvFrontier = frontier;
+    }
+
+    [[nodiscard]] std::optional<SizeType32> getRetireKvFrontier() const noexcept
+    {
+        return mRetireKvFrontier;
+    }
+
     /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning
     /// or end of the context is returned.
     [[nodiscard]] SizeType32 getContextCurrentPosition() const noexcept
@@ -1922,6 +1938,7 @@ protected:
     // Value `0` means Chunked-Context is disabled.
     SizeType32 mContextChunkSizeTarget{0};
     SizeType32 mContextChunkSizeDraft{0};
+    std::optional<SizeType32> mRetireKvFrontier{std::nullopt};
     SizeType32 mContextCurrentPositionTarget{0};
     SizeType32 mContextCurrentPositionDraft{0};
 

@@ -29,6 +29,11 @@ NEXT = replace(VERSION, epoch=8)
 def _request(version=VERSION):
     request = SimpleNamespace(
         py_request_id=42,
+        prepopulated_prompt_len=0,
+        context_current_position=0,
+        context_chunk_size=64,
+        context_remaining_length=64,
+        is_finished=False,
         py_execution_version=version,
         py_seq_slot=2,
         py_decoding_iter=3,
@@ -43,6 +48,7 @@ def _request(version=VERSION):
     def finish(reason):
         assert reason == FinishReason.CANCELLED
         request.state = LlmRequestState.GENERATION_COMPLETE
+        request.is_finished = True
 
     request.finish_by_reason = Mock(side_effect=finish)
     return request
@@ -56,6 +62,8 @@ def guard(monkeypatch):
     result.device = Mock()
     result.device.submission.side_effect = nullcontext
     result._uses = {}
+    result._prefill_frontiers = {}
+    result._v1_manager = None
     result._kv_manager = Mock()
     monkeypatch.setattr("torch.cuda.Event", Mock)
     return result
@@ -751,3 +759,301 @@ def test_terminal_only_response_pass_preserves_live_request() -> None:
     executor._enqueue_responses.assert_called_once_with([])
     executor._terminate_request.assert_not_called()
     executor.perf_manager.append_step_metrics.assert_not_called()
+
+
+@pytest.mark.parametrize("neighbor", [None, "live", "untagged"])
+def test_operator_exit_requires_every_row_to_lose_authority(guard, neighbor):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        execution_early_exit_point,
+    )
+
+    request = _request()
+    requests = [request]
+    if neighbor == "live":
+        version = replace(VERSION, scope_id="neighbor")
+        guard.table.apply(VersionUpdate("session", 1, version))
+        requests.append(_request(version))
+    elif neighbor == "untagged":
+        requests.append(_request(None))
+    with guard.forward(_batch(*requests, context=True)):
+        execution_early_exit_point()
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+        if neighbor is None:
+            with pytest.raises(ExecutionEarlyExit):
+                execution_early_exit_point()
+        else:
+            execution_early_exit_point()
+    # An early exit is not a release: every submitted use still needs a wait.
+    assert guard._uses[id(request)].event is not None
+    guard.device.wait_event.assert_not_called()
+    execution_early_exit_point()  # No batch callback leaks into the next forward.
+
+
+def test_operator_exit_unwinds_and_records_partial_submission(guard):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        execution_early_exit_point,
+    )
+
+    request = _request()
+    with pytest.raises(ExecutionEarlyExit):
+        with guard.forward(_batch(request, context=True)):
+            guard.table.apply(VersionUpdate("session", 2, NEXT))
+            execution_early_exit_point()
+    assert guard._uses[id(request)].event is not None
+    assert guard._prefill_frontiers[id(request)] == 0
+    execution_early_exit_point()
+
+
+@pytest.mark.parametrize("completed", [0, 16, 35])
+def test_v1_reserves_completed_chunks_before_probing_tree(guard, completed):
+    from tensorrt_llm.execution_alignment import AlignmentInput
+
+    request = _request()
+    request.freeze_retire_kv_frontier = Mock()
+    guard._v1_manager = Mock(tokens_per_block=16, enable_block_reuse=True)
+    guard._kv_manager = None
+    guard._alignment_adapter = Mock()
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        pass
+    with guard.context_commit(batch):
+        request.context_current_position = completed
+    # A later chunk was submitted but only partially executed at revocation.
+    with guard.forward(batch):
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+    with guard.context_commit(batch):
+        pass
+    order = []
+    guard.device.wait_event.side_effect = lambda event: order.append("drain")
+    request.freeze_retire_kv_frontier.side_effect = lambda count: order.append(("freeze", count))
+    guard._v1_manager.store_blocks_for_reuse.side_effect = lambda req: order.append("publish")
+    from tensorrt_llm.execution_alignment import AlignmentRequest, WorkerAlignmentState
+    from tensorrt_llm.execution_authority import Revision
+
+    alignment = AlignmentRequest(
+        "session", Revision("edit", VERSION, NEXT), AlignmentInput(tuple(range(64)))
+    )
+    guard._alignment_adapter.reserve.side_effect = lambda revised: (
+        order.append("reserve") or Mock(num_tokens=completed // 16 * 16)
+    )
+    state = WorkerAlignmentState(
+        guard._alignment_adapter.reserve, lambda: None, prepare=guard._prepare_prefix
+    )
+    state.observe(NEXT, alignment)
+    state.process()
+    expected = ["drain", ("freeze", completed // 16 * 16)]
+    if completed >= 16:
+        expected.append("publish")
+    assert order == expected + ["reserve"]
+    assert id(request) in guard._uses  # Old ownership survives until cleanup.
+
+
+def test_failed_drain_cannot_publish_or_reserve_prefill(guard):
+    from tensorrt_llm.execution_alignment import AlignmentInput
+
+    request = _request()
+    request.freeze_retire_kv_frontier = Mock()
+    guard._v1_manager = Mock(tokens_per_block=16)
+    guard._alignment_adapter = Mock()
+    with guard.forward(_batch(request)):
+        pass
+    guard.table.apply(VersionUpdate("session", 2, NEXT))
+    guard.device.wait_event.side_effect = RuntimeError("unknown completion")
+    from tensorrt_llm.execution_alignment import AlignmentRequest
+    from tensorrt_llm.execution_authority import Revision
+
+    alignment = AlignmentRequest("session", Revision("edit", VERSION, NEXT), AlignmentInput((1, 2)))
+    with pytest.raises(RuntimeError, match="source KV preparation failed"):
+        guard._prepare_prefix(alignment)
+    request.freeze_retire_kv_frontier.assert_not_called()
+    guard._v1_manager.store_blocks_for_reuse.assert_not_called()
+    guard._alignment_adapter.reserve.assert_not_called()
+    assert id(request) in guard._uses
+
+
+def test_early_exit_does_not_call_sampler_update(guard):
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.sampler = Mock()
+    executor._update_requests(None)
+    executor.sampler.update_requests.assert_not_called()
+
+
+@pytest.mark.parametrize("compiled,capturing", [(False, False), (True, False), (False, True)])
+def test_qwen_layer_hook_skips_only_unsubmitted_eager_layers(monkeypatch, compiled, capturing):
+    from tensorrt_llm._torch.models import modeling_qwen3
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        early_exit_scope,
+    )
+
+    calls = []
+    monkeypatch.setattr("torch.compiler.is_compiling", lambda: compiled)
+    monkeypatch.setattr("torch.cuda.is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(modeling_qwen3, "maybe_allgather_for_helix_cp", lambda h, *args: h)
+
+    def layer(**kwargs):
+        calls.append(len(calls))
+        return kwargs["hidden_states"], kwargs["residual"]
+
+    model = SimpleNamespace(layers=[layer] * 12, norm=lambda h, r: (h, r), mapping_with_cp=None)
+    with early_exit_scope(lambda: bool(calls)):
+        if compiled or capturing:
+            modeling_qwen3.Qwen3Model.forward(model, None, inputs_embeds=object())
+            assert len(calls) == 12
+        else:
+            with pytest.raises(ExecutionEarlyExit):
+                modeling_qwen3.Qwen3Model.forward(model, None, inputs_embeds=object())
+            assert len(calls) == 4
+
+
+def test_breakable_graph_exit_skips_remaining_segments_and_restores_context(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        get_current_replay_token,
+    )
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        early_exit_scope,
+    )
+
+    monkeypatch.setattr("torch.cuda.current_stream", Mock())
+    graph = BreakableCUDAGraph()
+    graph._segments = [Mock(), Mock(), Mock()]
+    graph._break_functions = [Mock(), Mock()]
+    with early_exit_scope(lambda: graph._segments[0].replay.called):
+        with pytest.raises(ExecutionEarlyExit):
+            graph.replay()
+    graph._segments[0].replay.assert_called_once()
+    graph._segments[1].replay.assert_not_called()
+    graph._segments[2].replay.assert_not_called()
+    assert get_current_replay_token() is None
+    graph.replay()  # Later unarmed replays must run the entire graph.
+    graph._segments[2].replay.assert_called_once()
+
+
+def test_alignment_does_not_wait_for_another_scope(guard):
+    from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentRequest
+    from tensorrt_llm.execution_authority import Revision
+
+    other_version = replace(VERSION, scope_id="other")
+    other = _request(other_version)
+    guard.table.apply(VersionUpdate("session", 1, other_version))
+    with guard.forward(_batch(other)):
+        pass
+    guard.table.apply(VersionUpdate("session", 2, replace(other_version, epoch=8)))
+    alignment = AlignmentRequest("session", Revision("edit", VERSION, NEXT), AlignmentInput((1, 2)))
+    guard._prepare_prefix(alignment)
+    guard.device.wait_event.assert_not_called()
+    guard._kv_manager.stop_request_committing.assert_not_called()
+
+
+def test_executor_treats_early_exit_as_revocation_not_model_error(guard, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import execution_early_exit_point
+
+    request = _request()
+    batch = _batch(request, context=True)
+    stream = Mock()
+    monkeypatch.setattr("torch.cuda.stream", lambda stream: nullcontext())
+    monkeypatch.setattr("torch.cuda.current_stream", lambda: stream)
+
+    def forward(*args, **kwargs):
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+        execution_early_exit_point()
+        pytest.fail("revoked model continued")
+
+    executor = SimpleNamespace(
+        _execution_guard=guard,
+        model_engine=SimpleNamespace(forward=forward),
+        sampler=Mock(),
+        execution_stream=stream,
+        resource_manager=Mock(),
+        iter_counter=1,
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        _compute_adp_dummy_tokens=lambda batch: (0, 0),
+        _attach_encoder_output_to_execution_stream=Mock(),
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _handle_errors=Mock(),
+    )
+    assert PyExecutor._forward_step(executor, batch) is None
+    assert request.is_finished
+    assert guard._uses[id(request)].event is not None
+    executor._handle_errors.assert_not_called()
+    guard.device.wait_event.assert_not_called()  # Cleanup must still drain it.
+
+
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("finished", [False, True])
+def test_overlap_accepts_missing_sample_only_for_fully_revoked_batch(monkeypatch, v2, finished):
+    from unittest.mock import MagicMock
+
+    class ReachedCommit(Exception):
+        pass
+
+    for name in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
+        monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{name}", Mock())
+    request = _request()
+    request.is_finished = finished
+    batch = _batch(request, context=True)
+    executor = MagicMock()
+    for flag in (
+        "enable_iter_perf_stats",
+        "is_benchmark_disagg",
+        "_resource_governor_enabled",
+        "_mm_encoder_item_scheduling_enabled",
+        "use_spec_decode",
+        "has_previous_draft_tokens",
+        "enable_early_first_token_response",
+    ):
+        setattr(executor, flag, False)
+    for field in (
+        "kv_connector_manager",
+        "kv_cache_transceiver",
+        "drafter",
+        "guided_decoder",
+        "previous_batch",
+        "speculation_gate",
+    ):
+        setattr(executor, field, None)
+    executor._is_kv_manager_v2 = v2
+    executor._can_pause_for_rebalance.return_value = False
+    executor._profiler.return_value = nullcontext(Mock())
+    executor._prepare_and_schedule_batch.return_value = (batch, None)
+    executor._check_benchmark_disagg_gate.return_value = (True, False)
+    executor._can_queue.return_value = (True, True)
+    executor._forward_step.return_value = None
+    executor._sample_async.return_value = None
+    executor.perf_manager.create_timing_events.return_value = (None, None, None)
+    executor._update_request_states.side_effect = ReachedCommit
+    with pytest.raises(ReachedCommit if finished else AssertionError):
+        PyExecutor._executor_loop_overlap(executor)
+    executor._sample_async.assert_called_once_with(batch, None)
+
+
+def test_v1_old_native_wheel_rejected_before_device_setup(monkeypatch):
+    import tensorrt_llm._torch.pyexecutor.execution_guard as module
+
+    monkeypatch.setattr(module, "LlmRequest", type("OldRequest", (), {}))
+    device = Mock()
+    monkeypatch.setattr(module, "DeviceExecutionAuthority", device)
+    with pytest.raises(RuntimeError, match="rebuilt native bindings"):
+        ExecutionDeviceGuard(_executor(), WorkerVersionTable("session"))
+    device.assert_not_called()
+
+
+def test_normal_v1_completion_keeps_native_generated_prefix_reuse(guard):
+    request = _request()
+    request.freeze_retire_kv_frontier = Mock()
+    guard._v1_manager = Mock(tokens_per_block=16)
+    guard._kv_manager = None
+    with guard.forward(_batch(request)):
+        pass
+    request.is_finished = True
+    request.context_remaining_length = 0
+    guard.before_release(request)
+    guard.device.wait_event.assert_called_once()
+    request.freeze_retire_kv_frontier.assert_not_called()
+    guard._v1_manager.store_blocks_for_reuse.assert_not_called()
