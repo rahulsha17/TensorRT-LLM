@@ -129,11 +129,11 @@ historical receipt does not make its version current again. Reusing the ID for
 a different transition fails. A different ID claiming the same old version is
 a competing revision, not a retry.
 
-The descriptor currently contains version metadata only. Its pending successor
-is a record of the latest accepted revision, not a runnable request. Revised
-input and the KV inheritance contract will be added with ALIGN. The runtime
-must keep a revision ID bound to the same revision; this metadata layer cannot
-compare input that has not been supplied to it.
+`Revision` identifies the transition. For a KV handoff, pass an immutable
+`AlignmentInput` alongside it to `control.advance`, as shown in step 7 below.
+The controller binds those exact tokens and cache namespace to the revision ID.
+Retries must supply the same input, including whether ALIGN was requested.
+An accepted successor remains pending until RESUME is implemented.
 
 The registry is an in-memory object in one process. The runtime must route all
 revisions for a scope through the same instance. Creating separate registries
@@ -245,7 +245,7 @@ Runtime accepts epoch 8
        -> worker rejects new epoch 7 enqueues
        -> worker enqueues cancellation for admitted epoch 7 requests
 
-Epoch 8 remains pending until ALIGN and RESUME are implemented.
+Epoch 8 remains pending until RESUME is implemented.
 ```
 
 Waiting result consumers receive `ExecutionAuthorityError`. Sync, async, and
@@ -348,9 +348,8 @@ already committed, including a partial block when V2 supports it. It does not
 append the uncommitted tail or clear the reuse tree. Other requests sharing the
 prefix keep their own holds.
 
-A prefix can remain available through ordinary cache reuse, but it is still
-subject to eviction. Step 5 does not reserve it for a successor. ALIGN will
-provide that handoff and validate which prefix the successor may inherit.
+Without ALIGN, a prefix remains subject to ordinary cache eviction. Step 7
+adds a native hold for the successor when revised input accompanies ADVANCE.
 
 ### Overlap (5C)
 
@@ -384,7 +383,7 @@ These checks are admission points, not kernel preemption. An already submitted
 forward can still write KV, and sampling can write candidate scratch. Step 5
 prevents rejected tokens from becoming committed request state; it does not
 guard every attention/KV store. The local cleanup wait supplies the GPU completion proof for step 6 below.
-Successors remain pending until ALIGN and RESUME are implemented.
+Successors remain pending until RESUME is implemented.
 
 Commit buffers are allocated per step. No performance gain is claimed yet.
 Device failures never roll authority back. Publication failures close host gates;
@@ -443,17 +442,101 @@ revision does not change the meaning of an older receipt. Shutdown fails pending
 waits. Unknown enqueue completion or inconsistent request identity fails closed;
 unknown GPU completion or failed cleanup never removes the pending request.
 
-This first fence uses ordinary terminal cleanup. It proves that the old execution
-has finished accessing its resources, but does not reserve KV or certify that a
-prefix remains cached. ALIGN must acquire a handoff hold before the old owner's
-last hold is released; that hook belongs before resource release, after the GPU
-completion wait. A fence receipt is neither an allocation-generation token nor
+FENCE uses ordinary terminal cleanup. It proves that the old execution has
+finished accessing its resources, but by itself does not reserve KV. When the
+revision includes ALIGN input, the worker acquires a separate native hold before
+releasing the old owner's resources, after the GPU completion wait. A fence receipt is neither an allocation-generation token nor
 permission to run the successor. It also does not wait for obsolete IPC responses
 to disappear; existing output gates prevent those responses from being delivered.
 
 The supported configurations remain those of step 5. Multi-rank execution and
 KV transfers/connectors need their own completion evidence before they can
 participate in this protocol.
+
+## ALIGN (step 7)
+
+The runtime supplies the complete revised token input with ADVANCE. This lets
+the worker reserve useful KV before cancellation frees the old owner's cache.
+
+```python
+from tensorrt_llm.execution_alignment import AlignmentInput
+
+revised_input = AlignmentInput(
+    input_token_ids=(1, 2, 3, 4, 9, 10),
+    cache_salt="app-cache",
+    lora_task_id=None,
+)
+result = control.advance(Revision("edit-123", old, new), alignment=revised_input)
+result.fence.wait(timeout=5)
+aligned = result.alignment.wait(timeout=5)
+print(aligned.reusable_prefix_length)
+```
+
+The worker matches the revised tokens in its existing cache tree, using the
+supplied salt and LoRA identity. Its manager fixes the model and KV layout.
+Neither epoch nor scope ID changes the cache namespace. A token mismatch ends
+the usable prefix; a changed salt or LoRA identity searches a different namespace.
+The match can use compatible KV from other requests too. Only prefixes already
+published for ordinary reuse are eligible; unpublished computed tails are
+recomputed. In particular, a V1 interruption before its context publication can
+produce a shorter match than the amount of prefill work already performed.
+
+A probe alone does not count as ALIGN. The worker acquires native ownership:
+
+- **V2:** a suspended native cache holds the matched pages without taking an
+  executor sequence slot. Held pages can migrate between cache tiers but cannot
+  be dropped. Partial prefixes follow V2's existing reuse rules.
+- **V1:** a cache-only native sequence holds the acquired prefix. It also needs
+  one private tail block per applicable pool. It never runs a model or publishes
+  new KV. V1 reports the acquired prefix, which can be shorter than its initial
+  probe, and waits for any native onboarding copies before returning it.
+
+The final revised input token is left for recomputation so the successor can
+obtain logits. A cache miss is a valid zero-length alignment: the successor will
+need to prefill the input. Set `min_reuse_tokens` to require a minimum prefix;
+insufficient reuse then fails ALIGN instead. Invalid tokens and requests longer
+than the engine's sequence limit fail validation.
+
+```text
+ADVANCE(new version, revised input)
+  -> mailbox arms the reservation plan and revokes old work
+  -> engine matches revised tokens and acquires native KV holds
+  -> old request drains and releases its own resources
+  -> FENCE completes
+  -> ALIGN returns a reservation ID and the held prefix length
+
+Successor remains pending until RESUME.
+```
+
+Reservation work runs on the engine thread, outside model capture and compilation.
+A queue marker wakes an idle engine. Old-owner release and plan arming share a
+lock, so an observed plan cannot be skipped between the reservation check and
+resource release. Requests that finished before the worker observed the plan
+can only contribute KV still present in the ordinary cache. ALIGN does not
+promise to recover already evicted data.
+
+A later revision invalidates the older reservation. The engine acquires a new
+reservation before closing an older one, allowing repeated revisions to retain
+their common prefix. Other scopes keep their own reservations. Waiting with a
+timeout does not release a hold. Native acquisition failure is reported to the
+runtime and never resumes the successor; unknown copy completion also blocks
+old resource release. A failed acquisition remains failed for that revision.
+Use a new revision for different input or a different reuse requirement.
+
+Reservations are bounded to 256 scopes per worker. A replacement in the same
+scope can temporarily hold both versions while acquiring the new prefix.
+Revision inputs and receipts are retained with controller retry history for its
+lifetime; this metadata is not yet compacted. Shutdown invalidates reservations
+immediately, then closes native ownership on the engine thread before manager
+teardown. Cache reset is rejected while ALIGN owns or prepares a prefix. Engine
+control actions that may change weights or cache storage invalidate ALIGN; a
+fresh executor is required for further alignment after those actions.
+
+The receipt is a record of preparation, not a permanent right to use memory.
+RESUME must check that its version and reservation ID are still live, verify the
+submitted input, and acquire the successor's own KV before releasing this hold.
+No GPU pointers are exposed. Successor submission is still rejected at this
+step, and no performance gain is claimed before native validation.
 
 ## Testing
 
@@ -483,7 +566,7 @@ revisions during prefill, generation, and cleanup.
 
 ## Next steps
 
-The next step is ALIGN: accept revised input, validate the reusable prefix, and
-establish successor KV holds before releasing the old owner. RESUME allows the
-prepared successor to run, and RECLAIM releases obsolete handoff holds. RESUME will keep authority
-checks active so another revision can supersede the new work too.
+The next step is RESUME: validate the prepared reservation against the current
+version and submitted input, attach its KV to the successor, and allow that
+request to run. RECLAIM then releases obsolete handoff holds. RESUME keeps
+authority checks active so another revision can supersede the new work too.

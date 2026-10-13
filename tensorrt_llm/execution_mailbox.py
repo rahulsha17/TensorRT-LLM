@@ -10,6 +10,13 @@ from queue import Empty, Queue
 from threading import Event, Lock, RLock, Thread
 from typing import Protocol
 
+from .execution_alignment import (
+    AlignmentInput,
+    AlignmentReceipt,
+    AlignmentRequest,
+    RevisionAlignment,
+    WorkerAlignmentState,
+)
 from .execution_authority import AdvanceReceipt, Revision, ScopeRegistry, ScopeSnapshot
 from .execution_fence import FenceReceipt, FenceRequest, RequestDrainTracker, RevisionFence
 from .execution_gate import ExecutionAuthorityError, HostExecution, HostExecutionGate
@@ -41,6 +48,7 @@ class VersionUpdate:
     session_id: str
     sequence: int
     version: ExecutionVersion
+    alignment: AlignmentRequest | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id:
@@ -49,6 +57,12 @@ class VersionUpdate:
             raise ValueError("sequence must be a positive integer")
         if not isinstance(self.version, ExecutionVersion):
             raise TypeError("version must be an ExecutionVersion")
+        if self.alignment is not None and (
+            not isinstance(self.alignment, AlignmentRequest)
+            or self.alignment.session_id != self.session_id
+            or self.alignment.revision.successor_version != self.version
+        ):
+            raise ValueError("alignment must belong to this publication")
 
 
 @dataclass(frozen=True)
@@ -108,6 +122,7 @@ class RevisionPublication:
     advance_receipt: AdvanceReceipt
     publication: VersionPublication
     fence: RevisionFence
+    alignment: RevisionAlignment | None = None
 
 
 class DeviceVersionPublisher(Protocol):
@@ -134,6 +149,7 @@ class WorkerVersionTable:
         self._device_publisher: DeviceVersionPublisher | None = None
         self._publication_error: Exception | None = None
         self.drain_tracker: RequestDrainTracker | None = None
+        self.alignment_state: WorkerAlignmentState | None = None
 
     def poll_fence(self, request: FenceRequest) -> FenceReceipt | None:
         """Check a drain without blocking publication or waiting on the GPU."""
@@ -150,6 +166,28 @@ class WorkerVersionTable:
             if not self.drain_tracker.drained(old):
                 return None
             return FenceReceipt(request)
+
+    def poll_alignment(self, request: AlignmentRequest) -> AlignmentReceipt | None:
+        """A prepared prefix is usable only after the revision's drain completes."""
+        with self._lock:
+            self._require_open()
+            if request.session_id != self.session_id:
+                raise ValueError("alignment belongs to a different authority session")
+            target = request.revision.successor_version
+            current = self._current_version_locked(target)
+            if current is None or current.epoch < target.epoch:
+                return None
+            if current != target:
+                raise RuntimeError("alignment was superseded")
+            if self.alignment_state is None:
+                raise RuntimeError("worker does not support ALIGN")
+            receipt = self.alignment_state.poll(request)
+            if (
+                receipt is None
+                or self.poll_fence(FenceRequest(self.session_id, request.revision)) is None
+            ):
+                return None
+            return receipt
 
     def bind_device_publisher(self, publisher: DeviceVersionPublisher) -> None:
         """Bind the engine's device table before any authority is published."""
@@ -190,6 +228,8 @@ class WorkerVersionTable:
                     return PublicationReceipt(update, previous.version)
                 if update.version.epoch < previous.version.epoch:
                     raise ValueError("newer publication sequence would rewind authority")
+            if self.alignment_state is not None:
+                self.alignment_state.observe(update.version, update.alignment)
             self._versions[key] = update
             self._gate.revoke_locked(update.version)
             if self._device_publisher is not None:
@@ -221,6 +261,8 @@ class WorkerVersionTable:
         with self._lock:
             self._closed = True
             self._gate.close_locked()
+            if self.alignment_state is not None:
+                self.alignment_state.close()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -239,6 +281,8 @@ class PublicationTransport(Protocol):
         ...
 
     def poll_fence(self, request: FenceRequest, stop: Event) -> FenceReceipt | None: ...
+
+    def poll_alignment(self, request: AlignmentRequest, stop: Event) -> AlignmentReceipt | None: ...
 
     def close(self) -> None:
         """Release transport resources on their owning thread."""
@@ -260,6 +304,11 @@ class LocalPublicationTransport:
         if stop.is_set():
             raise RuntimeError("execution controller is closed")
         return self._table.poll_fence(request)
+
+    def poll_alignment(self, request: AlignmentRequest, stop: Event) -> AlignmentReceipt | None:
+        if stop.is_set():
+            raise RuntimeError("execution controller is closed")
+        return self._table.poll_alignment(request)
 
     def close(self) -> None:
         pass
@@ -299,7 +348,11 @@ class ExecutionController:
         self._pending: set[VersionPublication] = set()
         self._fences: dict[FenceRequest, RevisionFence] = {}
         self._pending_fences: dict[FenceRequest, RevisionFence] = {}
-        self._queue: Queue[VersionPublication | FenceRequest | None] = Queue()
+        self._alignment_inputs: dict[Revision, AlignmentInput | None] = {}
+        self._alignments: dict[AlignmentRequest, RevisionAlignment] = {}
+        self._pending_alignments: dict[AlignmentRequest, RevisionAlignment] = {}
+        self._alignment_current: dict[ExecutionVersion, AlignmentRequest] = {}
+        self._queue: Queue[VersionPublication | FenceRequest | AlignmentRequest | None] = Queue()
         self._thread = Thread(target=self._run, name="retire_publication", daemon=True)
         self._thread.start()
 
@@ -310,11 +363,22 @@ class ExecutionController:
             snapshot = self._registry.register(version)
             return self._publish_current(snapshot.current_version)
 
-    def advance(self, revision: Revision) -> RevisionPublication:
+    def advance(
+        self, revision: Revision, *, alignment: AlignmentInput | None = None
+    ) -> RevisionPublication:
         """Accept the revision and publish current authority, including on historical retries."""
         with self._lock:
             self._require_open()
+            if alignment is not None and not isinstance(alignment, AlignmentInput):
+                raise TypeError("alignment must be an AlignmentInput or None")
+            if revision in self._alignment_inputs and self._alignment_inputs[revision] != alignment:
+                raise ValueError("revision retry changed its revised input")
             receipt = self._registry.advance(revision)
+            self._alignment_inputs[revision] = alignment
+            if alignment is not None:
+                self._alignment_current[revision.successor_version] = AlignmentRequest(
+                    self._session_id, revision, alignment
+                )
             expected = revision.expected_version
             current = self._registry.snapshot(expected.tenant_id, expected.scope_id).current_version
             self._gate.revoke_locked(current)
@@ -331,7 +395,23 @@ class ExecutionController:
                 else:
                     self._pending_fences[request] = fence
                     self._queue.put(request)
-            return RevisionPublication(receipt, publication, fence)
+            aligned = None
+            if alignment is not None:
+                align_request = self._alignment_current[revision.successor_version]
+                aligned = self._alignments.get(align_request)
+                if aligned is None or (
+                    aligned._future.done() and aligned._future.exception() is not None
+                ):
+                    aligned = RevisionAlignment(align_request, Future())
+                    self._alignments[align_request] = aligned
+                    if len(self._pending_alignments) >= self._max_pending:
+                        aligned._future.set_exception(
+                            RuntimeError("ALIGN backlog is full; retry revision")
+                        )
+                    else:
+                        self._pending_alignments[align_request] = aligned
+                        self._queue.put(align_request)
+            return RevisionPublication(receipt, publication, fence, aligned)
 
     def _current_version_locked(self, version: ExecutionVersion) -> ExecutionVersion | None:
         try:
@@ -369,6 +449,9 @@ class ExecutionController:
                 for fence in self._pending_fences.values():
                     fence._future.set_exception(RuntimeError("execution controller is closed"))
                 self._pending_fences.clear()
+                for aligned in self._pending_alignments.values():
+                    aligned._future.set_exception(RuntimeError("execution controller is closed"))
+                self._pending_alignments.clear()
                 self._queue.put(None)
         self._thread.join(timeout=5)
         if self._thread.is_alive():
@@ -387,7 +470,9 @@ class ExecutionController:
             update = previous.update
         else:
             self._sequence += 1
-            update = VersionUpdate(self._session_id, self._sequence, version)
+            update = VersionUpdate(
+                self._session_id, self._sequence, version, self._alignment_current.get(version)
+            )
         publication = VersionPublication(update, Future())
         self._latest[key] = publication
         if len(self._pending) >= self._max_pending:
@@ -424,19 +509,45 @@ class ExecutionController:
                         fence._future.set_result(receipt)
                     self._pending_fences.pop(request, None)
 
+    def _poll_one_alignment(self) -> None:
+        with self._lock:
+            if not self._pending_alignments:
+                return
+            request = next(iter(self._pending_alignments))
+            aligned = self._pending_alignments.pop(request)
+            self._pending_alignments[request] = aligned
+        try:
+            receipt = self._transport.poll_alignment(request, self._stop)
+            if receipt is not None and (
+                not isinstance(receipt, AlignmentReceipt) or receipt.request != request
+            ):
+                raise ValueError("acknowledgement does not match ALIGN")
+        except Exception as error:
+            with self._lock:
+                if not aligned._future.done():
+                    aligned._future.set_exception(error)
+                self._pending_alignments.pop(request, None)
+        else:
+            if receipt is not None:
+                with self._lock:
+                    if not aligned._future.done():
+                        aligned._future.set_result(receipt)
+                    self._pending_alignments.pop(request, None)
+
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
                 self._poll_one_fence()
+                self._poll_one_alignment()
                 with self._lock:
-                    timeout = 0.01 if self._pending_fences else None
+                    timeout = 0.01 if self._pending_fences or self._pending_alignments else None
                 try:
                     publication = self._queue.get(timeout=timeout)
                 except Empty:
                     continue
                 if publication is None or self._stop.is_set():
                     break
-                if isinstance(publication, FenceRequest):
+                if isinstance(publication, (FenceRequest, AlignmentRequest)):
                     continue
                 try:
                     receipt = self._transport.publish(publication.update, self._stop)

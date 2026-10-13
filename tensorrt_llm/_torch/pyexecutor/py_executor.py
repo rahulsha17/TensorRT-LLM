@@ -2804,6 +2804,9 @@ class PyExecutor:
             self.is_shutdown = True
             self.response_cv.notify_all()
         self.shutdown_event.set()
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.close_alignment()
 
         # The loop may exit while the benchmark fill gate is still closed.
         keepalive = getattr(self, "_gpu_keepalive", None)
@@ -4860,6 +4863,9 @@ class PyExecutor:
         # be in flight, so an in-place update_weights reload (or sleep/wakeup
         # freeing memory) could race with kernels still reading those tensors.
         torch.cuda.synchronize()
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.close_alignment()
         self.control_requests.pop(0)
         control_id = getattr(pending, "control_id", None)
         self._active_control_id = control_id
@@ -6298,7 +6304,11 @@ class PyExecutor:
         accepted_new_requests = []
         finished_prefix_load_ids = []
         for idx, req_item in enumerate(new_requests):
-            if req_item.is_prefix_load_completion_request:
+            if req_item.is_alignment_wake_request:
+                guard = getattr(self, '_execution_guard', None)
+                if guard is not None:
+                    guard.process_alignment()
+            elif req_item.is_prefix_load_completion_request:
                 finished_prefix_load_ids.extend(
                     req_item.finished_prefix_load_ids)
             elif req_item.is_shutdown_request:
@@ -8343,7 +8353,9 @@ class PyExecutor:
         guard = getattr(self, '_execution_guard', None)
         if guard is not None:
             guard.before_release(request)
-        self.resource_manager.free_resources(request)
+        with (guard.releasing_resources()
+              if guard is not None else nullcontext()):
+            self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
 
@@ -8911,9 +8923,12 @@ class PyExecutor:
         return new_target_inputs
 
     def reset_prefix_cache(self):
-        self.kv_cache_manager.reset_reuse_state()
-        if self.enable_joint_kv_cache_reuse:
-            self.draft_kv_cache_manager.reset_reuse_state()
+        guard = getattr(self, '_execution_guard', None)
+        state = guard.table.alignment_state if guard is not None else None
+        with (state.resetting_cache() if state is not None else nullcontext()):
+            self.kv_cache_manager.reset_reuse_state()
+            if self.enable_joint_kv_cache_reuse:
+                self.draft_kv_cache_manager.reset_reuse_state()
         # R3: invalidate cached routes together with the KV reuse state. Guard the
         # engine lookup too -- minimal executors (unit tests) may have no engine.
         route_capture = getattr(getattr(self, "model_engine", None),

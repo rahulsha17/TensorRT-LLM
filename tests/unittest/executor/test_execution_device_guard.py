@@ -566,3 +566,64 @@ def test_child_registration_keeps_fence_pending_after_parent_cleanup(guard):
     assert not guard.table.drain_tracker.drained(VERSION)
     guard.terminal(43, VERSION)
     assert guard.table.drain_tracker.drained(VERSION)
+
+
+def test_alignment_hold_acquired_before_old_resources_are_freed(guard):
+    from tensorrt_llm.execution_alignment import (
+        AlignmentInput,
+        AlignmentRequest,
+        WorkerAlignmentState,
+    )
+    from tensorrt_llm.execution_authority import Revision
+
+    order = []
+    hold = Mock(num_tokens=2)
+
+    def reserve(revised):
+        order.append("acquire hold")
+        return hold
+
+    state = guard.table.alignment_state = WorkerAlignmentState(reserve, lambda: None)
+    request = _request()
+    revised = AlignmentRequest(
+        "session", Revision("edit", VERSION, NEXT), AlignmentInput((1, 2, 3))
+    )
+    guard.table.apply(VersionUpdate("session", 2, NEXT, revised))
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.resource_manager = Mock()
+    executor.resource_manager.free_resources.side_effect = lambda request: order.append("free old")
+    executor._prefetched_request_ids = set()
+    executor.disagg = Mock()
+    executor._free_request_resources(request)
+    assert order == ["acquire hold", "free old"]
+    hold.close.assert_not_called()
+    state.close()
+    guard.process_alignment()
+    hold.close.assert_called_once()
+
+
+def test_alignment_wake_is_consumed_without_becoming_inference(guard):
+    from queue import Queue
+
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
+
+    queue = object.__new__(ExecutorRequestQueue)
+    queue.enqueue_lock = Lock()
+    queue.active = True
+    queue.request_queue = Queue()
+    queue._get_request_id = Mock(return_value=99)
+    assert queue.reserve_request_id() == 99
+    assert queue.request_queue.empty()
+    queue.wake_alignment()
+    item = queue.request_queue.get_nowait()
+    assert item.is_alignment_wake_request
+    assert not item.is_normal_request
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    guard.process_alignment = Mock()
+    assert executor._handle_special_queue_items([item]) == []
+    guard.process_alignment.assert_called_once()
+    queue.active = False
+    queue.wake_alignment()
+    assert queue.request_queue.empty()

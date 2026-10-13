@@ -1386,6 +1386,43 @@ class TestNoBatching(TestKVCacheManagerV2):
                 if cache is not None and cache.status != _KVCache.Status.CLOSED:
                     cache.close()
 
+    def test_retire_alignment_hold_survives_old_owner_close(self) -> None:
+        self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
+        scope = ReuseScope(salt=11)
+        tokens = [TokenId(i) for i in range(9)]
+        owner = self.manager.create_kv_cache(scope)
+        reservation = successor = None
+        try:
+            with TemporaryCudaStream([]) as holder:
+                stream = cast(CudaStream, holder.handle)
+                self.assertTrue(owner.resume(stream))
+                self.assertTrue(owner.resize(len(tokens), len(tokens)))
+                owner.commit(tokens[:6])
+                owner.stop_committing()
+            holder.take_finish_event().synchronize()
+            reservation = self.manager.create_kv_cache(
+                scope, tokens[:-1], expected_prompt_length=len(tokens)
+            )
+            self.assertEqual(reservation.num_committed_tokens, 6)
+            self.assertEqual(reservation.status, _KVCache.Status.SUSPENDED)
+            owner.close()
+            # A Python tree lookup is insufficient: native PageHolders must
+            # keep these pages non-droppable after the old execution exits.
+            self.assertFalse(_introspection.all_tree_pages_droppable(self.manager))
+            self.assertEqual(self.manager.probe_reuse(ReuseScope(salt=12), tokens), 0)
+            changed = tokens[:4] + [TokenId(100), TokenId(101)]
+            self.assertEqual(self.manager.probe_reuse(scope, changed), 4)
+            successor = self.manager.create_kv_cache(scope, tokens[:-1])
+            self.assertEqual(successor.num_committed_tokens, 6)
+            reservation.close()
+            self.assertFalse(_introspection.all_tree_pages_droppable(self.manager))
+            successor.close()
+            self.assertTrue(_introspection.all_tree_pages_droppable(self.manager))
+        finally:
+            for cache in (successor, reservation, owner):
+                if cache is not None and cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
     def test_create_kv_cache_accepts_sequence_input_tokens(self) -> None:
         self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
         prompt = [self.next_token() for _ in range(8)]

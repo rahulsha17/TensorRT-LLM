@@ -23,6 +23,7 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+ALIGNMENT_WAKE_REQUEST_ID = -6
 
 
 class RequestAdmissionState(enum.Enum):
@@ -64,7 +65,12 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request)
+                    or self.is_prefix_load_completion_request
+                    or self.is_alignment_wake_request)
+
+    @property
+    def is_alignment_wake_request(self):
+        return self.id == ALIGNMENT_WAKE_REQUEST_ID
 
     @property
     def is_prefix_load_completion_request(self):
@@ -280,6 +286,18 @@ class ExecutorRequestQueue:
         """Enqueue a profile-stop control item. Broadcasted to every rank."""
         with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(id=PROFILE_STOP_REQUEST_ID))
+
+    def reserve_request_id(self) -> int:
+        """Allocate an ID for a cache-only owner without enqueueing inference."""
+        with self.enqueue_lock:
+            return self._get_request_id()
+
+    def wake_alignment(self) -> None:
+        """Wake the owning engine thread without launching or canceling a request."""
+        with self.enqueue_lock:
+            if self.active:
+                self.request_queue.put(
+                    RequestQueueItem(ALIGNMENT_WAKE_REQUEST_ID))
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:

@@ -11,10 +11,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from ...bindings.executor import FinishReason
+from ...execution_alignment import WorkerAlignmentState
 from ...execution_fence import RequestDrainTracker
 from ...execution_gate import ExecutionAuthorityError
 from ...execution_mailbox import WorkerVersionTable
 from ...execution_version import ExecutionVersion
+from .execution_alignment import KVAlignmentAdapter
 from .execution_device import DeviceExecutionAuthority
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -72,6 +74,30 @@ class ExecutionDeviceGuard:
         self._uses: dict[int, _RequestUse] = {}
         table.bind_device_publisher(self.device)
         table.drain_tracker = RequestDrainTracker()
+        table.alignment_state = WorkerAlignmentState(
+            KVAlignmentAdapter(executor).reserve, executor.executor_request_queue.wake_alignment
+        )
+
+    def process_alignment(self) -> None:
+        """Drive native prefix reservations on the engine thread outside capture."""
+        if self.table.alignment_state is not None:
+            self.table.alignment_state.process()
+
+    @contextmanager
+    def releasing_resources(self) -> Iterator[None]:
+        """Keep the old KV owner until an observed revision has acquired its hold."""
+        state = self.table.alignment_state
+        if state is None:
+            yield
+        else:
+            with state.releasing_owner():
+                yield
+
+    def close_alignment(self) -> None:
+        """Invalidate and release reservations before model/cache teardown."""
+        if self.table.alignment_state is not None:
+            self.table.alignment_state.close()
+            self.table.alignment_state.process()
 
     def enqueue(self, version: ExecutionVersion | None, submit: Callable[[], int]) -> int:
         """Track admission before a queued request can become visible to FENCE."""
