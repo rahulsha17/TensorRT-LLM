@@ -679,3 +679,75 @@ def test_resume_handoff_before_common_forward_boundary(guard, v2, overlap, mode)
     # batch-wide alignment exception that would poison unrelated requests.
     with guard.forward(_batch(request)):
         pass
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_eager_idle_iteration_drains_finished_revision(monkeypatch, v2) -> None:
+    """The final revoked request must not need another GPU batch to drain."""
+    from unittest.mock import MagicMock
+
+    for name in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
+        monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{name}", Mock())
+    request = SimpleNamespace(is_finished=True, py_execution_version=VERSION)
+    executor = SimpleNamespace(
+        device_id=0,
+        _profiler=lambda: nullcontext(Mock()),
+        hang_detector=MagicMock(),
+        enable_iter_perf_stats=False,
+        is_benchmark_disagg=False,
+        _resource_governor_enabled=False,
+        _is_kv_manager_v2=v2,
+        _can_pause_for_rebalance=lambda: False,
+        _mm_encoder_item_scheduling_enabled=False,
+        kv_connector_manager=None,
+        active_requests=[request],
+        _execution_guard=object(),
+        iter_counter=0,
+        disagg=Mock(),
+        perf_manager=Mock(enabled=False),
+    )
+    batch = ScheduledRequests()
+    executor._prepare_and_schedule_batch = Mock(side_effect=[(batch, None), (None, None)])
+    executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+    executor._can_queue = Mock(return_value=(False, False))
+    for name in (
+        "_terminate_requests",
+        "_pause_requests",
+        "_release_unused_connector_reservations",
+        "_revert_gen_alloc",
+        "_finalize_adp_dummy_allocation",
+        "_kv_connector_terminate_requests",
+        "_flush_pending_transfer_responses",
+        "_flush_iter_stats_synced",
+        "_terminate_recompute_paused_requests",
+        "_pause_recompute_paused_requests",
+    ):
+        setattr(executor, name, Mock())
+
+    def drain(*, terminal_only):
+        assert terminal_only
+        executor.active_requests.clear()
+        return [request]
+
+    executor._handle_responses = Mock(side_effect=drain)
+    PyExecutor._executor_loop(executor)
+    assert not executor.active_requests
+    executor._handle_responses.assert_called_once_with(terminal_only=True)
+    assert executor._event_loop_completed
+
+
+def test_terminal_only_response_pass_preserves_live_request() -> None:
+    live = SimpleNamespace(py_request_id=1, is_finished=False)
+    executor = SimpleNamespace(
+        active_requests=[live],
+        dist=SimpleNamespace(rank=0),
+        perf_manager=Mock(),
+        disagg=Mock(),
+        _enqueue_responses=Mock(),
+        _terminate_request=Mock(),
+    )
+    assert PyExecutor._handle_responses(executor, terminal_only=True) == []
+    assert executor.active_requests == [live]
+    executor._enqueue_responses.assert_called_once_with([])
+    executor._terminate_request.assert_not_called()
+    executor.perf_manager.append_step_metrics.assert_not_called()

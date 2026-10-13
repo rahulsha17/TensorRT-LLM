@@ -4756,6 +4756,13 @@ class PyExecutor:
                         kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
+                elif (getattr(self, '_execution_guard', None) is not None
+                      and any(request.is_finished
+                              for request in self.active_requests)):
+                    # Revocation can leave no schedulable batch. Eager mode has
+                    # no previous sampler to consume before terminal cleanup.
+                    finished_requests = self._handle_responses(
+                        terminal_only=True)
 
                 # Drain timeout buffer outside ``if can_queue`` so the synced
                 # collective fires every iter regardless of future restructuring.
@@ -8618,7 +8625,10 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
-    def _handle_responses(self, emit_first_iter: bool = True):
+    def _handle_responses(self,
+                          emit_first_iter: bool = True,
+                          *,
+                          terminal_only: bool = False):
         new_responses = []
         requests_to_terminate = []
         # Requests terminated by the coordinator's context reap (DISAGG_CONTEXT_COMPLETE);
@@ -8635,6 +8645,9 @@ class PyExecutor:
 
         for request in self.active_requests:
             req_id = request.py_request_id
+            if terminal_only and not request.is_finished:
+                new_active_requests.append(request)
+                continue
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
