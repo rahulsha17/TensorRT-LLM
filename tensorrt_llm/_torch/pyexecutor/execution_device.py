@@ -6,7 +6,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock
+from threading import RLock
 
 import torch
 import triton
@@ -16,7 +16,12 @@ from ..._utils import prefer_pinned
 from ...execution_version import ExecutionVersion
 from .execution_early_exit import trace_execution
 
-__all__ = ["DeviceExecutionAuthority", "DeviceTokenCommit", "DeviceTokenCommitTicket"]
+__all__ = [
+    "DeviceAttentionRows",
+    "DeviceExecutionAuthority",
+    "DeviceTokenCommit",
+    "DeviceTokenCommitTicket",
+]
 
 
 @triton.jit
@@ -62,6 +67,21 @@ def _epoch_word(epoch: int) -> int:
 class _PendingUse:
     tensors: list[torch.Tensor]
     event: torch.cuda.Event | None = None
+
+
+@dataclass
+class DeviceAttentionRows:
+    """Stable graph inputs, refreshed on one model submission stream.
+
+    Keep this object alive until every graph/model reader has completed. The
+    counters are cumulative predicate rejections, not a GPU completion proof.
+    """
+
+    authority: "DeviceExecutionAuthority"
+    slots: torch.Tensor
+    expected: torch.Tensor
+    counters: torch.Tensor
+    stream_id: int
 
 
 @dataclass(frozen=True)
@@ -116,7 +136,9 @@ class DeviceExecutionAuthority:
             raise ValueError("device authority capacity must be positive")
         self.device = torch.device("cuda", device)
         self.capacity = capacity
-        self._lock = Lock()
+        # Preparing attention rows is nested inside the model's submission
+        # scope. The publisher still cannot allocate while capture is active.
+        self._lock = RLock()
         self._slots: dict[tuple[str, str], int] = {}
         self._published: dict[tuple[str, str], tuple[int, torch.cuda.Event]] = {}
         self._pending: list[_PendingUse] = []
@@ -236,9 +258,7 @@ class DeviceExecutionAuthority:
                 self._failure = error
                 raise
 
-    def _inputs(
-        self, versions: list[ExecutionVersion | None], use: _PendingUse
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _input_values(self, versions: list[ExecutionVersion | None]) -> tuple[list[int], list[int]]:
         # Called with _lock held, on the caller's CUDA stream.
         stream = torch.cuda.current_stream(self.device)
         stream.wait_event(self._ready)
@@ -256,7 +276,64 @@ class DeviceExecutionAuthority:
             stream.wait_event(self._published[key][1])
             slots.append(self._slots[key])
             epochs.append(_epoch_word(version.epoch))
+        return slots, epochs
+
+    def _inputs(
+        self, versions: list[ExecutionVersion | None], use: _PendingUse
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        slots, epochs = self._input_values(versions)
         return self._upload(slots, torch.int32, use), self._upload(epochs, torch.int64, use)
+
+    def create_attention_rows(self, capacity: int) -> DeviceAttentionRows:
+        """Allocate before capture; addresses remain fixed across row reuse."""
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("attention row capacity must be positive")
+        with self._lock, torch.cuda.device(self.device):
+            self._healthy()
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("attention authority rows must be allocated before capture")
+            stream = torch.cuda.current_stream(self.device)
+            stream.wait_event(self._ready)
+            return DeviceAttentionRows(
+                self,
+                torch.full((capacity,), -1, dtype=torch.int32, device=self.device),
+                torch.zeros(capacity, dtype=torch.int64, device=self.device),
+                torch.zeros(3, dtype=torch.int64, device=self.device),
+                stream.cuda_stream,
+            )
+
+    def prepare_attention_rows(
+        self, rows: DeviceAttentionRows, versions: list[ExecutionVersion | None]
+    ) -> None:
+        """Stage immutable host inputs before a forward or graph replay.
+
+        Padding is always reset to the untagged sentinel. Stream ordering keeps
+        a later batch from overwriting identities used by earlier model work.
+        The temporary upload storage remains held until its copy completes.
+        """
+        if rows.authority is not self:
+            raise ValueError("attention rows belong to another authority")
+        if len(versions) > rows.slots.numel():
+            raise ValueError("attention batch exceeds row capacity")
+        with self._lock, torch.cuda.device(self.device):
+            self._healthy()
+            stream = torch.cuda.current_stream(self.device)
+            if stream.cuda_stream != rows.stream_id:
+                raise RuntimeError("attention rows cannot move between model submission streams")
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("attention authority rows must be staged outside capture")
+            use = self._start_use([rows.slots, rows.expected, rows.counters])
+            try:
+                padded = list(versions) + [None] * (rows.slots.numel() - len(versions))
+                slots, expected = self._input_values(padded)
+                for target, values in ((rows.slots, slots), (rows.expected, expected)):
+                    host = torch.tensor(values, dtype=target.dtype, pin_memory=prefer_pinned())
+                    use.tensors.append(host)
+                    target.copy_(host, non_blocking=True)
+                self._record(use, stream)
+            except BaseException as error:
+                self._failure = error
+                raise
 
     def check(self, versions: list[ExecutionVersion | None]) -> list[bool]:
         """Observe device authority at a batch-entry boundary."""

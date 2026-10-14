@@ -285,6 +285,10 @@ class DecoderRunner(ScheduledModelRunner):
 
         self._config = config
 
+        from ....execution_attention import ExecutionAttentionBinding
+
+        self.execution_attention = ExecutionAttentionBinding.from_runner(self)
+
         self.guided_decoder: CapturableGuidedDecoder | None = None
         self.lora_model_config: LoraModelConfig | None = None
         self.forward_pass_callable = None
@@ -2683,6 +2687,8 @@ class DecoderRunner(ScheduledModelRunner):
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
         self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        if getattr(self, "execution_attention", None) is not None:
+            self.attn_metadata.use_paged_context_fmha = True
 
         return self.attn_metadata
 
@@ -4601,6 +4607,9 @@ class DecoderRunner(ScheduledModelRunner):
                 runtime_draft_len=runtime_draft_len,
                 is_dummy=is_dummy,
             )
+            execution_attention = getattr(self, "execution_attention", None)
+            if execution_attention is not None:
+                execution_attention.prepare(attn_metadata, execution_requests)
             if execution_promoted_context_ids:
                 self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
                 self.iter_states["num_ctx_tokens"] = sum(

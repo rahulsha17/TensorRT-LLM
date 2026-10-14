@@ -72,7 +72,12 @@ class ExecutionDeviceGuard:
         if not executor._is_kv_manager_v2 and not hasattr(LlmRequest, "freeze_retire_kv_frontier"):
             raise RuntimeError("RETIRE V1 prefill inheritance requires rebuilt native bindings")
         self.table = table
-        self.device = DeviceExecutionAuthority(executor.device_id)
+        attention_binding = getattr(executor.model_engine, "execution_attention", None)
+        self.device = (
+            attention_binding.authority
+            if attention_binding is not None
+            else DeviceExecutionAuthority(executor.device_id)
+        )
         self._kv_manager = executor.kv_cache_manager if executor._is_kv_manager_v2 else None
         self._v1_manager = None if executor._is_kv_manager_v2 else executor.kv_cache_manager
         self._alignment_adapter = KVAlignmentAdapter(executor)

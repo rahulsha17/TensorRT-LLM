@@ -566,6 +566,24 @@ def _executor():
     )
 
 
+def test_controller_adopts_authority_already_captured_by_attention(monkeypatch):
+    executor = _executor()
+    executor._is_kv_manager_v2 = True
+    executor.executor_request_queue = Mock()
+    startup_authority = Mock()
+    executor.model_engine.execution_attention = SimpleNamespace(authority=startup_authority)
+    constructor = Mock(side_effect=AssertionError("must not replace graph authority"))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.execution_guard.DeviceExecutionAuthority", constructor
+    )
+    table = WorkerVersionTable("session")
+    guard = ExecutionDeviceGuard(executor, table)
+    table.apply(VersionUpdate("session", 1, VERSION))
+    assert guard.device is startup_authority
+    startup_authority.publish.assert_called_once_with(VERSION)
+    constructor.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "target, field, value",
     [

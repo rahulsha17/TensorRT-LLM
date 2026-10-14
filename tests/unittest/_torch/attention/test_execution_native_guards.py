@@ -71,16 +71,16 @@ def test_native_attention_preserves_live_rows(
     old_epoch = (1 << 63) - 1
     new_epoch_word = -(1 << 63)
     table = torch.tensor([old_epoch, 9], device="cuda", dtype=torch.int64)
-    slots = torch.full((2,), -1, device="cuda", dtype=torch.int32)
-    expected = torch.zeros(2, device="cuda", dtype=torch.int64)
+    slots = torch.full((4,), -1, device="cuda", dtype=torch.int32)
+    expected = torch.zeros(4, device="cuda", dtype=torch.int64)
     counters = torch.zeros(3, device="cuda", dtype=torch.int64)
     row_slots = [0, -1 if untagged_neighbor else 1]
     row_epochs = [old_epoch, 0 if untagged_neighbor else 9]
     if target_row == 1:
         row_slots.reverse()
         row_epochs.reverse()
-    row_slots = torch.tensor(row_slots, device="cuda", dtype=torch.int32)
-    row_epochs = torch.tensor(row_epochs, device="cuda", dtype=torch.int64)
+    row_slots = torch.tensor(row_slots + [-1, -1], device="cuda", dtype=torch.int32)
+    row_epochs = torch.tensor(row_epochs + [0, 0], device="cuda", dtype=torch.int64)
     epoch_word = torch.tensor([new_epoch_word], device="cuda", dtype=torch.int64)
     # Compile the atomic publisher before any graph capture.
     old_word = torch.tensor([old_epoch], device="cuda", dtype=torch.int64)
@@ -170,7 +170,15 @@ def test_native_attention_preserves_live_rows(
 
 @pytest.mark.parametrize(
     "invalid",
-    ["partial", "host_table", "slot_dtype", "expected_rows", "counter_size", "empty_table"],
+    [
+        "partial",
+        "host_table",
+        "slot_dtype",
+        "slot_rows",
+        "expected_rows",
+        "counter_size",
+        "empty_table",
+    ],
 )
 def test_native_attention_rejects_invalid_authority_metadata(monkeypatch, invalid):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
@@ -199,6 +207,9 @@ def test_native_attention_rejects_invalid_authority_metadata(monkeypatch, invali
             authority["retire_current_versions"] = authority["retire_current_versions"].cpu()
         elif invalid == "slot_dtype":
             authority["retire_sequence_slots"] = authority["retire_sequence_slots"].float()
+        elif invalid == "slot_rows":
+            authority["retire_sequence_slots"] = authority["retire_sequence_slots"][:1]
+            authority["retire_expected_versions"] = authority["retire_expected_versions"][:1]
         elif invalid == "expected_rows":
             authority["retire_expected_versions"] = authority["retire_expected_versions"][:1]
         elif invalid == "counter_size":

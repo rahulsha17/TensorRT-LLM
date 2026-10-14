@@ -1331,7 +1331,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         validate(*retire_expected_versions, at::ScalarType::Long);
         validate(*retire_counters, at::ScalarType::Long);
         TORCH_CHECK(retire_current_versions->numel() > 0 && retire_current_versions->numel() <= INT_MAX
-                && retire_sequence_slots->numel() == sequence_length.numel()
+                && retire_sequence_slots->numel() >= sequence_length.numel()
+                && retire_sequence_slots->numel() <= INT_MAX
                 && retire_expected_versions->numel() == retire_sequence_slots->numel() && retire_counters->numel() == 3,
             "RETIRE authority tensor sizes do not match the batch");
         // GPT-OSS carries weight-only MXFP4 metadata here even when attention

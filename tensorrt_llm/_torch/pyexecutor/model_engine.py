@@ -809,6 +809,10 @@ class PyTorchModelEngine(ModelEngine):
             self._spec_metadata = value
 
     @property
+    def execution_attention(self):
+        return getattr(self._runner, "execution_attention", None)
+
+    @property
     def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
         # PyExecutor suspends the padding dummies around a KV pool rebalance.
         if not isinstance(self._runner, DecoderRunner):

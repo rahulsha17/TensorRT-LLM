@@ -760,7 +760,7 @@ ordinary attention path.
 The native implementation covers source-built SM90 BF16 attention with head
 size 64 or 128, paged KV, and a single beam. It checks authority before eligible
 attention tiles and before attention-output and KV stores. Epoch reads use
-GPU-scope acquire atomics, matching the device publisher. Untagged live rows
+GPU-scope acquire loads, matching the device publisher. Untagged live rows
 use the exact sentinel `(slot=-1, expected_epoch=0)`. Multi-block reductions
 still complete their scratch writes and semaphore arrivals; they cannot take
 independent early exits without stranding other blocks.
@@ -771,11 +771,27 @@ Captured graphs require stable addresses, with row identities refreshed before
 each replay. Existing cubins without the authority ABI cannot serve a guarded
 call. Rebuild native libraries and bindings together.
 
-**Integration status:** the executor does not yet bind its version table to
-these attention metadata fields. Automatic binding, overlap lifetime handling,
-and graph initialization remain required before real-model runs exercise the
-native predicates. This is an operator implementation and qualification step,
-not a claim of end-to-end operator suppression.
+Enable executor binding before constructing the LLM:
+
+```bash
+export TRTLLM_RETIRE_NATIVE_GUARDS=1
+export TLLM_FMHA_LIBS=fallback
+```
+
+The decoder creates its authority table before warmup. When the runtime later
+registers a scope, the controller adopts that same table. The runner stages
+identities in the attention packer's order after input preparation, before
+eager/compiled execution or graph replay. Each metadata object owns separate,
+stable buffers with capacity for all sequence rows; unused entries are reset
+to the untagged sentinel. This also covers prefill graph buckets whose sequence
+count changes. Immutable host uploads stay alive until their copies complete,
+and the buffers can only be updated on their original model submission stream.
+
+This opt-in requires the matching native build. It currently targets the
+single-rank SM90 BF16 decoder path above, with V1 or V2 KV. Enabling it does
+not remove the executor's unsupported-feature checks. Native operator tests,
+binding tests and real-model eager/overlap/compiled/graph qualification must
+pass before claiming end-to-end operator suppression or performance gains.
 
 `tests/unittest/_torch/attention/test_execution_native_guards.py` checks V1/V2,
 fresh/cached context, short/long generation, mixed batches, live tagged and
@@ -784,6 +800,9 @@ and captured decode replay after identity changes. It compares live outputs
 exactly with the unguarded operator and verifies that revoked rows leave output
 and KV sentinels untouched. The existing H100 attention test-list entry includes
 this file. Native build and GPU results are required to qualify the port.
+`test_execution_attention_binding.py` additionally checks packed row order,
+repeated graph-padding requests, buffer ownership, graph replay after epoch and
+identity changes, batch shrinkage, stream constraints, and metadata lifetimes.
 
 ### Executor lifecycle
 
