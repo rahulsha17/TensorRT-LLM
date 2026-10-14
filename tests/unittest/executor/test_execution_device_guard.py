@@ -64,6 +64,7 @@ def guard(monkeypatch):
     result.device.submission.side_effect = nullcontext
     result._uses = {}
     result._prefill_frontiers = {}
+    result._early_exit_enabled = True
     result._v1_manager = None
     result._kv_manager = Mock()
     monkeypatch.setattr("torch.cuda.Event", Mock)
@@ -566,7 +567,11 @@ def _executor():
     )
 
 
-def test_controller_adopts_authority_already_captured_by_attention(monkeypatch):
+@pytest.mark.parametrize("early_exit", [None, "0", "1"])
+def test_controller_adopts_authority_already_captured_by_attention(monkeypatch, early_exit):
+    monkeypatch.delenv("TRTLLM_RETIRE_EARLY_EXIT", raising=False)
+    if early_exit is not None:
+        monkeypatch.setenv("TRTLLM_RETIRE_EARLY_EXIT", early_exit)
     executor = _executor()
     executor._is_kv_manager_v2 = True
     executor.executor_request_queue = Mock()
@@ -580,8 +585,19 @@ def test_controller_adopts_authority_already_captured_by_attention(monkeypatch):
     guard = ExecutionDeviceGuard(executor, table)
     table.apply(VersionUpdate("session", 1, VERSION))
     assert guard.device is startup_authority
+    assert guard._early_exit_enabled is (early_exit != "0")
     startup_authority.publish.assert_called_once_with(VERSION)
     constructor.assert_not_called()
+
+
+@pytest.mark.parametrize("value", ["", "yes", "2"])
+def test_invalid_early_exit_setting_fails_before_executor_setup(monkeypatch, value):
+    monkeypatch.setenv("TRTLLM_RETIRE_EARLY_EXIT", value)
+    table = WorkerVersionTable("session")
+    with pytest.raises(ValueError, match="TRTLLM_RETIRE_EARLY_EXIT must be 0 or 1"):
+        ExecutionDeviceGuard(None, table)
+    assert table.drain_tracker is None
+    assert table.alignment_state is None
 
 
 @pytest.mark.parametrize(
@@ -641,10 +657,12 @@ def test_optimized_mode_matrix_is_accepted(v2, overlap, mode, in_graph_sampling)
     ExecutionDeviceGuard.validate_executor(executor)
 
 
-def test_fence_covers_enqueue_until_terminal_cleanup(guard):
+@pytest.mark.parametrize("early_exit", [True, False])
+def test_fence_covers_enqueue_until_terminal_cleanup(guard, early_exit):
     from tensorrt_llm.execution_authority import Revision
     from tensorrt_llm.execution_fence import FenceRequest, RequestDrainTracker
 
+    guard._early_exit_enabled = early_exit
     guard.table.drain_tracker = RequestDrainTracker()
     request = _request()
     executor = object.__new__(PyExecutor)
@@ -963,6 +981,31 @@ def test_operator_exit_unwinds_and_records_partial_submission(guard):
     assert guard._uses[id(request)].event is not None
     assert guard._prefill_frontiers[id(request)] == 0
     execution_early_exit_point()
+
+
+def test_disabling_early_exit_keeps_stale_commit_gates_and_completion_wait(guard):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        execution_early_exit_point,
+        get_layer_early_exit_point,
+    )
+
+    guard._early_exit_enabled = False
+    request = _request()
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+        assert get_layer_early_exit_point() is None
+        execution_early_exit_point("eager_layer", 4, 64)
+    event = guard._uses[id(request)].event
+    assert event is not None
+    guard.device.wait_event.assert_not_called()
+    # A previously accepted device result still cannot commit under old host authority.
+    with guard.token_commit(_state(request, allowed=[True])):
+        assert request.is_finished
+    with guard.context_commit(batch) as accepted:
+        assert not accepted.context_requests
+    guard.before_release(request)
+    guard.device.wait_event.assert_called_once_with(event)
 
 
 def test_boundary_observer_tracks_verdict_and_restores_after_unwind() -> None:

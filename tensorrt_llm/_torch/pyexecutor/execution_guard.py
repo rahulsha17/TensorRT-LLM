@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Execution authority at scheduling, GPU token commit, and KV ownership boundaries."""
 
+import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import copy
@@ -68,6 +69,10 @@ class ExecutionDeviceGuard:
             raise NotImplementedError("RETIRE device guards do not support: " + ", ".join(rejected))
 
     def __init__(self, executor: "PyExecutor", table: WorkerVersionTable) -> None:
+        early_exit = os.environ.get("TRTLLM_RETIRE_EARLY_EXIT", "1")
+        if early_exit not in ("0", "1"):
+            raise ValueError("TRTLLM_RETIRE_EARLY_EXIT must be 0 or 1")
+        self._early_exit_enabled = early_exit == "1"
         self.validate_executor(executor)
         if not executor._is_kv_manager_v2 and not hasattr(LlmRequest, "freeze_retire_kv_frontier"):
             raise RuntimeError("RETIRE V1 prefill inheritance requires rebuilt native bindings")
@@ -253,7 +258,9 @@ class ExecutionDeviceGuard:
         with (
             self.device.submission(),
             early_exit_scope(
-                wholly_obsolete if versions and all(v is not None for v in versions) else None,
+                wholly_obsolete
+                if self._early_exit_enabled and versions and all(v is not None for v in versions)
+                else None,
                 layer_checks=sum(r.context_chunk_size for r in batch.context_requests) >= 32,
                 observer=observe if traced else None,
             ),

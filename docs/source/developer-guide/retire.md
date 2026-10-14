@@ -806,6 +806,22 @@ identity changes, batch shrinkage, stream constraints, and metadata lifetimes.
 
 ### Executor lifecycle
 
+For mechanism ablations, set `TRTLLM_RETIRE_EARLY_EXIT=0` before starting the
+worker to disable host prelaunch, layer and graph-segment exits. The default is
+`1`. This leaves authority publication, stale-output rejection, FENCE and KV
+ownership checks active. Native attention predicates have their own startup
+switch, `TRTLLM_RETIRE_NATIVE_GUARDS`; disable both to measure an arm without
+either form of early stopping. Keep the same attention provider in every arm.
+
+Cross early stopping off/on with explicit inheritance off/on. With inheritance
+off, call `advance(revision)` without an alignment input, wait for publication
+and FENCE, then submit the successor under the new version. With inheritance
+on, supply the revised input and wait for ALIGN and RESUME as usual. Keep
+ordinary prefix reuse and cache salts equivalent in all four arms. This tests
+the benefit of an explicit handoff, not the benefit of disabling native reuse.
+Run native cancellation as a separate baseline. Preserve correctness failures
+and report both total revision latency and recovery after any imposed wait.
+
 The CPU CI list includes authority, mailbox, IPC, host gates, and executor wiring.
 Guard tests cover revisions during result waits, mixed scopes, context-only
 chunks, V2 commit races, slot changes, recycled request IDs, overlapping readers,
