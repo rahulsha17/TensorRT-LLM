@@ -118,6 +118,23 @@ PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
 
 # From _storage_manager.py
+class ReusePageResidency:
+    block_ordinal: int
+    life_cycle_id: int
+    token_start: int
+    matched_token_count: int
+    recorded_token_count: int
+    cache_level: int | None
+    pool_group: int | None
+    slot_id: int | None
+    ready: bool
+
+class ReuseResidencySnapshot:
+    """Copied tier observations, not page ownership or a future read guarantee."""
+
+    num_tokens: int
+    pages: list[ReusePageResidency]
+
 class StorageStatistics:
     """Independent per-pool storage counts returned by the manager."""
 
@@ -783,6 +800,18 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> bytes | None: ...
+    def probe_reuse_residency(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        input_tokens: Sequence[TokenIdExt] | None = None,
+    ) -> ReuseResidencySnapshot:
+        """Sample matched pages under the manager lock without acquiring ownership.
+
+        Missing pages have no cache level, pool group, or slot. A ready page at
+        level zero was in HBM when sampled. Slot IDs are not allocation identities
+        and must never be used to read memory or establish successor ownership.
+        """
+        ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_storage_statistics(self, cache_level: CacheLevel = ...) -> list[StorageStatistics]: ...

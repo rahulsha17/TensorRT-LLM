@@ -1961,6 +1961,51 @@ class PyExecutor:
             "maxNumTokens": max_num_blocks * tokens_per_block,
         }
 
+    def get_kv_cache_residency(self,
+                               input_tokens: list[int],
+                               cache_salt: str | None = None,
+                               lora_task_id: int | None = None) -> dict:
+        """Observe reusable V2 pages without reserving or restoring the prefix.
+
+        The native query copies metadata under the manager lock. Results can
+        become stale on return and must not be used as an ownership receipt.
+        """
+        from tensorrt_llm.execution_alignment import AlignmentInput
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope
+
+        if not self._is_kv_manager_v2:
+            raise NotImplementedError(
+                "prefix residency snapshots require KV cache V2")
+        revised = AlignmentInput(tuple(input_tokens), cache_salt, lora_task_id)
+        manager = self.kv_cache_manager
+        scope = ReuseScope(lora_id=revised.lora_task_id,
+                           salt=manager._derive_reuse_salt(revised.cache_salt))
+        start = time.monotonic_ns()
+        with torch.cuda.device(self.device_id):
+            snapshot = manager.impl.probe_reuse_residency(
+                scope, revised.input_token_ids)
+        end = time.monotonic_ns()
+        return {
+            "matched_tokens":
+            snapshot.num_tokens,
+            "sample_start_ns":
+            start,
+            "sample_end_ns":
+            end,
+            "cache_tiers": [tier.name for tier in manager.impl.cache_tier_list],
+            "pages": [{
+                "block_ordinal": page.block_ordinal,
+                "life_cycle_id": page.life_cycle_id,
+                "token_start": page.token_start,
+                "matched_token_count": page.matched_token_count,
+                "recorded_token_count": page.recorded_token_count,
+                "cache_level": page.cache_level,
+                "pool_group": page.pool_group,
+                "slot_id": page.slot_id,
+                "ready": page.ready,
+            } for page in snapshot.pages],
+        }
+
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)

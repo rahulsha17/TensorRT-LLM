@@ -274,6 +274,64 @@ class TestFirstNewBlockProbe(unittest.TestCase):
         self.manager.clear_reusable_blocks()
         self.assertEqual(self.probe_key(tokens), cold_key)
 
+    def test_residency_matches_scope_and_partial_prefix(self) -> None:
+        tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
+        scope = ReuseScope(lora_id=7, salt=1234)
+        empty = self.manager.probe_reuse_residency()
+        self.assertEqual(empty.num_tokens, 0)
+        self.assertEqual(empty.pages, [])
+        self.commit(tokens, scope)
+        for wrong_scope in (
+            ReuseScope(),
+            ReuseScope(lora_id=8, salt=1234),
+            ReuseScope(lora_id=7, salt=1235),
+        ):
+            snapshot = self.manager.probe_reuse_residency(wrong_scope, tokens)
+            self.assertEqual(snapshot.num_tokens, 0)
+            self.assertEqual(snapshot.pages, [])
+        for length in (0, 1, 3, 4, 5, 7, 8, len(tokens)):
+            with self.subTest(length=length):
+                query = tokens[:length] + self.tokens(100, len(tokens) - length)
+                snapshot = self.manager.probe_reuse_residency(scope, query)
+                self.assertEqual(snapshot.num_tokens, self.manager.probe_reuse(scope, query))
+                for page in snapshot.pages:
+                    self.assertEqual(page.token_start, page.block_ordinal * TOKENS_PER_BLOCK)
+                    self.assertGreater(page.matched_token_count, 0)
+                    self.assertLessEqual(page.matched_token_count, TOKENS_PER_BLOCK)
+                    self.assertLessEqual(
+                        page.token_start + page.matched_token_count, snapshot.num_tokens
+                    )
+                    if page.cache_level is None:
+                        self.assertIsNone(page.slot_id)
+                        self.assertIsNone(page.pool_group)
+                        self.assertEqual(page.recorded_token_count, 0)
+                        self.assertFalse(page.ready)
+                    else:
+                        self.assertEqual(page.cache_level, 0)
+                        self.assertTrue(page.ready)
+                        self.assertGreaterEqual(page.recorded_token_count, page.matched_token_count)
+
+    def test_residency_snapshot_does_not_hold_pages(self) -> None:
+        tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
+        self.commit(tokens)
+        self.stored_block_hashes()
+        before = self.manager.get_committed_stats()
+        snapshot = self.manager.probe_reuse_residency(None, tokens)
+        self.assertEqual(snapshot.num_tokens, self.manager.probe_reuse(None, tokens))
+        self.assertGreater(snapshot.num_tokens, 0)
+        self.assertEqual(self.manager.get_committed_stats(), before)
+        self.assertEqual(self.stored_block_hashes(), [])
+        locations = [(p.cache_level, p.pool_group, p.slot_id) for p in snapshot.pages]
+        with self.assertRaises(AttributeError):
+            snapshot.pages[0].cache_level = 1
+        self.manager.clear_reusable_blocks()
+        fresh = self.manager.probe_reuse_residency(None, tokens)
+        self.assertEqual(fresh.num_tokens, 0)
+        self.assertEqual(fresh.pages, [])
+        self.assertEqual(
+            [(p.cache_level, p.pool_group, p.slot_id) for p in snapshot.pages], locations
+        )
+
     def test_digest_tokens_in_the_prefix_and_new_block(self) -> None:
         tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
         tokens[3] = bytes([17]) * 32

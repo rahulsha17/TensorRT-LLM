@@ -227,6 +227,37 @@ int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, boo
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
+ReuseResidencySnapshot KvCacheManager::probeReuseResidency(
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+{
+    auto const apiLock = lockShared();
+    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    ReuseResidencySnapshot result{.numTokens = match.numTokens};
+    for (auto const* block : match.blocks)
+    {
+        int const tokenStart = block->ordinal().value() * tokensPerBlock();
+        int const matchedTokenCount = std::min(static_cast<int>(block->tokens.size()), match.numTokens - tokenStart);
+        for (LifeCycleId lifeCycle{0}; lifeCycle < block->storage.size(); ++lifeCycle)
+        {
+            ReusePageResidency entry{.blockOrdinal = block->ordinal().value(),
+                .lifeCycleId = lifeCycle.value(),
+                .tokenStart = tokenStart,
+                .matchedTokenCount = matchedTokenCount};
+            auto const* page = block->storage[lifeCycle];
+            if (page != nullptr)
+            {
+                entry.recordedTokenCount = page->numTokensInBlock;
+                entry.cacheLevel = page->cacheLevel.value();
+                entry.poolGroup = mStorage->getPoolGroupIndex(page->cacheLevel, lifeCycle).value();
+                entry.slotId = page->slotId().value();
+                entry.ready = page->readyEvent.queryComplete();
+            }
+            result.pages.push_back(entry);
+        }
+    }
+    return result;
+}
+
 std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
     ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {

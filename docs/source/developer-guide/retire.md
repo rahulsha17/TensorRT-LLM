@@ -619,6 +619,30 @@ These operations stay outside graph capture and use the same boundary with
 V1/V2, eager, overlap, graph, and compiled execution. The copy wait occurs once
 per handoff, not on every decoding step.
 
+## Measuring prefix residence
+
+For V2, the worker RPC `fetch_kv_cache_residency(input_tokens, cache_salt,
+lora_task_id)` reports the pages that match those tokens in the ordinary reuse
+namespace. It returns the matched token count, sampling timestamps, cache-tier
+names, and each block/lifecycle's tier, slot and readiness. The native method
+`KVCacheManager.probe_reuse_residency` takes the manager's shared lock and returns
+copied values. The probe does not reserve, restore, or change eviction priority.
+It requires a matching native build.
+
+Use `cache_tiers[page.cache_level] == "GPU_MEM"` together with `page.ready`
+to identify pages ready in HBM at the time of the sample. A tree hit can include
+host or disk pages. Missing pages have no tier or slot; windowed caches may
+legitimately omit old pages. Report each lifecycle separately rather than adding
+their token counts together. `matched_token_count` clips each page to the query's
+matched prefix; `recorded_token_count` describes the underlying page.
+
+Sample before and after cache pressure, and before RESUME, to show migration
+without triggering restoration. These observations can become stale immediately
+after the query. A slot number is not an allocation identity or permission to
+read memory; ALIGN's live reservation still establishes successor ownership.
+The probe observes the supplied tokens, including the final token if present;
+RESUME may recompute that token for logits. V1 does not support this RPC.
+
 ## Early exit during prefill
 
 For an interruption test, resolve the frontend request ID through the worker's
@@ -626,6 +650,10 @@ For an interruption test, resolve the frontend request ID through the worker's
 The mapping exists only while the backend request is live. It does not prove
 that a reported prefill position is still the active position when a revision
 arrives.
+
+Set `TLLM_LOG_LEVEL=info` before launching the worker to retain early-exit events;
+the default error level filters them out. Missing events at that level do not
+show whether an exit happened.
 
 An actual early exit emits `RETIRE_EARLY_EXIT` with frontend and runtime request
 IDs, the prefill position, and the execution boundary. For `eager_layer`,

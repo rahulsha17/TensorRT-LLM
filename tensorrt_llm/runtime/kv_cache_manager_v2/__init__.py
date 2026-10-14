@@ -152,6 +152,8 @@ PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
 PoolGroupPeakBlockStats = _cpp.PoolGroupPeakBlockStats
 ReuseScope = _cpp.ReuseScope
+ReusePageResidency = _cpp.ReusePageResidency
+ReuseResidencySnapshot = _cpp.ReuseResidencySnapshot
 ReusedBlocksByLevel = _cpp.ReusedBlocksByLevel
 ScratchDesc = _cpp.ScratchDesc
 SlotDesc = _cpp.SlotDesc
@@ -259,6 +261,8 @@ __all__ = [
     "PoolIndex",
     "Priority",
     "ReuseScope",
+    "ReusePageResidency",
+    "ReuseResidencySnapshot",
     "ScratchDesc",
     "KVCacheIterationStatsDelta",
     "ReusedBlocksByLevel",

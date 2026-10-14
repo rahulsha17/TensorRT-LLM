@@ -339,6 +339,7 @@ def test_stats_queries_do_not_block_a_concurrent_resize() -> None:
         ("manager", "get_and_reset_iteration_disk_prefetch_blocks"),
         ("manager", "get_and_reset_iteration_peak_block_stats_by_level"),
         ("manager", "get_storage_statistics"),
+        ("manager", "probe_reuse_residency"),
         ("cache", "drop_cached_token_attribution"),
         ("cache", "drop_partial_block_cached_token_attribution"),
     ],
@@ -407,17 +408,30 @@ def test_level_stats_wait_for_the_api_lock_without_holding_the_gil(owner: str, m
     assert call_finished.is_set()
 
 
-def test_probe_reuse_runs_concurrently_with_a_background_resize() -> None:
+@pytest.mark.parametrize("residency", [False, True])
+def test_probe_reuse_runs_concurrently_with_a_background_resize(residency: bool) -> None:
     """The motivating scenario: serve prefix-match probes while a resize runs elsewhere."""
     manager = KVCacheManager(_make_config())
     try:
         tokens = list(range(manager.tokens_per_block * 4))
+        stream = torch.cuda.Stream()
+        cache = manager.create_kv_cache(None, tokens)
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(len(tokens))
+        cache.commit(tokens)
+        cache.close()
+        stream.synchronize()
         stop = threading.Event()
         probes = {"n": 0}
 
         def probe() -> None:
             while not stop.is_set():
-                manager.probe_reuse(None, tokens)
+                if residency:
+                    snapshot = manager.probe_reuse_residency(None, tokens)
+                    assert snapshot.num_tokens == len(tokens)
+                    assert all(page.cache_level == 0 and page.ready for page in snapshot.pages)
+                else:
+                    assert manager.probe_reuse(None, tokens) == len(tokens)
                 probes["n"] += 1
 
         prober = _worker(probe)

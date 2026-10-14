@@ -52,6 +52,26 @@ struct ExpandedBuffer
     int expansion; // expansion factor (tokens_per_block / tokens_per_block_override)
 };
 
+// Value copies only: these observations do not retain pages or authorize reads.
+struct ReusePageResidency
+{
+    int blockOrdinal = 0;
+    int lifeCycleId = 0;
+    int tokenStart = 0;
+    int matchedTokenCount = 0;
+    int recordedTokenCount = 0;
+    std::optional<int> cacheLevel;
+    std::optional<int> poolGroup;
+    std::optional<int> slotId;
+    bool ready = false;
+};
+
+struct ReuseResidencySnapshot
+{
+    int numTokens = 0;
+    std::vector<ReusePageResidency> pages;
+};
+
 struct AggregatedPageDesc
 {
     MemAddress base;                     // pool base address + buffer offset
@@ -154,6 +174,11 @@ public:
     BlockRadixTree::ReuseMatch matchReuse(
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+
+    // Sample matched tree pages without holding, restoring, or touching LRU priority.
+    // Tier/slot observations can become stale immediately after the shared lock drops.
+    ReuseResidencySnapshot probeReuseResidency(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
     // Read-only, advisory key of the first full block past the reusable prefix.
     // Uses the same fresh, window-aware match as probeReuse without acquiring pages.

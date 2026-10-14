@@ -79,6 +79,48 @@ def _batch(*requests, context=False):
     return batch
 
 
+def test_residency_rpc_preserves_cache_namespace_and_page_tiers(monkeypatch) -> None:
+    executor = object.__new__(PyExecutor)
+    executor._is_kv_manager_v2 = True
+    executor.device_id = 0
+    page = SimpleNamespace(
+        block_ordinal=0,
+        life_cycle_id=0,
+        token_start=0,
+        matched_token_count=4,
+        recorded_token_count=4,
+        cache_level=1,
+        pool_group=0,
+        slot_id=7,
+        ready=True,
+    )
+    manager = Mock()
+    manager._derive_reuse_salt.return_value = 1234
+    manager.impl.probe_reuse_residency.return_value = SimpleNamespace(num_tokens=4, pages=[page])
+    manager.impl.cache_tier_list = [
+        SimpleNamespace(name="GPU_MEM"),
+        SimpleNamespace(name="HOST_MEM"),
+    ]
+    executor.kv_cache_manager = manager
+    monkeypatch.setattr("torch.cuda.device", lambda _: nullcontext())
+    result = executor.get_kv_cache_residency([1, 2, 3, 4, 5], "tenant-salt", 7)
+    scope, tokens = manager.impl.probe_reuse_residency.call_args.args
+    assert scope.lora_id == 7 and scope.salt == 1234
+    assert tokens == (1, 2, 3, 4, 5)
+    manager._derive_reuse_salt.assert_called_once_with("tenant-salt")
+    assert result["matched_tokens"] == 4
+    assert result["cache_tiers"] == ["GPU_MEM", "HOST_MEM"]
+    assert result["sample_start_ns"] <= result["sample_end_ns"]
+    assert result["pages"] == [vars(page)]
+    manager.impl.probe_reuse_residency.reset_mock()
+    with pytest.raises(ValueError, match="nonnegative int32"):
+        executor.get_kv_cache_residency([-1])
+    manager.impl.probe_reuse_residency.assert_not_called()
+    executor._is_kv_manager_v2 = False
+    with pytest.raises(NotImplementedError, match="require KV cache V2"):
+        executor.get_kv_cache_residency([1])
+
+
 def _state(*requests, allowed=None):
     state = SimpleNamespace(
         requests=list(requests),

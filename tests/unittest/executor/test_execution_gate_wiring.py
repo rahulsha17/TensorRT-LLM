@@ -211,6 +211,16 @@ def test_runtime_request_id_uses_backend_mapping_and_expires():
     assert BaseWorker.get_runtime_request_id(worker, 42) is None
 
 
+def test_residency_rpc_forwards_namespace_and_requires_engine() -> None:
+    worker = MagicMock()
+    worker.engine.get_kv_cache_residency.return_value = {"matched_tokens": 4}
+    assert BaseWorker.fetch_kv_cache_residency(worker, [1, 2], "salt", 7) == {"matched_tokens": 4}
+    worker.engine.get_kv_cache_residency.assert_called_once_with([1, 2], "salt", 7)
+    worker.engine = None
+    with pytest.raises(RuntimeError, match="before engine initialization"):
+        BaseWorker.fetch_kv_cache_residency(worker, [1, 2])
+
+
 def test_stale_native_submission_never_reaches_engine(controller) -> None:
     worker, request, _ = worker_shell(controller)
     controller.advance(REVISION)

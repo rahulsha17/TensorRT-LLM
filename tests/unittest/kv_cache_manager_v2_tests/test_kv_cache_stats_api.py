@@ -21,6 +21,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
     GpuCacheTierConfig,
+    HostCacheTierConfig,
     KVCacheIterationStatsDelta,
     KVCacheManager,
     KVCacheManagerConfig,
@@ -100,6 +101,49 @@ def test_cpp_stats_types_are_native() -> None:
     assert peak == PoolGroupPeakBlockStats(3, 4, 5)
     with pytest.raises(AttributeError):
         peak.available = 6
+
+
+def test_prefix_residency_observes_offload_without_restoring() -> None:
+    config = _make_config()
+    config.cache_tiers = [*config.cache_tiers, HostCacheTierConfig(quota=4 << 20)]
+    manager = KVCacheManager(config)
+    cache = None
+    stream = torch.cuda.Stream()
+    tokens = list(range(2048))
+    try:
+        cache = manager.create_kv_cache(None, tokens)
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(len(tokens))
+        cache.commit(tokens)
+        cache.suspend()
+        stream.synchronize()
+        initial = manager.probe_reuse_residency(None, tokens)
+        assert initial.num_tokens == len(tokens)
+        assert all(p.cache_level == 0 and p.ready for p in initial.pages)
+
+        # Keep the prefix owned while forcing real migration out of HBM.
+        assert manager.resize(GPU_LEVEL, 1 << 20)
+        torch.cuda.synchronize()
+        before = manager.get_committed_stats()
+        offloaded = manager.probe_reuse_residency(None, tokens)
+        assert offloaded.num_tokens == len(tokens)
+        assert any(p.cache_level == 1 and p.ready for p in offloaded.pages)
+        locations = [(p.cache_level, p.slot_id) for p in offloaded.pages]
+        again = manager.probe_reuse_residency(None, tokens)
+        assert [(p.cache_level, p.slot_id) for p in again.pages] == locations
+        assert manager.get_committed_stats() == before
+
+        assert manager.resize(GPU_LEVEL, 4 << 20)
+        assert cache.resume(stream.cuda_stream)
+        stream.synchronize()
+        restored = manager.probe_reuse_residency(None, tokens)
+        assert restored.num_tokens == len(tokens)
+        assert all(p.cache_level == 0 and p.ready for p in restored.pages)
+        assert [(p.cache_level, p.slot_id) for p in offloaded.pages] == locations
+    finally:
+        if cache is not None:
+            cache.close()
+        manager.shutdown()
 
 
 def test_native_cold_page_codec_is_consumed_after_failure() -> None:

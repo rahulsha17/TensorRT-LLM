@@ -1353,6 +1353,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__eq__", &kv::SsmSnapshotIterationStatsDelta::operator==, nb::arg("other"))
         .def("__repr__", &ssmSnapshotStatsDeltaRepr);
 
+    nb::class_<kv::ReusePageResidency>(m, "ReusePageResidency")
+        .def_ro("block_ordinal", &kv::ReusePageResidency::blockOrdinal)
+        .def_ro("life_cycle_id", &kv::ReusePageResidency::lifeCycleId)
+        .def_ro("token_start", &kv::ReusePageResidency::tokenStart)
+        .def_ro("matched_token_count", &kv::ReusePageResidency::matchedTokenCount)
+        .def_ro("recorded_token_count", &kv::ReusePageResidency::recordedTokenCount)
+        .def_ro("cache_level", &kv::ReusePageResidency::cacheLevel)
+        .def_ro("pool_group", &kv::ReusePageResidency::poolGroup)
+        .def_ro("slot_id", &kv::ReusePageResidency::slotId)
+        .def_ro("ready", &kv::ReusePageResidency::ready);
+
+    nb::class_<kv::ReuseResidencySnapshot>(m, "ReuseResidencySnapshot")
+        .def_ro("num_tokens", &kv::ReuseResidencySnapshot::numTokens)
+        .def_ro("pages", &kv::ReuseResidencySnapshot::pages);
+
     nb::class_<kv::StorageStatistics>(m, "StorageStatistics")
         .def_prop_ro("slot_sizes", [](kv::StorageStatistics const& self) { return self.slotSizes.raw(); })
         .def_ro("total", &kv::StorageStatistics::total)
@@ -2564,6 +2579,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     {
                         nb::gil_scoped_release release;
                         return self->probeReuse(std::move(reuseScope), view, knownNoDigest);
+                    });
+            },
+            nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
+        .def(
+            "probe_reuse_residency",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
+            {
+                kv::ReuseScope const reuseScope = castReuseScope(std::move(reuseScopeObj));
+                if (inputTokens.is_none())
+                {
+                    nb::gil_scoped_release release;
+                    return self->probeReuseResidency(reuseScope, kv::TokenSpan{}, /*knownNoDigest=*/true);
+                }
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        nb::gil_scoped_release release;
+                        return self->probeReuseResidency(reuseScope, view, knownNoDigest);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())

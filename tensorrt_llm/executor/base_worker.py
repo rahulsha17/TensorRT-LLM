@@ -244,6 +244,17 @@ class BaseWorker(GenerationExecutor):
 
         return {}
 
+    def fetch_kv_cache_residency(self,
+                                 input_tokens: list[int],
+                                 cache_salt: str | None = None,
+                                 lora_task_id: int | None = None) -> dict:
+        """Return a V2 prefix's sampled page tiers; this does not retain its KV."""
+        if self.engine is None:
+            raise RuntimeError(
+                "KV residency is unavailable before engine initialization")
+        return self.engine.get_kv_cache_residency(input_tokens, cache_salt,
+                                                  lora_task_id)
+
     def fetch_kv_cache_events(self) -> list:
         return self.engine.get_latest_kv_cache_events()
 
