@@ -690,7 +690,7 @@ Chunk 2 starts -> runtime sends ADVANCE
 
 | Execution path | Early-exit boundary |
 | --- | --- |
-| Eager Qwen3 prefill, at least 32 scheduled context tokens | Before each group of four decoder layers |
+| Eager Qwen3, Qwen2 or dense Llama/Mistral prefill, at least 32 scheduled context tokens | Before each group of four decoder layers |
 | Breakable prefill CUDA graph | Before each replay segment |
 | Monolithic CUDA graph or compiled model | Before submitting the model/graph |
 | Other eager models | Before submitting the model |
@@ -805,6 +805,14 @@ repeated graph-padding requests, buffer ownership, graph replay after epoch and
 identity changes, batch shrinkage, stream constraints, and metadata lifetimes.
 
 ### Executor lifecycle
+
+The Qwen3, Qwen2 and dense Llama decoder loops check authority every four
+eager prefill layers. Mistral uses that same Llama loop. An exit stops only
+unsubmitted layers; the executor still drains recorded device uses before
+reclaiming the request. Compilation and graph capture omit these Python layer
+checks. Graph replay uses the separate prelaunch and breakable-segment hooks.
+These hooks do not enable unsupported model features or parallelism. Model
+fixtures and production checkpoints need their own GPU qualification.
 
 For mechanism ablations, set `TRTLLM_RETIRE_EARLY_EXIT=0` before starting the
 worker to disable host prelaunch, layer and graph-segment exits. The default is

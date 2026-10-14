@@ -1129,8 +1129,12 @@ def test_early_exit_does_not_call_sampler_update(guard):
 
 
 @pytest.mark.parametrize("compiled,capturing", [(False, False), (True, False), (False, True)])
-def test_qwen_layer_hook_skips_only_unsubmitted_eager_layers(monkeypatch, compiled, capturing):
-    from tensorrt_llm._torch.models import modeling_qwen3
+@pytest.mark.parametrize("family", ["qwen3", "qwen2", "llama"])
+@pytest.mark.parametrize("armed", [True, False])
+def test_layer_hook_skips_only_unsubmitted_eager_layers(
+    monkeypatch, compiled, capturing, family, armed
+):
+    from tensorrt_llm._torch.models import modeling_llama, modeling_qwen, modeling_qwen3
     from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
         ExecutionEarlyExit,
         early_exit_scope,
@@ -1145,14 +1149,29 @@ def test_qwen_layer_hook_skips_only_unsubmitted_eager_layers(monkeypatch, compil
         calls.append(len(calls))
         return kwargs["hidden_states"], kwargs["residual"]
 
-    model = SimpleNamespace(layers=[layer] * 12, norm=lambda h, r: (h, r), mapping_with_cp=None)
-    with early_exit_scope(lambda: bool(calls)):
-        if compiled or capturing:
-            modeling_qwen3.Qwen3Model.forward(model, None, inputs_embeds=object())
+    model = SimpleNamespace(
+        layers=[layer] * 12,
+        norm=lambda h, r: (h, r),
+        mapping_with_cp=None,
+        num_hidden_layers=12,
+        skip_norm=False,
+    )
+    forward = {
+        "qwen3": modeling_qwen3.Qwen3Model.forward,
+        "qwen2": modeling_qwen.QwenModel.forward,
+        "llama": modeling_llama.LlamaModel.forward,
+    }[family]
+    if family == "llama":
+        model.norm = lambda h: h
+        # Configured depth can be smaller than the module list.
+        model.layers.append(layer)
+    with early_exit_scope(lambda: bool(calls), layer_checks=armed):
+        if compiled or capturing or not armed:
+            forward(model, None, inputs_embeds=object())
             assert len(calls) == 12
         else:
             with pytest.raises(ExecutionEarlyExit) as stopped:
-                modeling_qwen3.Qwen3Model.forward(model, None, inputs_embeds=object())
+                forward(model, None, inputs_embeds=object())
             assert len(calls) == 4
             assert stopped.value.boundary == "eager_layer"
             assert stopped.value.submitted == 4
