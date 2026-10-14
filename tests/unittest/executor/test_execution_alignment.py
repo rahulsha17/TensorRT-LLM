@@ -511,3 +511,61 @@ def test_cancel_before_activation_reclaims_unclaimed_resumed_hold(setup):
     assert record.reservation is None
     with pytest.raises(RuntimeError):
         state.claim(NEW, 11, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id)
+
+
+def test_snapshot_tracks_ownership_until_engine_reclaims_abandoned_hold(setup):
+    controller, _, _, state, _, _ = setup
+    assert state.snapshot()["held_count"] == 0
+    aligned = _aligned(setup)
+    held = state.snapshot()
+    assert held["held_count"] == 1 and held["promised_tokens_held"] == 3
+    assert held["unknown_prefix_count"] == 0
+    assert held["records"][0]["epoch"] == NEW.epoch
+    assert held["records"][0]["current"]
+    controller.advance(Revision("abandon", NEW, replace(NEW, epoch=9))).publication.wait()
+    obsolete = state.snapshot()
+    assert obsolete["held_count"] == 1
+    assert not obsolete["records"][0]["current"]
+    # Neither observing nor revoking authority proves native cleanup.
+    state.process()
+    assert state.snapshot()["held_count"] == 0
+    assert held["records"][0]["current"]  # Earlier snapshots are detached copies.
+    with pytest.raises(ValueError, match="obsolete"):
+        controller.resume(aligned)
+
+
+@pytest.mark.parametrize("failure", ["settle", "close"])
+def test_snapshot_keeps_failed_native_cleanup_visible(setup, failure):
+    controller, _, _, state, _, _ = setup
+    controller.resume(_aligned(setup)).wait()
+    record = next(iter(state._records.values()))
+    getattr(record.reservation, failure).side_effect = RuntimeError("native cleanup failed")
+    state.terminal(NEW, 10)
+    with pytest.raises(AlignmentSafetyError):
+        state.process()
+    snapshot = state.snapshot()
+    assert snapshot["unsafe"] and snapshot["held_count"] == 1
+    assert snapshot["records"][0]["failed"]
+    assert snapshot["promised_tokens_held"] == 3
+
+
+def test_snapshot_reports_unknown_partial_hold_without_native_access():
+    class Hold:
+        reads = 0
+
+        @property
+        def num_tokens(self):
+            self.reads += 1
+            raise AlignmentSafetyError("prefix length unavailable")
+
+    hold = Hold()
+    state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    state.observe(NEW, AlignmentRequest("session", REVISION, INPUT))
+    with pytest.raises(AlignmentSafetyError):
+        state.process()
+    snapshot = state.snapshot()
+    assert hold.reads == 1
+    assert snapshot["unsafe"] and snapshot["held_count"] == 1
+    assert snapshot["unknown_prefix_count"] == 1
+    assert snapshot["promised_tokens_held"] == 0
+    assert snapshot["records"][0]["promised_tokens"] is None

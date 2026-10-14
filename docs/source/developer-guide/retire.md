@@ -862,6 +862,23 @@ CPU suite, CUDA tests, or real inference. GPU validation must include V1/V2,
 overlap on/off, eager/compiled/graph execution, and in-graph sampling, with
 revisions during prefill, generation, and cleanup.
 
+## Observing reservation ownership
+
+`executor.collective_rpc("fetch_execution_reservations")` samples worker-owned
+ALIGN holds without starting RETIRE, querying CUDA, or releasing anything.
+The report distinguishes a promised prefix, a still-held reservation, and a
+reservation whose native cleanup has completed. Superseding an epoch can make
+a reservation obsolete before the engine has released it; a publication or
+FENCE receipt alone does not establish that this extra hold is gone.
+
+`held_count` counts live reservation objects. `promised_tokens_held` sums their
+known promises; overlapping reservations can refer to the same physical pages.
+`unknown_prefix_count` includes retained partial reservations without a completed
+receipt. An unsafe cleanup remains visible with its ownership flag set.
+These are logical ownership counters, not HBM bytes or physical occupancy.
+Use the separate V2 page-residency query for page locations. Both reports are
+observations and cannot authorize reuse.
+
 ## Next steps
 
 Validate the complete lifecycle on native GPU runs across V1/V2 and execution

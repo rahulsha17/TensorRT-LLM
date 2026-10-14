@@ -4,6 +4,7 @@
 
 from contextlib import AbstractContextManager, nullcontext
 from threading import RLock
+from time import monotonic_ns
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -136,6 +137,26 @@ class WorkerExecutionControlMixin:
                 self._execution_mailbox_server = ExecutionMailboxServer(table)
             self._execution_mailbox_server.check_health()
             return self._execution_mailbox_server.address
+
+    def fetch_execution_reservations(self) -> dict:
+        """Observe RETIRE holds through worker RPC without creating a controller.
+
+        This reports logical ownership, not cache residency or a reusable
+        receipt. Sampling does not release holds or drive engine cleanup.
+        """
+        start = monotonic_ns()
+        with self._execution_control_lock:
+            self._require_execution_control_open()
+            table = self._execution_version_table
+            state = table.alignment_state if table is not None else None
+        snapshot = state.snapshot() if state is not None else {}
+        return {
+            "configured": table is not None,
+            "alignment_configured": state is not None,
+            "sample_start_ns": start,
+            "sample_end_ns": monotonic_ns(),
+            **snapshot,
+        }
 
 
 class ProxyExecutionControlMixin:

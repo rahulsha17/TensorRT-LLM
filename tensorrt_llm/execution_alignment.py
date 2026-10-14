@@ -248,6 +248,43 @@ class WorkerAlignmentState:
                 raise RuntimeError(f"ALIGN failed: {record.error}") from record.error
             return record.receipt
 
+    def snapshot(self) -> dict:
+        """Copy logical reservation ownership without querying native KV or CUDA.
+
+        Promised tokens count per reservation, not distinct physical blocks or
+        HBM residency. A retained reservation with no receipt has unknown size.
+        Only successful native cleanup clears its ownership flag.
+        """
+        with self._lock:
+            records = []
+            for request, record in self._records.items():
+                version = request.revision.successor_version
+                records.append(
+                    {
+                        "tenant_id": version.tenant_id,
+                        "scope_id": version.scope_id,
+                        "epoch": version.epoch,
+                        "current": self._is_current(request),
+                        "has_reservation": record.reservation is not None,
+                        "promised_tokens": (
+                            record.receipt.reusable_prefix_length if record.receipt else None
+                        ),
+                        "resumed": record.resumed,
+                        "attached": record.attached,
+                        "request_id": record.request_id,
+                        "failed": record.error is not None,
+                    }
+                )
+            held = [record for record in records if record["has_reservation"]]
+            return {
+                "closed": self._closed,
+                "unsafe": self._unsafe_error is not None,
+                "held_count": len(held),
+                "promised_tokens_held": sum(record["promised_tokens"] or 0 for record in held),
+                "unknown_prefix_count": sum(record["promised_tokens"] is None for record in held),
+                "records": records,
+            }
+
     def authorize_resume(self, receipt: AlignmentReceipt) -> None:
         """Validate a live reservation before opening worker admission; no CUDA calls."""
         with self._lock:

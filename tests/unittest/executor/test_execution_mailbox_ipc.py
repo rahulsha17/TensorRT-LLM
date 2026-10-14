@@ -43,12 +43,36 @@ def test_rpc_method_discovery_does_not_initialize_execution_control(world_size: 
     server = RPCServer(worker)
     try:
         assert "start_execution_mailbox" in server._functions
+        assert "fetch_execution_reservations" in server._functions
+        snapshot = worker.fetch_execution_reservations()
+        assert not snapshot["configured"] and not snapshot["alignment_configured"]
+        assert snapshot["sample_start_ns"] <= snapshot["sample_end_ns"]
         assert worker._execution_controller is None
         assert worker._execution_version_table is None
         assert worker._execution_mailbox_server is None
     finally:
         server.shutdown()
         worker._shutdown_execution_control()
+
+
+def test_reservation_snapshot_does_not_bootstrap_or_drive_native_cleanup():
+    from tensorrt_llm.execution_alignment import WorkerAlignmentState
+
+    worker = _Worker()
+    try:
+        worker.get_execution_controller().register(VERSION).wait()
+        table = worker.get_execution_version_table()
+        assert not worker.fetch_execution_reservations()["alignment_configured"]
+        state = table.alignment_state = WorkerAlignmentState(lambda _: None, lambda: None)
+        snapshot = worker.fetch_execution_reservations()
+        assert snapshot["configured"] and snapshot["alignment_configured"]
+        assert snapshot["held_count"] == 0 and snapshot["records"] == []
+        state.close()
+        assert worker.fetch_execution_reservations()["closed"]
+    finally:
+        worker._shutdown_execution_control()
+    with pytest.raises(RuntimeError, match="closed"):
+        worker.fetch_execution_reservations()
 
 
 def test_real_rpc_bootstrap_opens_separate_publication_channel() -> None:
