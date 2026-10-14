@@ -214,6 +214,8 @@ def test_native_sampler_consumes_overlap_batch_containing_canceled_request(logpr
     guard.table.apply(VersionUpdate("session", 1, version))
     guard._uses = {}
     guard._kv_manager = None
+    guard._v1_manager = None
+    guard._prefill_frontiers = {}
     sampler = TorchSampler(
         TorchSampler.Args(
             max_seq_len=32,
