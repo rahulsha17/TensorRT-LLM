@@ -78,6 +78,7 @@ class ExecutionDeviceGuard:
             raise RuntimeError("RETIRE V1 prefill inheritance requires rebuilt native bindings")
         self.table = table
         attention_binding = getattr(executor.model_engine, "execution_attention", None)
+        self._native_kv_guards = attention_binding is not None
         self.device = (
             attention_binding.authority
             if attention_binding is not None
@@ -356,6 +357,20 @@ class ExecutionDeviceGuard:
         if not any(version is not None for version in versions):
             yield batch
             return
+        if self._native_kv_guards:
+            # A later publication can suppress queued KV writes. Complete this
+            # chunk before accepting its frontier, then recheck host authority.
+            # Keep the publisher unlocked throughout the wait.
+            events = {}
+            for request, version in zip(requests, versions):
+                if version is None:
+                    continue
+                use = self._uses.get(id(request))
+                if use is None or use.request is not request or use.event is None:
+                    raise RuntimeError("context GPU completion is unknown; refusing prefix commit")
+                events[id(use.event)] = use.event
+            for event in events.values():
+                self.device.wait_event(event)
         with self.table.guard_versions(versions) as allowed:
             rejected = {id(r) for r, ok in zip(requests, allowed) if not ok}
             for request in requests:

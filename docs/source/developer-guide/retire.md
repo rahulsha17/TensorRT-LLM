@@ -787,6 +787,14 @@ to the untagged sentinel. This also covers prefill graph buckets whose sequence
 count changes. Immutable host uploads stay alive until their copies complete,
 and the buffers can only be updated on their original model submission stream.
 
+With native predicates enabled, tagged prefill chunks wait for their recorded
+GPU completion before host progress or a reusable prefix is accepted. Publication
+remains unlocked during that wait, and authority is checked again afterward.
+This prevents a revision from suppressing queued writes to an already accepted
+prefix. It can reduce CPU/GPU overlap during tagged prefill; include that cost in
+performance comparisons. Untagged batches, decode-only batches and the path
+without native predicates keep their existing scheduling behavior.
+
 This opt-in requires the matching native build. It currently targets the
 single-rank SM90 BF16 decoder path above, with V1 or V2 KV. Enabling it does
 not remove the executor's unsupported-feature checks. Native operator tests,

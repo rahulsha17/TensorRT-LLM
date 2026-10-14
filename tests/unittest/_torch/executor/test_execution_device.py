@@ -88,6 +88,79 @@ def test_publication_does_not_join_an_occupied_model_stream() -> None:
         model_done.synchronize()
 
 
+@pytest.mark.parametrize("revoked", [False, True])
+def test_context_frontier_requires_gpu_completion_before_host_acceptance(revoked):
+    from threading import Thread
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.execution_guard import ExecutionDeviceGuard
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+    from tensorrt_llm.execution_mailbox import VersionUpdate, WorkerVersionTable
+
+    old = ExecutionVersion("tenant", "scope", 0)
+    guard = object.__new__(ExecutionDeviceGuard)
+    guard.device = DeviceExecutionAuthority(torch.cuda.current_device())
+    guard.table = WorkerVersionTable("session")
+    guard.table.bind_device_publisher(guard.device)
+    guard.table.apply(VersionUpdate("session", 1, old))
+    assert guard.device.check([old]) == [True]
+    guard._native_kv_guards = True
+    guard._early_exit_enabled = False
+    guard._uses = {}
+    guard._prefill_frontiers = {}
+    request = SimpleNamespace(
+        py_execution_version=old,
+        py_request_id=42,
+        py_client_id=142,
+        prepopulated_prompt_len=0,
+        context_current_position=0,
+        context_chunk_size=64,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_decoding_iter=0,
+        is_finished=False,
+    )
+
+    def finish(reason):
+        request.is_finished = True
+        request.state = LlmRequestState.GENERATION_COMPLETE
+
+    request.finish_by_reason = finish
+    batch = ScheduledRequests()
+    batch.context_requests_chunking = [request]
+    stream = torch.cuda.Stream()
+    marker = torch.zeros(1, device="cuda")
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream), guard.forward(batch):
+        torch.cuda._sleep(1_000_000_000)
+        marker.fill_(1)
+    completion = guard._uses[id(request)].event
+    assert not completion.query()
+    wait = guard.device.wait_event
+
+    def wait_with_revision(event):
+        publisher = Thread(
+            target=lambda: guard.table.apply(VersionUpdate("session", 2, replace(old, epoch=1)))
+        )
+        publisher.start()
+        publisher.join(timeout=2)
+        assert not publisher.is_alive(), "GPU wait prevented publication"
+        wait(event)
+
+    if revoked:
+        guard.device.wait_event = wait_with_revision
+    try:
+        with guard.context_commit(batch) as accepted:
+            assert completion.query()
+            assert marker.item() == 1
+            assert accepted.context_requests == ([] if revoked else [request])
+            if not revoked:
+                request.context_current_position = 64
+        assert guard._prefill_frontiers[id(request)] == (0 if revoked else 64)
+    finally:
+        stream.synchronize()
+
+
 def test_unknown_completion_keeps_buffers_and_fails_future_guards() -> None:
     from types import SimpleNamespace
 

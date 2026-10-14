@@ -65,6 +65,7 @@ def guard(monkeypatch):
     result._uses = {}
     result._prefill_frontiers = {}
     result._early_exit_enabled = True
+    result._native_kv_guards = False
     result._v1_manager = None
     result._kv_manager = Mock()
     monkeypatch.setattr("torch.cuda.Event", Mock)
@@ -233,6 +234,94 @@ def test_context_only_chunk_rejects_progress_and_preserves_sampler_row_order(gua
         assert accepted.context_requests == [other]
         assert old.state == LlmRequestState.GENERATION_COMPLETE
         assert batch.context_requests == [old, other]
+    guard.device.wait_event.assert_not_called()
+
+
+@pytest.mark.parametrize("last_chunk", [False, True])
+def test_native_context_waits_before_accepting_progress(guard, last_chunk):
+    guard._native_kv_guards = True
+    first, second, untagged = _request(), _request(), _request(None)
+    batch = _batch(untagged, context=True)
+    if last_chunk:
+        batch.context_requests_last_chunk += [first, second]
+    else:
+        batch.context_requests_chunking = [first, second]
+    with guard.forward(batch):
+        pass
+    completed = []
+    guard.device.wait_event.side_effect = lambda event: completed.append(event)
+    with guard.context_commit(batch) as accepted:
+        assert completed == [guard._uses[id(first)].event]
+        assert accepted.context_requests == batch.context_requests
+        first.context_current_position = second.context_current_position = 64
+    assert guard._prefill_frontiers[id(first)] == guard._prefill_frontiers[id(second)] == 64
+    # Both tagged requests share the same completion event; wait once per batch.
+    guard.device.wait_event.assert_called_once()
+
+
+def test_native_context_revision_can_publish_during_completion_wait(guard):
+    guard._native_kv_guards = True
+    old, live = _request(), _request(None)
+    batch = _batch(live, context=True)
+    batch.context_requests_chunking = [old]
+    with guard.forward(batch):
+        pass
+    published = Event()
+
+    def publish():
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+        published.set()
+
+    publisher = Thread(target=publish)
+
+    def wait(event):
+        publisher.start()
+        assert published.wait(2), "context completion held the publication lock"
+
+    guard.device.wait_event.side_effect = wait
+    try:
+        with guard.context_commit(batch) as accepted:
+            assert published.is_set()
+            assert accepted.context_requests == [live]
+            assert old.is_finished
+        assert guard._prefill_frontiers[id(old)] == 0
+    finally:
+        if publisher.ident is not None:
+            publisher.join(timeout=2)
+
+
+@pytest.mark.parametrize("failure", ["missing", "unrecorded", "identity", "timeout"])
+def test_native_context_unknown_completion_does_not_publish_prefix(guard, failure):
+    guard._native_kv_guards = True
+    request = _request()
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        pass
+    if failure == "missing":
+        guard._uses.clear()
+    elif failure == "unrecorded":
+        guard._uses[id(request)].event = None
+    elif failure == "identity":
+        guard._uses[id(request)].request = _request()
+    else:
+        guard.device.wait_event.side_effect = TimeoutError("incomplete chunk")
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.kv_cache_manager = Mock()
+    executor.enable_joint_kv_cache_reuse = False
+    error = TimeoutError if failure == "timeout" else RuntimeError
+    with pytest.raises(error):
+        executor._update_v2_context_resources(batch)
+    executor.kv_cache_manager.update_context_resources.assert_not_called()
+    assert guard._prefill_frontiers[id(request)] == 0
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_context_wait_does_not_serialize_untagged_or_decode_batches(guard, native):
+    guard._native_kv_guards = native
+    for batch in (_batch(_request(None), context=True), _batch(_request())):
+        with guard.context_commit(batch) as accepted:
+            assert accepted is batch
     guard.device.wait_event.assert_not_called()
 
 
