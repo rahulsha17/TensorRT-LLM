@@ -123,6 +123,14 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
 
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
+    # Per-row execution identities must outlive every submitted reader. Graph
+    # callers must keep these addresses stable and refresh row contents before
+    # replay; a device predicate does not establish KV ownership or completion.
+    retire_current_versions: Optional[torch.Tensor] = None
+    retire_sequence_slots: Optional[torch.Tensor] = None
+    retire_expected_versions: Optional[torch.Tensor] = None
+    retire_counters: Optional[torch.Tensor] = None
+
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
@@ -2442,6 +2450,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fmha is None:
                 raise RuntimeError(
                     "No TRT-LLM attention FMHA library supports this request.")
+            if any(value is not None
+                   for value in (metadata.retire_current_versions,
+                                 metadata.retire_sequence_slots,
+                                 metadata.retire_expected_versions,
+                                 metadata.retire_counters)):
+                from .fmha.fallback import FallbackFmha
+                if not isinstance(fmha, FallbackFmha):
+                    raise RuntimeError(
+                        "RETIRE authority is unsupported by the selected attention provider"
+                    )
             if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
                 # Conservatively disable reclamation for metadata used by graphs
                 # or backends that can retain staged workspace state.

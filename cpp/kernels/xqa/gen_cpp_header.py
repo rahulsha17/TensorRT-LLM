@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -88,11 +88,11 @@ def is_header(entry: Entry):
 
 
 SOURCE_FILES = [
-    'cuda_hint.cuh', 'defines.h', 'ldgsts.cuh', 'mha.cu', 'mha_sm90.cu',
-    'mla_sm120.cu', 'mha.h', 'mhaUtils.cuh', 'mma.cuh', 'platform.h',
-    'utils.cuh', 'utils.h', 'mha_stdheaders.cuh', 'mha_components.cuh',
-    'mla_sm120.cuh', 'gmma.cuh', 'gmma_impl.cuh', 'barriers.cuh', 'tma.h',
-    'specDec.h'
+    'retireAuthority.h', 'cuda_hint.cuh', 'defines.h', 'ldgsts.cuh', 'mha.cu',
+    'mha_sm90.cu', 'mla_sm120.cu', 'mha.h', 'mhaUtils.cuh', 'mma.cuh',
+    'platform.h', 'utils.cuh', 'utils.h', 'mha_stdheaders.cuh',
+    'mha_components.cuh', 'mla_sm120.cuh', 'gmma.cuh', 'gmma_impl.cuh',
+    'barriers.cuh', 'tma.h', 'specDec.h'
 ]
 
 CUDA_HEADERS = [
@@ -110,7 +110,7 @@ if args.embed_cuda_headers:
 all_entries = map(get_entry_from_input_fname, all_files)
 
 TEMPLATE_PROLOGUE = '''/*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

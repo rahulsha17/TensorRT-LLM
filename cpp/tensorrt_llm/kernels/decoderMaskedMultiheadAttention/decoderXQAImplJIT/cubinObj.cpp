@@ -81,6 +81,7 @@ CubinObj::CubinObj(CubinObj&& other)
         this->mKernel = other.mKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
+        this->mRetireGuardAbi = other.mRetireGuardAbi;
 
         other.mInitialized = false;
     }
@@ -106,6 +107,7 @@ CubinObj& CubinObj::operator=(CubinObj&& other)
         this->mKernel = other.mKernel;
         this->mSharedMemBytes = other.mSharedMemBytes;
         this->mKernelType = other.mKernelType;
+        this->mRetireGuardAbi = other.mRetireGuardAbi;
 
         other.mInitialized = false;
     }
@@ -162,6 +164,9 @@ void CubinObj::initialize()
         // Populate mSharedMemBytes and mKernelType.
         mSharedMemBytes = getGlobalVar<uint32_t>(mDriver, mLibrary, kSmemName, true).value();
         mKernelType = getGlobalVar<XQAKernelType>(mDriver, mLibrary, kKernelTypeName, true).value();
+        // Old serialized/native cubins remain baseline-compatible, but cannot
+        // claim support for the appended RETIRE argument.
+        mRetireGuardAbi = getGlobalVar<uint32_t>(mDriver, mLibrary, "retireGuardAbi", false).value_or(0);
 
         TLLM_CHECK(mSharedMemBytes > 0);
 

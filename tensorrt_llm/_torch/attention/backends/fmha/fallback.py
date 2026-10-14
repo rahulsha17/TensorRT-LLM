@@ -394,6 +394,10 @@ class FallbackFmha(Fmha):
             skip_softmax_stat=attn.skip_softmax_stat,
             skip_correction_threshold=attn.skip_correction_threshold,
             uses_spcompress=attn.uses_spcompress,
+            retire_current_versions=metadata.retire_current_versions,
+            retire_sequence_slots=metadata.retire_sequence_slots,
+            retire_expected_versions=metadata.retire_expected_versions,
+            retire_counters=metadata.retire_counters,
             # --- Sparse runtime parameters ---
             sparse_kv_indices=forward_args.sparse_runtime_params.sparse_kv_indices,
             sparse_kv_offsets=forward_args.sparse_runtime_params.sparse_kv_offsets,

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
+#include "tensorrt_llm/kernels/retireAuthority.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <stdint.h>
@@ -215,6 +216,7 @@ struct Multihead_attention_params_base
 
     int const* memory_length_per_sample = nullptr;
     int32_t const* mrope_position_deltas = nullptr;
+    retire::Authority retireAuthority{};
 };
 
 template <typename T, bool USE_CROSS_ATTENTION = false>

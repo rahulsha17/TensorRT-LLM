@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -442,8 +442,20 @@ struct DMA
                     local_q_tile_offset = q_steps * blockIdx.x * STEP_Q;
                 }
 
+                // Only the BF16, single-DMA-warp path is guard-enabled by the
+                // native dispatcher. Broadcast one observation before sending
+                // head_info: consumers must never wait for a skipped tile.
+                int retire_allowed = 1;
+                if constexpr (!DMA_GROUP_TRANSPOSE_V)
+                {
+                    if (tiw == 0)
+                    {
+                        retire_allowed = params.retireAuthority.allows(bidb, 0);
+                    }
+                    retire_allowed = __shfl_sync(0xffffffff, retire_allowed, 0);
+                }
                 // The last block may process fewer q_steps.
-                if (local_q_tile_offset >= actual_q_seqlen)
+                if (local_q_tile_offset >= actual_q_seqlen || !retire_allowed)
                 {
                     if (SCHEDULING_MODE == 0)
                     {

@@ -116,6 +116,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
 {
     // Reinit kernel params.
     mKernelParams = {};
+    mKernelParams.retireAuthority = runnerParams.retireAuthority;
 
     // Set the batch size, and sequence length.
     mKernelParams.b = runnerParams.b;

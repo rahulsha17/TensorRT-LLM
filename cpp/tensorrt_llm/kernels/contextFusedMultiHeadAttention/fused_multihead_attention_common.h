@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/retireAuthority.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tmaDescriptor.h"
 #include <limits.h>
@@ -252,6 +253,7 @@ struct MHARunnerFixedParams
 
 struct MHARunnerParams
 {
+    retire::Authority retireAuthority{};
     // The batch size.
     int b;
     // The number of grouped heads.
@@ -526,6 +528,7 @@ struct Fused_multihead_attention_params_v2
     uint32_t* skip_softmax_total_blocks;
     uint32_t* skip_softmax_skipped_blocks;
 #endif
+    retire::Authority retireAuthority{};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

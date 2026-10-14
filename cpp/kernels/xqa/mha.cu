@@ -23,6 +23,7 @@
 #include "mhaUtils.cuh"
 #include "mha_components.cuh"
 #include "mma.cuh"
+#include "retireAuthority.h"
 #include "utils.cuh"
 
 #include <cuda_fp16.h>
@@ -1535,7 +1536,8 @@ CUBIN_EXPORT __global__
         uint32_t const batchSize,
         float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
                                                 // int8/fp8 KV cache.
-        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
+        uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr,
+        retire::Authority retireAuthority = {})
 {
     assert(allowMultiBlockMode || gridDim.x == 1);
     bool const isMultiBlock = allowMultiBlockMode && (gridDim.x != 1);
@@ -1549,6 +1551,22 @@ CUBIN_EXPORT __global__
     SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
 
     uint32_t const idxReq = blockIdx.z;
+    // Multi-block CTAs must all contribute scratch and semaphore arrivals.
+    // Only a single-block request can take a whole-CTA entry exit. Observe
+    // authority once and broadcast across both producer/consumer warp groups.
+    if (!isMultiBlock && retireAuthority.currentVersions != nullptr)
+    {
+        __shared__ int retireAllowed;
+        if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+        {
+            retireAllowed = retireAuthority.allows(idxReq, 0);
+        }
+        __syncthreads();
+        if (!retireAllowed)
+        {
+            return;
+        }
+    }
 #if SPEC_DEC
     // Variable query sequence length support.
     bool const variableQSeqLen = qCuSeqLens != nullptr;
@@ -2761,7 +2779,9 @@ CUBIN_EXPORT __global__
                 smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
             }
         }
-        if (writesOutput && warpGrpIdx == 0)
+        // All internal reductions are complete; this copy contains only
+        // per-thread global stores and may be suppressed independently.
+        if (writesOutput && warpGrpIdx == 0 && retireAuthority.allows(idxReq, 1))
         {
 #if SPEC_DEC
             copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
@@ -2790,6 +2810,7 @@ constexpr uint32_t nbCtaPerSM = 1;
 #endif
 
 CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType = XQAKernelType::kAMPERE_WARP_SPECIALIZED;
+CUBIN_EXPORT __device__ constexpr uint32_t retireGuardAbi = 1;
 
 #ifdef NDEBUG
 CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
@@ -2819,7 +2840,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     uint32_t const batchSize,
     float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
                                             // int8/fp8 KV cache.
-    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
+    uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr,
+    retire::Authority retireAuthority = {})
 {
 #if SPEC_DEC
     kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -2841,7 +2863,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, semaphores, scratch);
+        batchSize, kvCacheScale, semaphores, scratch, retireAuthority);
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;

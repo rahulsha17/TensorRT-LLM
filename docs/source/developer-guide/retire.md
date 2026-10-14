@@ -749,6 +749,44 @@ numbers must not be presented as validation of this change.
 
 ## Testing
 
+### Native attention predicates
+
+`thop.attention` accepts an optional set of four tensors: the current epoch
+table, per-row scope slots, expected epochs, and rejection counters. All four
+must be present together. `TrtllmAttentionMetadata` carries these inputs to the
+fallback FMHA provider; other providers reject them. Null inputs retain the
+ordinary attention path.
+
+The native implementation covers source-built SM90 BF16 attention with head
+size 64 or 128, paged KV, and a single beam. It checks authority before eligible
+attention tiles and before attention-output and KV stores. Epoch reads use
+GPU-scope acquire atomics, matching the device publisher. Untagged live rows
+use the exact sentinel `(slot=-1, expected_epoch=0)`. Multi-block reductions
+still complete their scratch writes and semaphore arrivals; they cannot take
+independent early exits without stranding other blocks.
+
+These predicates do not establish FENCE or permit resource release. Callers
+must retain the authority tensors and KV until all submitted GPU uses finish.
+Captured graphs require stable addresses, with row identities refreshed before
+each replay. Existing cubins without the authority ABI cannot serve a guarded
+call. Rebuild native libraries and bindings together.
+
+**Integration status:** the executor does not yet bind its version table to
+these attention metadata fields. Automatic binding, overlap lifetime handling,
+and graph initialization remain required before real-model runs exercise the
+native predicates. This is an operator implementation and qualification step,
+not a claim of end-to-end operator suppression.
+
+`tests/unittest/_torch/attention/test_execution_native_guards.py` checks V1/V2,
+fresh/cached context, short/long generation, mixed batches, live tagged and
+untagged neighbors, epoch wrap across the signed boundary, malformed metadata,
+and captured decode replay after identity changes. It compares live outputs
+exactly with the unguarded operator and verifies that revoked rows leave output
+and KV sentinels untouched. The existing H100 attention test-list entry includes
+this file. Native build and GPU results are required to qualify the port.
+
+### Executor lifecycle
+
 The CPU CI list includes authority, mailbox, IPC, host gates, and executor wiring.
 Guard tests cover revisions during result waits, mixed scopes, context-only
 chunks, V2 commit races, slot changes, recycled request IDs, overlapping readers,

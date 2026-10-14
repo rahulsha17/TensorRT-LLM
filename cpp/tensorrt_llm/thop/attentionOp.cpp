@@ -340,6 +340,8 @@ enum class AttentionInputType : int8_t
 class RunnerBase
 {
 public:
+    // Per-call pointers; deliberately not part of the cached operator key.
+    retire::Authority retireAuthority{};
     int32_t beam_width;
     int32_t max_num_requests;
     int32_t max_num_sequences;
@@ -866,6 +868,8 @@ public:
         }
 
         AttentionOp::EnqueueParams<T> common_enqueue_params;
+        common_enqueue_params.retireAuthority = retireAuthority;
+        common_enqueue_params.retireAuthority.rowOffset = seq_offset;
         common_enqueue_params.attention_input = attention_input;
         common_enqueue_params.attention_sinks = attention_sinks_ptr;
         common_enqueue_params.rotary_inv_freq = rotary_inv_freq_ptr;
@@ -1224,7 +1228,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
     bool enable_dsv4_epilogue_fusion, bool const force_prepare_spec_dec_tree_mask,
     std::optional<int64_t> const max_num_sequences, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
-    double skip_correction_threshold, std::optional<bool> uses_spcompress)
+    double skip_correction_threshold, std::optional<bool> uses_spcompress,
+    std::optional<torch::Tensor> retire_current_versions, std::optional<torch::Tensor> retire_sequence_slots,
+    std::optional<torch::Tensor> retire_expected_versions, std::optional<torch::Tensor> retire_counters)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1307,6 +1313,49 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     runner->max_num_requests = max_num_requests;
     runner->max_num_sequences = max_num_sequences.value_or(max_num_requests);
     runner->attention_window_size = attention_window_size;
+
+    bool const retire_enabled = retire_current_versions.has_value();
+    TORCH_CHECK(retire_enabled == retire_sequence_slots.has_value()
+            && retire_enabled == retire_expected_versions.has_value() && retire_enabled == retire_counters.has_value(),
+        "RETIRE attention requires all four authority tensors or none");
+    if (retire_enabled)
+    {
+        auto validate = [&](torch::Tensor const& tensor, at::ScalarType type)
+        {
+            TORCH_CHECK(tensor.device() == q.device() && tensor.is_cuda() && tensor.is_contiguous() && tensor.dim() == 1
+                    && tensor.scalar_type() == type,
+                "RETIRE authority must be contiguous 1-D tensors on the attention device");
+        };
+        validate(*retire_current_versions, at::ScalarType::Long);
+        validate(*retire_sequence_slots, at::ScalarType::Int);
+        validate(*retire_expected_versions, at::ScalarType::Long);
+        validate(*retire_counters, at::ScalarType::Long);
+        TORCH_CHECK(retire_current_versions->numel() > 0 && retire_current_versions->numel() <= INT_MAX
+                && retire_sequence_slots->numel() == sequence_length.numel()
+                && retire_expected_versions->numel() == retire_sequence_slots->numel() && retire_counters->numel() == 3,
+            "RETIRE authority tensor sizes do not match the batch");
+        // GPT-OSS carries weight-only MXFP4 metadata here even when attention
+        // activations and KV are BF16. No KV/activation quantization bits pass.
+        TORCH_CHECK(tensorrt_llm::common::getSMVersion() == 90 && dtype == tensorrt_llm::DataType::kBF16
+                && out_dtype == torch::kBFloat16
+                && (quant_mode == 0 || quant_mode == tensorrt_llm::common::QuantMode::w4a16Mxfp4().value())
+                && (head_size == 64 || head_size == 128) && beam_width == 1 && !is_mla_enable && !is_cross
+                && use_kv_cache && use_paged_context_fmha && !is_spec_dec_tree && !use_sage_attn
+                && !is_spec_decoding_enabled && !use_spec_decoding && !softmax_stats_tensor.has_value()
+                && !helix_position_offsets.has_value(),
+            "RETIRE native guards require BF16 paged head-size-64/128 attention without auxiliary outputs; "
+            "quant_mode=",
+            quant_mode, ", head_size=", head_size, ", dtype=", int(dtype), ", output_dtype=", int(out_dtype),
+            ", paged_context=", use_paged_context_fmha, ", auxiliary_stats=", softmax_stats_tensor.has_value());
+        runner->retireAuthority.currentVersions
+            = reinterpret_cast<uint64_t const*>(retire_current_versions->data_ptr<int64_t>());
+        runner->retireAuthority.sequenceSlots = retire_sequence_slots->data_ptr<int32_t>();
+        runner->retireAuthority.expectedVersions
+            = reinterpret_cast<uint64_t const*>(retire_expected_versions->data_ptr<int64_t>());
+        runner->retireAuthority.counters = reinterpret_cast<unsigned long long*>(retire_counters->data_ptr<int64_t>());
+        runner->retireAuthority.capacity = static_cast<int32_t>(retire_current_versions->numel());
+        runner->retireAuthority.rows = static_cast<int32_t>(retire_sequence_slots->numel());
+    }
 
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;

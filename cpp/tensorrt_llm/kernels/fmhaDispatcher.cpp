@@ -209,6 +209,8 @@ bool FmhaDispatcher::isSupported()
 
 void FmhaDispatcher::run(MHARunnerParams runnerParams)
 {
+    TLLM_CHECK_WITH_INFO(runnerParams.retireAuthority.currentVersions == nullptr || !mUseTllmGen,
+        "RETIRE authority is not supported by the TRTLLM-GEN context dispatcher");
     if (mUseTllmGen)
     {
         TLLM_LOG_DEBUG("Running TRTLLM-GEN context FMHA kernel.");

@@ -201,7 +201,7 @@ ns_close = r"""
 
 copyright = '''\
 /***************************************************************************************************
- * SPDX-FileCopyrightText: Copyright (c) 2011-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -2400,6 +2400,14 @@ def get_kernel_code(kspec, kname, lname):
     # contextFusedMultiHeadAttention directory on the include path.
     include_str = '#include "fused_multihead_attention_common.h"\n' if generate_cu_trtllm else ''
     include_str += '#include "tensorrt_llm/common/config.h"' if generate_cu_trtllm else ''
+    if generate_cu_trtllm:
+        include_str += '''
+#include <cstddef>
+static_assert(sizeof(bert::Fused_multihead_attention_params_v2) ==
+              sizeof(tensorrt_llm::kernels::Fused_multihead_attention_params_v2));
+static_assert(offsetof(bert::Fused_multihead_attention_params_v2, retireAuthority) ==
+              offsetof(tensorrt_llm::kernels::Fused_multihead_attention_params_v2, retireAuthority));
+'''
     num_compute_groups_str = '' if generate_cu_trtllm else 'static constexpr int NUM_COMPUTE_GROUPS = 2;'
     fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'{params_type}'
     const_fused_multihead_attention_params_v2_str = 'Fused_multihead_attention_params_v2' if generate_cu_trtllm else f'const {params_type}'
@@ -3340,6 +3348,9 @@ def use_cubin_header(sm,
     if sage_block_sizes:
         return True
     if enable_skip_softmax:
+        return False
+    # Guarded BF16 kernels need the appended runtime authority ABI.
+    if sm == 90 and head_size == 128 and 'bf16' in dtype:
         return False
     if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
         return False

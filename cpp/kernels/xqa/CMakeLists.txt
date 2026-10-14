@@ -54,6 +54,7 @@ set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -O0 -G -keep")
 # "${CMAKE_CUDA_FLAGS_RELEASE}")
 
 set(XQA_SOURCES
+    "retireAuthority.h"
     "cuda_hint.cuh"
     "defines.h"
     "ldgsts.cuh"

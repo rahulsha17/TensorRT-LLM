@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
+#include "tensorrt_llm/kernels/retireAuthority.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cuda_runtime_api.h>
 
@@ -117,6 +118,7 @@ inline void calGridSizeWithBestEfficiency(
 template <typename T, typename KVCacheBuffer>
 struct QKVPreprocessingParams
 {
+    retire::Authority retireAuthority{};
     // Buffers.
     // source buffer
     // also acts as a dst buffer based on if separate_q_kv_output

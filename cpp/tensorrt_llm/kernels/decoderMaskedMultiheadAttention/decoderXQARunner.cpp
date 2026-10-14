@@ -243,6 +243,9 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
     bool const isHMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kAMPERE_WARP_SPECIALIZED);
     bool const isGMMAKernel = (cubinObj->getKernelType() == XQAKernelType::kHOPPER_WARP_SPECIALIZED);
     bool const isMLAKernel = (cubinObj->getKernelType() == XQAKernelType::kSM120_MLA);
+    TLLM_CHECK_WITH_INFO(xqaParams.retireAuthority.currentVersions == nullptr
+            || (isHMMAKernel && cubinObj->getRetireGuardAbi() == 1 && mSM == 90 && xqaParams.beam_width == 1),
+        "RETIRE requires an ABI-verified source-built HMMA generation kernel");
     TLLM_CHECK_WITH_INFO(!isSpecDec || isGMMAKernel || isHMMAKernel
             || (isMLAKernel && !xqaParams.spec_decoding_is_generation_length_variable),
         "speculative decoding is available for GMMA/MLA kernel only in JIT path for now. For MLA, the input sequence "
@@ -317,6 +320,7 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             // The preprocessing kernel that applies RoPE and updates kv cache.
             QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
             memset(&preprocessingParams, 0, sizeof(preprocessingParams));
+            preprocessingParams.retireAuthority = xqaParams.retireAuthority;
             // Set parameters.
             preprocessingParams.qkv_input = static_cast<T*>(const_cast<void*>(xqaParams.qkv));
             preprocessingParams.q_output = static_cast<T*>(xqaQInputPtr);
@@ -382,7 +386,7 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
     };
 
-    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 19;
+    constexpr uint32_t kMAX_NB_KERNEL_PARAMS = 21;
     uint32_t idxNextParam = 0;
     void* kernelParams[kMAX_NB_KERNEL_PARAMS];
     auto appendParam = [&](auto* p) mutable
@@ -462,6 +466,10 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
         appendParam(&launchParams.scratch);
 
         uint32_t multiBlock = 1;
+        if (cubinObj->getRetireGuardAbi() == 1)
+        {
+            appendParam(&xqaParams.retireAuthority);
+        }
         if (xqaParams.multi_block_mode)
         {
             // HMMA spec-dec gridDim is {multiBlock, nbKVHeads * nbTokenBlocksPerGrp, batchSize};
@@ -534,6 +542,10 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
         }
         appendParam(&launchParams.semaphores);
         appendParam(&launchParams.scratch);
+        if (isHMMAKernel && cubinObj->getRetireGuardAbi() == 1)
+        {
+            appendParam(&xqaParams.retireAuthority);
+        }
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
         uint32_t multiBlock = 1;
         if (xqaParams.multi_block_mode)

@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/retireAuthority.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -29,6 +30,7 @@ using XQADataType = Data_type;
 
 struct XQAParams
 {
+    retire::Authority retireAuthority{};
     XQADataType data_type = DATA_TYPE_FP16;
     XQADataType kv_cache_data_type = DATA_TYPE_FP16;
     XQADataType output_data_type = DATA_TYPE_FP16;

@@ -75,6 +75,7 @@ public:
     class EnqueueParams
     {
     public:
+        retire::Authority retireAuthority{};
         T const* attention_input = nullptr;
         T const* qkv_bias = nullptr;
         // Attention mask input, which has shape of [batch_size, attention_mask_stride].

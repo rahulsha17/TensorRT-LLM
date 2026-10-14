@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1445,6 +1445,32 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         return;
     }
 
+    // Single-block retirement is a CTA-uniform exit before any collectives or
+    // KV writes. Multi-block CTAs must still publish their partial results and
+    // arrive at the final reduction: an independently observed epoch is not a
+    // grid-wide barrier. Their persistent stores are guarded below instead.
+    if constexpr (!MULTI_BLOCK_FLAG)
+    {
+        if (params.retireAuthority.currentVersions != nullptr)
+        {
+            __shared__ int retireAllowed;
+            if (threadIdx.x == 0)
+            {
+                retireAllowed = params.retireAuthority.allows(batch_beam_idx, 0);
+                if (!retireAllowed && params.retireAuthority.counters != nullptr)
+                {
+                    // This fused kernel also skips the row's KV update.
+                    atomicAdd(params.retireAuthority.counters + 2, 1ULL);
+                }
+            }
+            __syncthreads();
+            if (!retireAllowed)
+            {
+                return;
+            }
+        }
+    }
+
     // The head.
     unsigned const hi{blockIdx.x};
     // The number of heads.
@@ -2192,7 +2218,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Get the c_tile_id that handles the current timestep.
     int current_step_ctile_idx = kv_loop_length / timesteps_per_block;
     if (HANDLE_KV && hi == (hi_kv * qhead_per_kv) && qk_vec_idx < Dh
-        && (!MULTI_BLOCK_FLAG || c_tile == current_step_ctile_idx))
+        && (!MULTI_BLOCK_FLAG || c_tile == current_step_ctile_idx) && params.retireAuthority.allows(batch_beam_idx, 2))
     {
         // Trigger the stores to global memory.
         Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
@@ -2469,7 +2495,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Store the values with bias back to global memory in the cache for V.
         //*reinterpret_cast<V_vec_k*>(&v_cache[params.timestep*Dh]) = v;
         // For MQA/GQA mode, write only with the first Q head of each group per KV head.
-        if ((hi == (hi_kv * qhead_per_kv)) && !DO_CROSS_ATTENTION)
+        if ((hi == (hi_kv * qhead_per_kv)) && !DO_CROSS_ATTENTION && params.retireAuthority.allows(batch_beam_idx, 2))
         {
             if (ENABLE_8BITS_KV_CACHE)
             {
@@ -2544,7 +2570,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     {
         auto const bhvi = tensorrt_llm::common::flat_index2(bhi, vi, Dh);
 #ifdef MMHA_USE_FP32_ACCUM_FOR_OUT
-        if (!MULTI_BLOCK_FLAG)
+        if (!MULTI_BLOCK_FLAG && params.retireAuthority.allows(batch_beam_idx, 1))
         {
             if (write_attention_quant)
             {
@@ -2561,7 +2587,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 *reinterpret_cast<V_vec_k*>(static_cast<T*>(params.out) + bhvi) = final_out;
             }
         }
-        else
+        else if (MULTI_BLOCK_FLAG)
         {
             // for write partial output to partial_out
             int partial_out_offset = c_tile * params.batch_size * num_heads * params.hidden_size_per_head;
@@ -2576,7 +2602,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             convert_from_float(reinterpret_cast<float*>(&params.partial_sum[partial_stats_offset]), sum);
         }
 #else  // MMHA_USE_FP32_ACCUM_FOR_OUT
-        *reinterpret_cast<V_vec_accum*>(static_cast<T*>(params.out) + bhvi) = out;
+        if (params.retireAuthority.allows(batch_beam_idx, 1))
+        {
+            *reinterpret_cast<V_vec_accum*>(static_cast<T*>(params.out) + bhvi) = out;
+        }
 #endif // MMHA_USE_FP32_ACCUM_FOR_OUT
     }
 
@@ -2715,7 +2744,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             // Final output O * inv_sum
             ////////////////////
 
-            if (oo == 0 && (Dh == Dh_MAX || oi < Dh))
+            if (oo == 0 && (Dh == Dh_MAX || oi < Dh) && params.retireAuthority.allows(batch_beam_idx, 1))
             {
                 // Add the attention sinks.
                 if (params.attention_sinks != nullptr)

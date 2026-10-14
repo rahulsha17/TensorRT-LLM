@@ -665,7 +665,7 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                         }
                     }
 
-                    if (valid_kv_cache_pos && !helix_inactive)
+                    if (valid_kv_cache_pos && !helix_inactive && params.retireAuthority.allows(batch_idx, 2))
                     {
                         if constexpr (ENABLE_8BITS_CACHE)
                         {
@@ -1101,7 +1101,7 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
                     }
                 }
 
-                if (valid_kv_cache_pos && !helix_inactive)
+                if (valid_kv_cache_pos && !helix_inactive && params.retireAuthority.allows(batch_idx, 2))
                 {
                     if constexpr (ENABLE_8BITS_CACHE)
                     {

@@ -138,6 +138,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
     int32_t const* mrope_position_deltas;
+    retire::Authority retireAuthority{};
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -187,6 +188,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
         return false;
     }
     xqaParams = {};
+    xqaParams.retireAuthority = generationsParams.retireAuthority;
     xqaParams.data_type = ConvertMMHAToXQAParamsHelper<T, KVCacheBuffer>::data_type;
 
     xqaParams.num_q_heads = mNumAttnHeads;
@@ -582,6 +584,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
 
     // Prepare the parameters.
     params = {};
+    params.retireAuthority = input_params.retireAuthority;
 
     int hidden_units = input_params.head_num * input_params.size_per_head;
     int hidden_units_kv = input_params.kv_head_num * input_params.size_per_head;
@@ -1832,6 +1835,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Prepare QKV preprocessing parameters.
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParams;
+        preprocessingParams.retireAuthority = params.retireAuthority;
 
         // Buffers.
         preprocessingParams.qkv_input = const_cast<T*>(attention_input);
@@ -2060,6 +2064,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Construct the fmha params for running kernels.
         MHARunnerParams fmhaParams{};
+        fmhaParams.retireAuthority = params.retireAuthority;
         fmhaParams.b = params.batch_size;
         fmhaParams.qSeqLen = params.input_seq_length;
         fmhaParams.kvSeqLen = max_kv_seq_len;
@@ -2646,6 +2651,11 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         }
     }
 
+    TLLM_CHECK_WITH_INFO(params.retireAuthority.currentVersions == nullptr
+            || (mSM == 90 && params.beam_width == 1 && !isCrossAttention() && !mPosShiftEnabled && mCpSize == 1
+                && (headSize == 64 || headSize == 128) && !mKVCacheQuantMode.hasKvCacheQuant()),
+        "RETIRE masked-MHA requires the guarded SM90 single-beam non-shifted KV path");
+
     // This is the number of kv tokens that q needs to visit, but excluding one as it will be processed before the kv
     // loop.
     int timestep = params.max_past_kv_length;
@@ -2713,6 +2723,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     }
 
     FusedQKVMaskedAttentionDispatchParams<T, KVCacheBuffer> dispatch_params{};
+    dispatch_params.retireAuthority = params.retireAuthority;
     dispatch_params.mUnfuseQkvGemm = mUnfuseQkvGemm;
     dispatch_params.qkv_buf = attention_input;
     dispatch_params.qkv_bias = params.qkv_bias;

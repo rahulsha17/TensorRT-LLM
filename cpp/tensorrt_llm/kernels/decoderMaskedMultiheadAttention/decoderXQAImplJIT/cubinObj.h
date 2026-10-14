@@ -64,6 +64,11 @@ public:
         return mKernelType;
     }
 
+    [[nodiscard]] uint32_t getRetireGuardAbi() const
+    {
+        return mRetireGuardAbi;
+    }
+
 private:
     [[nodiscard]] CUfunction kernel() const
     {
@@ -83,6 +88,7 @@ private:
     CUkernel mKernel;
     unsigned int mSharedMemBytes;
     XQAKernelType mKernelType;
+    uint32_t mRetireGuardAbi = 0;
 };
 
 } // namespace jit

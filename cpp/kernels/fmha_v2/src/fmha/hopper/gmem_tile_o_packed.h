@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include "../../../../xqa/retireAuthority.h"
 #include <fmha/gmem_tile_o_packed.h>
 #include <fmha/hopper/fragment.h>
 
@@ -282,6 +283,8 @@ struct Gmem_tile_o_hopper<fmha::Hopper_hgmma_bf16_traits<GMMA_M, GMMA_N, GMMA_K,
     inline __device__ Gmem_tile_o_hopper(
         Params const& params, Block_info const& block_info, Shared&&, int tidx, int cta_row_offset = 0)
         : Base(params, block_info, tidx, cta_row_offset)
+        , retire_authority_(params.retireAuthority)
+        , retire_row_(block_info.bidb)
     {
         static_assert(!std::is_same<Shared, int>::value, "Check constructor argument type!");
     }
@@ -290,6 +293,12 @@ struct Gmem_tile_o_hopper<fmha::Hopper_hgmma_bf16_traits<GMMA_M, GMMA_N, GMMA_K,
     template <typename Accumulators, int M, int N>
     inline __device__ void store(Accumulators const (&acc)[M][N])
     {
+        // This BF16 epilogue contains only per-thread STGs, no collectives.
+        // A late ADVANCE may suppress each stale writer independently.
+        if (!retire_authority_.allows(retire_row_, 1))
+        {
+            return;
+        }
         int64_t const step_m = 8 * (this->params_o_stride_in_bytes_);
         // we assume M = 1. some shortcuts.
         static_assert(M == 1);
@@ -333,6 +342,9 @@ struct Gmem_tile_o_hopper<fmha::Hopper_hgmma_bf16_traits<GMMA_M, GMMA_N, GMMA_K,
             } // row_idx
         }     // mma_ni
     }
+
+    retire::Authority retire_authority_;
+    int retire_row_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

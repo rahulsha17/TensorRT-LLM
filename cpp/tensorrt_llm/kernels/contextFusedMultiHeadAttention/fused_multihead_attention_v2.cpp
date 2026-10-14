@@ -364,9 +364,15 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
     if (kernelMeta.launcher != nullptr)
     {
+        TLLM_CHECK_WITH_INFO(params.retireAuthority.currentVersions == nullptr
+                || (mSM == kSM_90 && launch_params.warp_specialization && mInputDataType == DATA_TYPE_BF16
+                    && mOutputDataType == DATA_TYPE_BF16 && (params.d == 64 || params.d == 128)),
+            "RETIRE requires source-built SM90 BF16 warp-specialized attention");
         kernelMeta.launcher(params, launch_params, stream);
         return;
     }
+    TLLM_CHECK_WITH_INFO(params.retireAuthority.currentVersions == nullptr,
+        "RETIRE cannot dispatch an unguarded prebuilt attention cubin");
     const CUfunction func = findIter->second.mDeviceFunction;
 
     void* kernelParams[] = {&params, nullptr};
