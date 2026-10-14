@@ -5480,6 +5480,38 @@ class KVCacheManagerV2(BaseResourceManager):
         if request.context_remaining_length == 0:
             kv_cache.stop_committing()
 
+    def preserve_context_prefix(self, request: LlmRequest, completed_frontier: int) -> None:
+        """Retain complete blocks from an accepted, drained context frontier.
+
+        The execution owner must wait for all submitted GPU uses first. Context
+        progress can be accepted before a revision prevents the ordinary V2
+        publication step. Only the supplied accepted frontier may be recovered;
+        the request's current chunk and allocated capacity are not completion
+        evidence. Suspended caches keep their existing committed prefix.
+        """
+        if type(completed_frontier) is not int or not (
+            0 <= completed_frontier <= request.context_current_position
+        ):
+            raise ValueError("completed frontier must be within accepted context progress")
+        if not (
+            self.enable_block_reuse
+            and self._can_publish_block_reuse
+            and not request.is_dummy_request
+        ):
+            return
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        end = completed_frontier // self.tokens_per_block * self.tokens_per_block
+        start = kv_cache.num_committed_tokens
+        if end <= start:
+            return
+        source = self._reuse_token_source(request)
+        if end > len(source) or end > kv_cache.capacity:
+            raise RuntimeError("completed frontier exceeds the retained context allocation")
+        tokens = self._augment_tokens_for_block_reuse(source, request, start=start, end=end)
+        kv_cache.commit(tokens)
+
     def stop_request_committing(self, request: LlmRequest) -> None:
         """Freeze one request's existing commit frontier before terminal release.
 

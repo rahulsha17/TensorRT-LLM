@@ -342,7 +342,11 @@ class ExecutionDeviceGuard:
             if frontier and self._v1_manager.enable_block_reuse:
                 self._v1_manager.store_blocks_for_reuse(request)
         elif self._kv_manager is not None:
-            # V2 already publishes accepted chunks through its commit protocol.
+            # Retain accepted progress if revocation won the race against the
+            # ordinary V2 commit. The latest GPU use has completed above.
+            self._kv_manager.preserve_context_prefix(
+                request, self._prefill_frontiers.get(id(request), 0)
+            )
             self._kv_manager.stop_request_committing(request)
 
     def before_release(self, request: LlmRequest) -> None:

@@ -674,7 +674,7 @@ Chunk 2 starts -> runtime sends ADVANCE
   -> stop submitting the rest of the wholly revoked batch
   -> record completion of work already submitted
   -> drain old GPU uses
-  -> V1 publishes only the frozen completed prefix; V2 retains committed pages
+  -> publish only the accepted, completed prefix and retain its pages
   -> ALIGN acquires ownership -> FENCE/ALIGN receipts -> RESUME
   -> successor prefills the remaining input
 ```
@@ -691,6 +691,13 @@ completion tracking. These boundaries are implemented, not yet performance
 qualified. Already-launched kernels are not preempted. Compilation and capture
 never record a Python authority decision into the graph. A monolithic graph has
 no internal host interruption point; adding one requires graph partitioning.
+
+V2 context progress and ordinary tree publication occur at separate executor
+steps. If a revision arrives between them, cleanup first waits for outstanding
+GPU work, then publishes complete blocks up to the previously accepted context
+frontier. It never derives that frontier from allocated capacity or the current
+unfinished chunk. A suspended cache keeps its already committed prefix without
+being restored just for this step. Other owners keep their existing holds.
 
 Only a batch whose every real row has lost authority may exit. A live request
 from another scope or an untagged neighbor makes the complete batch continue.

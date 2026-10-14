@@ -1336,6 +1336,59 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     assert kv_cache.stopped_committing
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_retire_recovers_completed_context_before_stopping_native_cache() -> None:
+    torch.cuda.init()
+    torch.cuda.synchronize()
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+            layers=[
+                AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4096)])
+            ],
+        )
+    )
+    owner = peer = successor = None
+    prompt = list(range(16))
+    scope = ReuseScope(salt=11)
+    try:
+        owner = core.create_kv_cache(scope, prompt)
+        assert owner.resume(CudaStream(torch.cuda.current_stream().cuda_stream))
+        assert owner.resize(len(prompt))
+        owner.commit(prompt[:4])
+        peer = core.create_kv_cache(scope, prompt)
+        assert peer.num_committed_tokens == 4
+        torch.cuda.synchronize()
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.enable_block_reuse = manager._can_publish_block_reuse = True
+        manager.tokens_per_block = 4
+        manager.kv_cache_map = {1: owner}
+        manager._reuse_token_source = lambda request: prompt
+        manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[
+            start:end
+        ]
+        request = SimpleNamespace(
+            py_request_id=1, is_dummy_request=False, context_current_position=10
+        )
+        manager.preserve_context_prefix(request, 10)
+        manager.stop_request_committing(request)
+        assert owner.num_committed_tokens == 8
+        assert peer.num_committed_tokens == 4
+        assert core.probe_reuse(scope, prompt) == 8
+        owner.close()
+        owner = None
+        successor = core.create_kv_cache(scope, prompt)
+        assert successor.num_committed_tokens == 8
+        assert core.probe_reuse(ReuseScope(salt=12), prompt) == 0
+    finally:
+        for cache in (successor, peer, owner):
+            if cache is not None:
+                cache.close()
+        core.shutdown()
+
+
 def test_generation_allocation_reserves_dynamic_width() -> None:
     request = SimpleNamespace(
         py_request_id=80,

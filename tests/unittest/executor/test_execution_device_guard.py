@@ -292,6 +292,7 @@ def test_wait_failure_retains_ownership_and_never_closes_cache(guard) -> None:
     with pytest.raises(TimeoutError):
         guard.before_release(request)
     assert id(request) in guard._uses
+    guard._kv_manager.preserve_context_prefix.assert_not_called()
     guard._kv_manager.stop_request_committing.assert_not_called()
 
 
@@ -431,6 +432,103 @@ def test_v2_context_commit_rechecks_revision_after_context_progress(guard) -> No
     committed_batch = executor.kv_cache_manager.update_context_resources.call_args.args[0]
     assert committed_batch.context_requests == [other]
     assert batch.context_requests == [old, other]
+
+
+@pytest.mark.parametrize("frontier", [0, 16, 35])
+def test_v2_retains_only_accepted_context_after_drain(guard, frontier) -> None:
+    request = _request()
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        pass
+    with guard.context_commit(batch):
+        request.context_current_position = frontier
+    with guard.forward(batch):
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+    with guard.context_commit(batch) as accepted:
+        assert not accepted.context_requests
+    order = []
+    guard.device.wait_event.side_effect = lambda event: order.append("drain")
+    guard._kv_manager.preserve_context_prefix.side_effect = lambda req, count: order.append(count)
+    guard._kv_manager.stop_request_committing.side_effect = lambda req: order.append("freeze")
+    guard.before_release(request)
+    assert order == ["drain", frontier, "freeze"]
+
+
+@pytest.mark.parametrize(
+    "frontier,start,expected_end", [(0, 0, 0), (15, 0, 0), (35, 16, 32), (35, 24, 32), (35, 35, 35)]
+)
+def test_v2_preserves_complete_blocks_without_publishing_unfinished_tail(
+    frontier, start, expected_end
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = manager._can_publish_block_reuse = True
+    manager.tokens_per_block = 16
+    request = _request()
+    request.is_dummy_request = False
+    request.context_current_position = 48
+    cache = Mock(is_active=True, capacity=64, num_committed_tokens=start)
+    other = Mock()
+    manager.kv_cache_map = {42: cache, 43: other}
+    manager._reuse_token_source = Mock(return_value=list(range(64)))
+    manager._augment_tokens_for_block_reuse = lambda tokens, req, start, end: tokens[start:end]
+
+    def commit(tokens):
+        cache.num_committed_tokens += len(tokens)
+
+    cache.commit.side_effect = commit
+    manager.preserve_context_prefix(request, frontier)
+    manager.preserve_context_prefix(request, frontier)
+    assert cache.num_committed_tokens == expected_end
+    if expected_end > start:
+        cache.commit.assert_called_once_with(list(range(start, expected_end)))
+    else:
+        cache.commit.assert_not_called()
+    cache.stop_committing.assert_not_called()
+    cache.close.assert_not_called()
+    assert other.mock_calls == []
+
+
+@pytest.mark.parametrize(
+    "unavailable", ["disabled", "not_publishable", "dummy", "suspended", "absent"]
+)
+def test_v2_prefix_preservation_does_not_restore_or_publish_unavailable_cache(unavailable) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = unavailable != "disabled"
+    manager._can_publish_block_reuse = unavailable != "not_publishable"
+    manager.tokens_per_block = 16
+    request = _request()
+    request.context_current_position = 32
+    request.is_dummy_request = unavailable == "dummy"
+    cache = Mock(is_active=unavailable != "suspended", num_committed_tokens=0, capacity=32)
+    manager.kv_cache_map = {} if unavailable == "absent" else {42: cache}
+    manager.preserve_context_prefix(request, 32)
+    cache.commit.assert_not_called()
+    cache.resume.assert_not_called()
+
+
+@pytest.mark.parametrize("frontier", [-1, True, 49])
+def test_v2_prefix_preservation_rejects_invalid_frontier(frontier) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    request = _request()
+    request.context_current_position = 48
+    with pytest.raises(ValueError, match="completed frontier"):
+        manager.preserve_context_prefix(request, frontier)
+
+
+@pytest.mark.parametrize("capacity,source_length", [(16, 64), (64, 16)])
+def test_v2_prefix_preservation_rejects_missing_allocation(capacity, source_length) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = manager._can_publish_block_reuse = True
+    manager.tokens_per_block = 16
+    request = _request()
+    request.is_dummy_request = False
+    request.context_current_position = 32
+    cache = Mock(is_active=True, capacity=capacity, num_committed_tokens=0)
+    manager.kv_cache_map = {42: cache}
+    manager._reuse_token_source = Mock(return_value=list(range(source_length)))
+    with pytest.raises(RuntimeError, match="retained context allocation"):
+        manager.preserve_context_prefix(request, 32)
+    cache.commit.assert_not_called()
 
 
 def test_executor_release_failure_does_not_free_any_resources(guard) -> None:
