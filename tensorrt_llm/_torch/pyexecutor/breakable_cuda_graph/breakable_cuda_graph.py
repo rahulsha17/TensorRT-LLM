@@ -209,7 +209,7 @@ class BreakableCUDAGraph:
         replay_token = _current_replay_token.set(next(_replay_token_counter))
         try:
             for index, segment in enumerate(self._segments):
-                execution_early_exit_point()
+                execution_early_exit_point("graph_segment", index, len(self._segments))
                 segment.replay()
                 if index < len(self._break_functions):
                     self._break_functions[index]()

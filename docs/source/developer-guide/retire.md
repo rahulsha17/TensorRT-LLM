@@ -621,6 +621,19 @@ per handoff, not on every decoding step.
 
 ## Early exit during prefill
 
+For an interruption test, resolve the frontend request ID through the worker's
+`get_runtime_request_id` RPC before matching iteration `requestStats` IDs.
+The mapping exists only while the backend request is live. It does not prove
+that a reported prefill position is still the active position when a revision
+arrives.
+
+An actual early exit emits `RETIRE_EARLY_EXIT` with frontend and runtime request
+IDs, the prefill position, and the execution boundary. For `eager_layer`,
+`submitted` and `total` count decoder layers; for `graph_segment`, they count
+replay segments. A `prelaunch` event does not prove a mid-forward stop. These
+counts describe work that was submitted, not GPU completion or kernel
+preemption. FENCE still establishes completion separately.
+
 REVISION can now save unfinished computation as well as retain completed KV.
 The runtime still calls ADVANCE with the revised input; no new runtime API is
 needed. Chunked prefill must be enabled and the prompt must span multiple chunks

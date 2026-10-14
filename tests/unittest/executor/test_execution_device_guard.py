@@ -29,6 +29,7 @@ NEXT = replace(VERSION, epoch=8)
 def _request(version=VERSION):
     request = SimpleNamespace(
         py_request_id=42,
+        py_client_id=142,
         prepopulated_prompt_len=0,
         context_current_position=0,
         context_chunk_size=64,
@@ -904,9 +905,12 @@ def test_qwen_layer_hook_skips_only_unsubmitted_eager_layers(monkeypatch, compil
             modeling_qwen3.Qwen3Model.forward(model, None, inputs_embeds=object())
             assert len(calls) == 12
         else:
-            with pytest.raises(ExecutionEarlyExit):
+            with pytest.raises(ExecutionEarlyExit) as stopped:
                 modeling_qwen3.Qwen3Model.forward(model, None, inputs_embeds=object())
             assert len(calls) == 4
+            assert stopped.value.boundary == "eager_layer"
+            assert stopped.value.submitted == 4
+            assert stopped.value.total == 12
 
 
 def test_breakable_graph_exit_skips_remaining_segments_and_restores_context(monkeypatch):

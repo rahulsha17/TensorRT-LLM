@@ -266,7 +266,7 @@ class Qwen3Model(DecoderModel):
                 early_exit = None
         for layer_index, decoder_layer in enumerate(self.layers):
             if early_exit is not None and layer_index % 4 == 0:
-                early_exit()
+                early_exit("eager_layer", layer_index, len(self.layers))
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,

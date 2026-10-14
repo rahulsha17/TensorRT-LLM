@@ -17,6 +17,12 @@ __all__ = [
 class ExecutionEarlyExit(Exception):
     """The entire physical batch lost authority; discard its unfinished forward."""
 
+    def __init__(self, boundary: str = "prelaunch", submitted: int = 0, total: int = 0) -> None:
+        super().__init__(boundary)
+        self.boundary = boundary
+        self.submitted = submitted
+        self.total = total
+
 
 _layer_checks: ContextVar[bool] = ContextVar("execution_layer_checks", default=False)
 
@@ -37,7 +43,9 @@ def early_exit_scope(
         _layer_checks.reset(layer_token)
 
 
-def execution_early_exit_point() -> None:
+def execution_early_exit_point(
+    boundary: str = "prelaunch", submitted: int = 0, total: int = 0
+) -> None:
     """Stop submission only when every real row is irrevocably obsolete.
 
     Call only outside compilation and graph capture. Unwinding does not release
@@ -45,9 +53,9 @@ def execution_early_exit_point() -> None:
     """
     poll = _poll.get()
     if poll is not None and poll():
-        raise ExecutionEarlyExit()
+        raise ExecutionEarlyExit(boundary, submitted, total)
 
 
-def get_layer_early_exit_point() -> Callable[[], None] | None:
+def get_layer_early_exit_point() -> Callable[..., None] | None:
     """Return the active prefill hook, or None for unarmed/short decode batches."""
     return execution_early_exit_point if _layer_checks.get() and _poll.get() is not None else None

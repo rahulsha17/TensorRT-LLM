@@ -54,6 +54,45 @@ from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 pytestmark = pytest.mark.cpu_only
 
 
+def test_request_stats_exclude_control_cancel_and_empty_queue_items():
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+        ALIGNMENT_WAKE_REQUEST_ID,
+        CONTROL_REQUEST_ID,
+        PREFIX_LOAD_COMPLETION_REQUEST_ID,
+        PROFILE_START_REQUEST_ID,
+        PROFILE_STOP_REQUEST_ID,
+        SHUTDOWN_REQUEST_ID,
+        RequestQueueItem,
+    )
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm.bindings.executor import RequestStage
+
+    controls = [
+        RequestQueueItem(request_id)
+        for request_id in (
+            SHUTDOWN_REQUEST_ID,
+            CONTROL_REQUEST_ID,
+            PROFILE_START_REQUEST_ID,
+            PROFILE_STOP_REQUEST_ID,
+            PREFIX_LOAD_COMPLETION_REQUEST_ID,
+            ALIGNMENT_WAKE_REQUEST_ID,
+        )
+    ]
+    pending = [
+        *controls,
+        RequestQueueItem(51, request=object()),
+        RequestQueueItem(51, is_canceled_request=True),
+        RequestQueueItem(52),
+        object(),
+    ]
+    executor = MagicMock()
+    executor.executor_request_queue.get_request_queue.return_value.queue = pending
+    stats = PyExecutor._populate_req_stats(executor, [], [], MagicMock())
+    assert [row.id for row in stats] == [51]
+    assert stats[0].stage == RequestStage.QUEUED
+    assert stats[0].context_prefill_position == 0
+
+
 class _StubRequest:
     """Stub LlmRequest exposing only the accessors ``_update_iter_stats`` reads.
 

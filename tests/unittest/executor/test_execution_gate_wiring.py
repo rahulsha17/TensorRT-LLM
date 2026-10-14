@@ -202,6 +202,15 @@ def test_native_enqueue_is_gated_and_cancel_uses_native_id(controller) -> None:
         result.result()
 
 
+def test_runtime_request_id_uses_backend_mapping_and_expires():
+    worker = MagicMock()
+    worker._client_id_to_request_id = {42: 99}
+    assert BaseWorker.get_runtime_request_id(worker, 42) == 99
+    assert BaseWorker.get_runtime_request_id(worker, 99) is None
+    worker._client_id_to_request_id.clear()
+    assert BaseWorker.get_runtime_request_id(worker, 42) is None
+
+
 def test_stale_native_submission_never_reaches_engine(controller) -> None:
     worker, request, _ = worker_shell(controller)
     controller.advance(REVISION)

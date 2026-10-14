@@ -4,6 +4,7 @@
 import atexit
 import dataclasses
 import datetime
+import json
 import math
 import os
 import sys
@@ -2285,7 +2286,8 @@ class PyExecutor:
             req_stats.append(req_stat)
 
         for req in list(self.executor_request_queue.get_request_queue().queue):
-            if isinstance(req, RequestQueueItem):
+            if (isinstance(req, RequestQueueItem) and req.is_normal_request
+                    and req.request is not None):
                 req_stat = get_queued_req_stats(req.id)
                 req_stat.stage = RequestStage.QUEUED
                 req_stats.append(req_stat)
@@ -7931,12 +7933,26 @@ class PyExecutor:
                                                      scheduled_requests)
 
             return outputs
-        except ExecutionEarlyExit:
+        except ExecutionEarlyExit as early_exit:
             # The guard's finally block recorded every submitted GPU use before
             # unwinding. Keep those events and all KV until ordinary cleanup.
             torch.cuda.current_stream().wait_stream(self.execution_stream)
             if route_capture is not None:
                 route_capture.abort_forward()
+            logger.info("RETIRE_EARLY_EXIT " + json.dumps({
+                "boundary":
+                early_exit.boundary,
+                "submitted":
+                early_exit.submitted,
+                "total":
+                early_exit.total,
+                "requests":
+                [{
+                    "request_id": request.py_request_id,
+                    "client_id": request.py_client_id,
+                    "prefill_position": request.context_current_position,
+                } for request in scheduled_requests.all_requests()],
+            }))
             guard.revoke_obsolete_requests(
                 list(scheduled_requests.all_requests()))
             return None
