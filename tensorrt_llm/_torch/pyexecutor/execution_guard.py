@@ -18,7 +18,7 @@ from ...execution_mailbox import WorkerVersionTable
 from ...execution_version import ExecutionVersion
 from .execution_alignment import KVAlignmentAdapter
 from .execution_device import DeviceExecutionAuthority
-from .execution_early_exit import early_exit_scope
+from .execution_early_exit import early_exit_scope, execution_trace_enabled, trace_execution
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .sampler import SampleStateTorch, TorchSampler
@@ -218,20 +218,54 @@ class ExecutionDeviceGuard:
         def wholly_obsolete() -> bool:
             return bool(versions) and not any(self.table.observe_allowed(versions))
 
+        traced = bool(requests) and bool(batch.context_requests) and execution_trace_enabled()
+        trace_requests = (
+            [
+                {
+                    "request_id": r.py_request_id,
+                    "client_id": r.py_client_id,
+                    "tenant_id": r.py_execution_version.tenant_id,
+                    "scope_id": r.py_execution_version.scope_id,
+                    "epoch": r.py_execution_version.epoch,
+                    "prefill_position": r.context_current_position,
+                }
+                for r in requests
+            ]
+            if traced
+            else []
+        )
+
+        def observe(boundary: str, submitted: int, total: int, obsolete: bool) -> None:
+            trace_execution(
+                "boundary",
+                requests=trace_requests,
+                boundary=boundary,
+                submitted=submitted,
+                total=total,
+                obsolete=obsolete,
+            )
+
         with (
             self.device.submission(),
             early_exit_scope(
                 wholly_obsolete if versions and all(v is not None for v in versions) else None,
                 layer_checks=sum(r.context_chunk_size for r in batch.context_requests) >= 32,
+                observer=observe if traced else None,
             ),
         ):
             for request in requests:
                 self._uses[id(request)] = _RequestUse(request, None)
+            if traced:
+                trace_execution("forward_begin", requests=trace_requests)
+            completed = False
             try:
                 yield
+                completed = True
             finally:
                 if requests:
                     self._record_uses(requests)
+                if traced:
+                    trace_execution("forward_end", requests=trace_requests, completed=completed)
 
     def _record_uses(self, requests: list[LlmRequest]) -> None:
         # Publish a completion proof only after event.record succeeds. On a

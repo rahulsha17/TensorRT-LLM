@@ -14,6 +14,7 @@ import triton.language as tl
 
 from ..._utils import prefer_pinned
 from ...execution_version import ExecutionVersion
+from .execution_early_exit import trace_execution
 
 __all__ = ["DeviceExecutionAuthority", "DeviceTokenCommit", "DeviceTokenCommitTicket"]
 
@@ -203,6 +204,13 @@ class DeviceExecutionAuthority:
 
     def publish(self, version: ExecutionVersion) -> None:
         """Queue one atomic epoch write without joining the execution stream."""
+        # The worker table updates host observations before calling this method.
+        trace_execution(
+            "publication_requested",
+            tenant_id=version.tenant_id,
+            scope_id=version.scope_id,
+            epoch=version.epoch,
+        )
         key = (version.tenant_id, version.scope_id)
         with self._lock, torch.cuda.device(self.device):
             self._healthy()

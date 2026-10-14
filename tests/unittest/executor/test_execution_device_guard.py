@@ -947,6 +947,51 @@ def test_operator_exit_unwinds_and_records_partial_submission(guard):
     execution_early_exit_point()
 
 
+def test_boundary_observer_tracks_verdict_and_restores_after_unwind() -> None:
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        early_exit_scope,
+        execution_early_exit_point,
+    )
+
+    outer, inner = Mock(), Mock()
+    with early_exit_scope(lambda: False, observer=outer):
+        execution_early_exit_point("eager_layer", 4, 16)
+        with pytest.raises(ExecutionEarlyExit):
+            with early_exit_scope(lambda: True, observer=inner):
+                execution_early_exit_point("eager_layer", 8, 16)
+        execution_early_exit_point("eager_layer", 12, 16)
+    execution_early_exit_point()
+    assert [c.args for c in outer.call_args_list] == [
+        ("eager_layer", 4, 16, False),
+        ("eager_layer", 12, 16, False),
+    ]
+    inner.assert_called_once_with("eager_layer", 8, 16, True)
+
+
+def test_prefill_trace_carries_request_identity_and_partial_submission(guard, monkeypatch) -> None:
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        execution_early_exit_point,
+    )
+
+    path = "tensorrt_llm._torch.pyexecutor.execution_guard"
+    monkeypatch.setattr(path + ".execution_trace_enabled", lambda: True)
+    trace = Mock()
+    monkeypatch.setattr(path + ".trace_execution", trace)
+    request = _request()
+    with pytest.raises(ExecutionEarlyExit):
+        with guard.forward(_batch(request, context=True)):
+            guard.table.apply(VersionUpdate("session", 2, NEXT))
+            execution_early_exit_point("eager_layer", 4, 16)
+    assert [c.args[0] for c in trace.call_args_list] == ["forward_begin", "boundary", "forward_end"]
+    assert trace.call_args_list[1].kwargs["obsolete"]
+    assert trace.call_args.kwargs["completed"] is False
+    metadata = trace.call_args.kwargs["requests"][0]
+    assert metadata["client_id"] == request.py_client_id
+    assert metadata["epoch"] == VERSION.epoch
+
+
 @pytest.mark.parametrize("completed", [0, 16, 35])
 def test_v1_reserves_completed_chunks_before_probing_tree(guard, completed):
     from tensorrt_llm.execution_alignment import AlignmentInput

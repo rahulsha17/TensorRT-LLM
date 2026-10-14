@@ -662,6 +662,15 @@ replay segments. A `prelaunch` event does not prove a mid-forward stop. These
 counts describe work that was submitted, not GPU completion or kernel
 preemption. FENCE still establishes completion separately.
 
+For a separate timing diagnostic, enable `TLLM_LOG_LEVEL_BY_MODULE=debug:_torch`.
+`RETIRE_TRACE` records worker-local monotonic timestamps for prefill submission,
+each supported boundary and its authority verdict, and the device publisher's
+entry after the host authority changed. This distinguishes a revision that
+arrives while CPU submission is still running from one that arrives after the
+forward has already been submitted. A forward-end record does not mean the GPU
+has completed. Debug logging perturbs timing; do not pool these diagnostic runs
+with uninstrumented performance measurements.
+
 REVISION can now save unfinished computation as well as retain completed KV.
 The runtime still calls ADVANCE with the revised input; no new runtime API is
 needed. Chunked prefill must be enabled and the prompt must span multiple chunks
