@@ -313,30 +313,51 @@ def test_invalid_deadline_is_rejected_before_admission(timeout: float) -> None:
 
 @pytest.mark.parametrize("direction", ["send", "receive"])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_worker_explicitly_selects_session_deadline(direction: str, enabled: bool) -> None:
+def test_worker_explicitly_selects_session_deadline(
+    direction: str, enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Only the worker's configured controller can activate a session deadline."""
-    watchdog = RetirementWatchdog(Mock()) if enabled else None
-    worker = object.__new__(transfer_mod.TransferWorker)
-    worker._retirement_watchdog = watchdog
+    monkeypatch.setattr(transfer_mod, "_make_aux_buffer", Mock(return_value=None))
+    monkeypatch.setattr(transfer_mod.RankInfo, "from_kv_cache_manager", Mock())
+    monkeypatch.setattr(transfer_mod.TransferWorker, "_setup_peer_infrastructure", Mock())
+    monkeypatch.setattr(transfer_mod.TransferWorker, "_setup_transfer_engine", Mock())
+    config = SimpleNamespace(
+        tx_timeout_s=1.0,
+        tx_overall_timeout_s=5.0,
+        rx_timeout_s=5.0,
+        enforce_physical_ownership=True,
+        quiescence_fatal_callback=Mock() if enabled else None,
+        kv_cache_manager=Mock(),
+        max_concurrent_sessions=1,
+        max_draft_len=0,
+        instance_name="deadline-test",
+        device_id=0,
+    )
+    worker = transfer_mod.TransferWorker(config)
+    watchdog = worker._retirement_watchdog
     worker._sender = Mock(_enforce_physical_ownership=True)
     worker._receiver = Mock(_enforce_physical_ownership=True)
-    worker._aux_buffer = None
-    worker._config = SimpleNamespace(tx_timeout_s=1.0, tx_overall_timeout_s=5.0, rx_timeout_s=5.0)
     request = SimpleNamespace(
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=4),
         py_request_id=4,
         prompt_len=16,
     )
     create_session = worker.create_tx_session if direction == "send" else worker.create_rx_session
-    session = create_session(request)
-    if watchdog is None:
-        assert session._retirement is None
-    else:
-        assert session._retirement is not None
-        assert session._retirement.controller is watchdog
-    assert session.close()
-    if watchdog is not None:
-        watchdog.stop()
+    session = None
+    try:
+        session = create_session(request)
+        if enabled:
+            assert watchdog is not None
+            assert session._retirement is not None
+            assert session._retirement.controller is watchdog
+        else:
+            assert watchdog is None
+            assert session._retirement is None
+    finally:
+        if session is not None:
+            assert session.close()
+        if watchdog is not None:
+            watchdog.stop()
 
 
 def _receiver(watchdog: RetirementWatchdog) -> transfer_mod.Receiver:
