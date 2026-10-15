@@ -189,6 +189,64 @@ def test_changed_identity_and_id_reuse_fail_closed():
         tracker.drained(NEW)
 
 
+@pytest.mark.parametrize("source", [False, True])
+def test_broadcasted_parent_remains_pending_until_all_children_complete(source):
+    tracker = RequestDrainTracker()
+    if source:
+        tracker.enqueue(OLD, lambda: 1)
+    tracker.observe_broadcast(((1, OLD),), source_rank=source)
+    tracker.add_child(1, 2, OLD)
+    tracker.complete(1, OLD)
+    assert not tracker.drained(OLD)
+    tracker.complete(2, OLD)
+    assert tracker.drained(OLD)
+    # Terminal cleanup also releases the broadcast bookkeeping for a new ID use.
+    if source:
+        tracker.enqueue(NEW, lambda: 1)
+    tracker.observe_broadcast(((1, NEW),), source_rank=source)
+    assert tracker.drained(OLD) and not tracker.drained(NEW)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_source",
+        "changed_version",
+        "duplicate_envelope",
+        "repeat_broadcast",
+        "peer_collision",
+        "invalid_version",
+    ],
+)
+def test_invalid_broadcast_cannot_certify_drain_even_after_cleanup(fault):
+    tracker = RequestDrainTracker()
+    source = fault != "peer_collision"
+    if fault != "missing_source":
+        tracker.enqueue(OLD, lambda: 1)
+    rows = ((1, OLD),)
+    if fault == "changed_version":
+        rows = ((1, NEW),)
+    elif fault == "duplicate_envelope":
+        rows = rows + rows
+    elif fault == "repeat_broadcast":
+        tracker.observe_broadcast(rows, source_rank=True)
+    elif fault == "invalid_version":
+        rows = ((1, None),)
+    with pytest.raises((RuntimeError, TypeError)):
+        tracker.observe_broadcast(rows, source_rank=source)
+    tracker.complete(1, OLD)
+    with pytest.raises(RuntimeError, match="unknown"):
+        tracker.drained(OLD)
+
+
+def test_failed_collective_keeps_drain_unknown_after_empty_cleanup():
+    tracker = RequestDrainTracker()
+    tracker.fail(TimeoutError("peer did not acknowledge"))
+    tracker.complete(1, OLD)
+    with pytest.raises(RuntimeError, match="unknown"):
+        tracker.drained(OLD)
+
+
 def test_child_sequences_outlive_parent_and_block_fence(control):
     controller, _, tracker = control
     tracker.enqueue(OLD, lambda: 1)

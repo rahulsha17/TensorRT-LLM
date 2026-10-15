@@ -60,6 +60,7 @@ class RequestDrainTracker:
     def __init__(self) -> None:
         self._lock = Lock()
         self._requests: dict[int, ExecutionVersion] = {}
+        self._broadcasted: set[int] = set()
         self._error: Exception | None = None
 
     def enqueue(self, version: ExecutionVersion, submit: Callable[[], int]) -> int:
@@ -87,6 +88,48 @@ class RequestDrainTracker:
                 raise self._error
             self._requests[child_id] = version
 
+    def observe_broadcast(
+        self, requests: tuple[tuple[int, ExecutionVersion], ...], *, source_rank: bool
+    ) -> None:
+        """Record an admission envelope received from the sole submitting rank.
+
+        The source must still own each original enqueue. Peers register the same
+        identities, even if their versions have since been revoked. This tracks
+        already-admitted work; it does not grant new execution authority.
+
+        The caller must join an all-rank acknowledgement before exposing the
+        envelope to activation or cleanup. Otherwise the source could complete
+        before a late peer records its ownership, yielding a false global drain.
+        """
+        with self._lock:
+            self._require_healthy()
+            try:
+                if type(source_rank) is not bool or not isinstance(requests, tuple):
+                    raise TypeError("invalid broadcast admission envelope")
+                identities = set()
+                for request_id, version in requests:
+                    if type(request_id) is not int or not isinstance(version, ExecutionVersion):
+                        raise TypeError("invalid broadcast execution identity")
+                    if request_id in identities or request_id in self._broadcasted:
+                        raise RuntimeError("request was broadcast more than once")
+                    identities.add(request_id)
+                    if source_rank:
+                        if self._requests.get(request_id) != version:
+                            raise RuntimeError("broadcast has no matching source admission")
+                    elif request_id in self._requests:
+                        raise RuntimeError("broadcast collides with a pending execution")
+                self._requests.update(requests)
+                self._broadcasted.update(identities)
+            except Exception as error:
+                self._error = error
+                raise
+
+    def fail(self, error: Exception) -> None:
+        """Preserve uncertainty after failed distributed admission or execution."""
+        with self._lock:
+            if self._error is None:
+                self._error = error
+
     def complete(self, request_id: int, version: ExecutionVersion | None) -> None:
         """Record terminal cleanup, or removal of a never-activated queue item."""
         with self._lock:
@@ -95,6 +138,7 @@ class RequestDrainTracker:
                 self._error = RuntimeError("request execution identity changed before cleanup")
                 raise self._error
             self._requests.pop(request_id, None)
+            self._broadcasted.discard(request_id)
 
     def drained(self, version: ExecutionVersion) -> bool:
         """Check all epochs through version; callers must already exclude new admission."""

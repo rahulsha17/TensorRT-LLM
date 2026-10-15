@@ -6129,6 +6129,10 @@ class PyExecutor:
                                    > 1) and self.dist.rank > 0:
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.register_broadcast_requests(new_requests)
+
         waiting_queue.add_requests(new_requests)
 
     def _get_request_admission_capacity(self) -> int:

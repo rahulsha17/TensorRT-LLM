@@ -81,6 +81,7 @@ class ExecutionDeviceGuard:
         # Installed only by a bootstrap that coordinates all model ranks.
         # Executor topology validation still excludes multi-rank execution.
         self._rank_consensus: ExecutionStepConsensus | None = None
+        self._admission_source = executor.dist.rank == 0
         attention_binding = getattr(executor.model_engine, "execution_attention", None)
         self._native_kv_guards = attention_binding is not None
         self.device = (
@@ -160,6 +161,39 @@ class ExecutionDeviceGuard:
                     request.parent_request_id, request.py_request_id, request.py_execution_version
                 )
 
+    def register_broadcast_requests(self, items: list) -> None:
+        """Record every mirrored enqueue before any rank can activate or finish it."""
+        if self._rank_consensus is None:
+            return
+        tracker = self.table.drain_tracker
+        rows = []
+        local_error = None
+        try:
+            if tracker is None:
+                raise RuntimeError("distributed admission requires drain tracking")
+            for item in items:
+                if not item.is_normal_request or item.request is None:
+                    raise ValueError("broadcast admission expects only normal requests")
+                version = getattr(item.request, "py_execution_version", None)
+                rows.append(ExecutionRow(item.id, version, 0, 0, 0, "queued"))
+            tracker.observe_broadcast(
+                tuple((row.request_id, row.version) for row in rows if row.version is not None),
+                source_rank=self._admission_source,
+            )
+        except Exception as error:
+            local_error = error
+        try:
+            self._rank_consensus.agree(
+                "queue_admission",
+                tuple(rows),
+                (True,) * len(rows),
+                local_error=local_error,
+            )
+        except Exception as error:
+            if tracker is not None:
+                tracker.fail(error)
+            raise
+
     def terminal(self, request_id: int, version: ExecutionVersion | None) -> None:
         """Complete only after terminal cleanup or removal before activation."""
         if version is not None and self.table.alignment_state is not None:
@@ -215,18 +249,28 @@ class ExecutionDeviceGuard:
         """Agree before changing logical progress; physical allocation stays rank-local."""
         if self._rank_consensus is None:
             return tuple(allowed)
-        rows = tuple(
-            ExecutionRow(
-                request.py_request_id,
-                request.py_execution_version,
-                request.get_num_tokens(0),
-                request.context_current_position,
-                request.context_chunk_size,
-                request.state.name,
+        rows = ()
+        local_error = None
+        try:
+            rows = tuple(
+                ExecutionRow(
+                    request.py_request_id,
+                    request.py_execution_version,
+                    request.get_num_tokens(0),
+                    request.context_current_position,
+                    request.context_chunk_size,
+                    request.state.name,
+                )
+                for request in requests
             )
-            for request in requests
-        )
-        return self._rank_consensus.agree(phase, rows, tuple(allowed))
+        except Exception as error:
+            local_error = error
+        try:
+            return self._rank_consensus.agree(phase, rows, tuple(allowed), local_error=local_error)
+        except Exception as error:
+            if self.table.drain_tracker is not None:
+                self.table.drain_tracker.fail(error)
+            raise
 
     @contextmanager
     def forward(self, batch: ScheduledRequests) -> Iterator[None]:

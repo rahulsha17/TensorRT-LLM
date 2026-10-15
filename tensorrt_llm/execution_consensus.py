@@ -109,13 +109,22 @@ class ExecutionStepConsensus:
                 raise ValueError("authority cannot reject an untagged row")
 
     def agree(
-        self, phase: str, rows: tuple[ExecutionRow, ...], allowed: tuple[bool, ...]
+        self,
+        phase: str,
+        rows: tuple[ExecutionRow, ...],
+        allowed: tuple[bool, ...],
+        *,
+        local_error: Exception | None = None,
     ) -> tuple[bool, ...]:
         """Require the same step on every rank; one rejection excludes the row everywhere."""
         if self._failure is not None:
             raise RuntimeError("execution consensus failed; restart required") from self._failure
         error = None
         try:
+            if local_error is not None:
+                if not isinstance(local_error, Exception):
+                    raise TypeError("local execution failure must be an exception")
+                error = str(local_error)
             if not isinstance(phase, str) or not phase:
                 raise ValueError("execution consensus requires a named boundary")
             self._validate_rows(rows, allowed)

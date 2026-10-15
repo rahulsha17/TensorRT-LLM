@@ -642,7 +642,7 @@ def test_executor_release_failure_does_not_free_any_resources(guard) -> None:
 
 def _executor():
     return SimpleNamespace(
-        dist=SimpleNamespace(world_size=1),
+        dist=SimpleNamespace(world_size=1, rank=0),
         disable_overlap_scheduler=True,
         max_beam_width=1,
         sampler=object.__new__(TorchSampler),

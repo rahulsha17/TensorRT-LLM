@@ -251,12 +251,21 @@ graph-segment boundary; they retain the existing GPU-use records. Token and
 context waits finish before a host commit vote. Physical allocation identifiers
 remain local. Single-rank execution keeps its existing local authority checks.
 
+Mirrored admissions use another agreement point, after restoring request
+versions and before adding requests to the waiting queue. The submitting rank
+must still hold the original enqueue; every peer records the same request in
+its drain tracker. All ranks acknowledge the envelope before any can activate
+or finish it. This prevents a late peer from receiving a request after the
+source has already reported drain. Revoked versions remain tracked until
+cleanup; recording the envelope does not restore their authority. A failed
+acknowledgement invalidates drain evidence even if local cleanup later finishes.
+
 These hooks are tested with bounded host collectives and controlled device
-completion. They are not yet attached by distributed bootstrap, and do not
-enable TP/PP. Before enabling that topology, the executor must register mirrored
-admissions before any rank can report drain, coordinate empty/error paths, and
-provide a host-only collective with distributed failure handling. Pipeline
-stages do not enter every boundary together; they require separate ordering.
+completion. Distributed bootstrap does not attach them yet, so they do not
+enable TP/PP. Before enabling that topology, the executor must coordinate the
+remaining empty/error paths and provide a host-only collective with distributed
+failure handling. Pipeline stages do not enter every boundary together; they
+require separate ordering.
 
 Updates carry the full execution version, a publication sequence, and an
 executor-session identity. Epochs retain their full 64-bit range. Worker tables
