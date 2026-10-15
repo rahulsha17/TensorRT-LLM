@@ -295,6 +295,36 @@ Frontends in separate runtime processes also need an external owner/admission
 protocol; they cannot independently create controllers with the same epoch and
 claim one shared authority.
 
+### Frontend control across processes
+
+`FrontendAuthorityGate` and `FrontendAuthorityServer` provide the internal host
+side of that protocol. The server has its own authenticated channel and lease
+loop, separate from worker publication and GPU drain. Its identity includes the
+authority session and a unique frontend lifetime. A replacement process cannot
+accept messages for the previous lifetime.
+
+The intended order is: seal every frontend, accept ADVANCE at the owner, publish
+to workers, complete FENCE and ALIGN, then activate the acknowledged RESUME.
+Sealing immediately rejects old admission and output and wakes old consumers.
+It does not wait for a worker and does not certify that GPU or transfer access
+has stopped. A canceled request can still have resource claims keeping FENCE
+pending.
+
+Observation alone cannot admit a successor. Activation must name the exact
+observed publication, and a revised scope requires RESUME. Duplicate seals and
+delayed activations cannot restore an older epoch. Each endpoint binds one owner
+incarnation; fresh heartbeat sequences renew its lease. Replayed heartbeats do
+not extend it. Expiry closes host authority permanently and wakes consumers;
+it never releases KV memory.
+
+These are internal building blocks, tested over real IPC and separately spawned
+processes. They are **not yet wired into executor admission or an external
+authority coordinator**. That integration must validate fixed membership, seal
+all frontends before accepting a revision, activate only after every worker ACK,
+and handle partial failure without reopening old authority. Existing transfer
+and connector guards remain enabled. Host endpoint tests do not qualify GPU
+execution or disaggregated KV transfer.
+
 ### Coordinating model execution
 
 The device guard coordinates scheduling, token/context commits, and early exit.
