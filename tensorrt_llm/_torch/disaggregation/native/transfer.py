@@ -107,9 +107,15 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
-from tensorrt_llm.execution_fence import RequestDrainTracker, RequestResourceClaim
+from tensorrt_llm.execution_alignment import AlignmentRequest
+from tensorrt_llm.execution_fence import (
+    FenceReceipt,
+    RequestDrainTracker,
+    RequestResourceClaim,
+    ScopeResourceClaim,
+)
 from tensorrt_llm.execution_gate import ExecutionAuthorityError
-from tensorrt_llm.execution_mailbox import WorkerVersionTable
+from tensorrt_llm.execution_mailbox import AlignmentTransferPermit, WorkerVersionTable
 
 if TYPE_CHECKING:
     from .bounce import Config
@@ -2405,11 +2411,19 @@ class _SessionCleanup:
         self._lock = threading.Lock()
         self._error: Optional[Exception] = None
         self._drain: Optional[RequestDrainTracker] = None
-        self._claim: Optional[RequestResourceClaim] = None
+        self._claim: RequestResourceClaim | ScopeResourceClaim | None = None
+        self._alignment_permit: AlignmentTransferPermit | None = None
+        self._on_release: Callable[[], None] | None = None
         self._finished = False
         self._released = False
 
-    def bind_claim(self, drain: RequestDrainTracker, claim: RequestResourceClaim) -> None:
+    def bind_claim(
+        self,
+        drain: RequestDrainTracker,
+        claim: RequestResourceClaim | ScopeResourceClaim,
+        alignment_permit: AlignmentTransferPermit | None = None,
+        on_release: Callable[[], None] | None = None,
+    ) -> None:
         """Attach a pre-acquired claim, including when close won the race."""
         with self._lock:
             try:
@@ -2417,7 +2431,11 @@ class _SessionCleanup:
                     raise RuntimeError("KV session already has an execution claim")
                 if self._error is not None:
                     raise RuntimeError("KV session cleanup is unproven") from self._error
+                if alignment_permit is not None and alignment_permit.claim is not claim:
+                    raise RuntimeError("ALIGN permit does not own this cleanup claim")
                 self._drain, self._claim = drain, claim
+                self._alignment_permit = alignment_permit
+                self._on_release = on_release
                 self._release_claim()
             except Exception as error:
                 self._error = error
@@ -2426,11 +2444,18 @@ class _SessionCleanup:
                     self._drain.fail(error)
                 raise
 
+    @property
+    def alignment_permit(self) -> AlignmentTransferPermit | None:
+        with self._lock:
+            return self._alignment_permit
+
     def _release_claim(self) -> None:
         if self._finished and self._claim is not None and not self._released:
             assert self._drain is not None
             self._drain.release_resource(self._claim)
             self._released = True
+            if self._on_release is not None:
+                self._on_release()
 
     def run(self, cleanup: Callable[[], bool]) -> bool:
         with self._lock:
@@ -4787,7 +4812,12 @@ class TransferWorker:
         request: LlmRequest,
         direction: Literal["send", "receive"],
         create: Callable[[], _SessionT],
+        *,
+        alignment: AlignmentRequest | None = None,
+        fence: FenceReceipt | None = None,
     ) -> _SessionT:
+        if (alignment is None) != (fence is None):
+            raise ValueError("ALIGN copy requires both revised input and completed FENCE")
         with self._execution_session_lock:
             self._sessions_started = True
             version = getattr(request, "py_execution_version", None)
@@ -4800,6 +4830,8 @@ class TransferWorker:
             cache_salt = getattr(request, "cache_salt", None)
             wire = getattr(self, "_execution_wire", None)
             if version is None:
+                if alignment is not None:
+                    raise ValueError("ALIGN copy requires a tagged execution")
                 if wire is not None:
                     wire.register_local(transfer_id, direction, None, cache_salt)
                 return create()
@@ -4812,16 +4844,35 @@ class TransferWorker:
             if table.drain_tracker is not drain:
                 raise RuntimeError("execution authority drain tracker changed")
             prefix = self._prefix_identity(request)
+            request_id = request.py_request_id
+            permit = None
             # Publication and claim registration share the table's lock. Session
             # construction can block, so it runs after that lock is released.
-            claim = table.admit_resource(request.py_request_id, version, f"kv-{direction}-session")
+            if alignment is not None:
+                if version != alignment.revision.successor_version:
+                    raise ValueError("ALIGN session version does not match the revised input")
+                permit = table.admit_alignment_transfer(
+                    alignment,
+                    fence,
+                    request_id=request_id,
+                    transfer_id=transfer_id,
+                    direction=direction,
+                    prefix_length=prefix.num_tokens,
+                )
+                claim = permit.claim
+            else:
+                claim = table.admit_resource(request_id, version, f"kv-{direction}-session")
             try:
-                wire.register_local(transfer_id, direction, version, cache_salt, prefix)
-            except Exception:
+                wire.register_local(transfer_id, direction, version, cache_salt, prefix, permit)
+            except Exception as error:
                 # No constructor or native publication has run. This exact
                 # claim can be retired without releasing any existing session.
                 try:
+                    if permit is not None:
+                        table.fail_alignment_transfer(permit, error)
                     drain.release_resource(claim)
+                    if permit is not None:
+                        table.alignment_state.wake_reclaim()
                 except Exception as error:
                     drain.fail(error)
                     raise
@@ -4832,13 +4883,18 @@ class TransferWorker:
                     not session._enforce_physical_ownership
                     or session.disagg_request_id != transfer_id
                     or getattr(request, "cache_salt", None) != cache_salt
-                    or session.request_id != claim.request_id
-                    or request.py_request_id != claim.request_id
+                    or session.request_id != request_id
+                    or request.py_request_id != request_id
                     or request.py_execution_version != version
                     or self._prefix_identity(request) != prefix
                 ):
                     raise RuntimeError("KV session execution ownership changed during admission")
-                session._cleanup.bind_claim(drain, claim)
+                session._cleanup.bind_claim(
+                    drain,
+                    claim,
+                    permit,
+                    table.alignment_state.wake_reclaim if permit is not None else None,
+                )
                 return session
             except Exception as error:
                 # Construction may already have exposed a session to listener
@@ -4846,7 +4902,13 @@ class TransferWorker:
                 drain.fail(error)
                 raise
 
-    def create_tx_session(self, request: LlmRequest) -> TxSession:
+    def create_tx_session(
+        self,
+        request: LlmRequest,
+        *,
+        alignment: AlignmentRequest | None = None,
+        fence: FenceReceipt | None = None,
+    ) -> TxSession:
         params = request.py_disaggregated_params
         assert params is not None
         return self._create_session(
@@ -4863,9 +4925,17 @@ class TransferWorker:
                 overall_timeout_s=self._config.tx_overall_timeout_s,
                 retirement_watchdog=getattr(self, "_retirement_watchdog", None),
             ),
+            alignment=alignment,
+            fence=fence,
         )
 
-    def create_rx_session(self, request: LlmRequest) -> RxSession:
+    def create_rx_session(
+        self,
+        request: LlmRequest,
+        *,
+        alignment: AlignmentRequest | None = None,
+        fence: FenceReceipt | None = None,
+    ) -> RxSession:
         params = request.py_disaggregated_params
         assert params is not None
         return self._create_session(
@@ -4881,7 +4951,40 @@ class TransferWorker:
                 prompt_len=request.prompt_len,
                 retirement_watchdog=getattr(self, "_retirement_watchdog", None),
             ),
+            alignment=alignment,
+            fence=fence,
         )
+
+    def finish_alignment_transfer(
+        self, session: TxSession | RxSession, validate_prefix: Callable[[], None]
+    ) -> None:
+        """Accept a completed copy only after the engine validates its retained KV.
+
+        The engine must keep source/destination KV holds through validation and
+        attach the destination prefix to ALIGN. The callback runs outside the
+        authority lock. A racing revision prevents acceptance, while successful
+        physical cleanup can still unblock its FENCE.
+        """
+        local = (isinstance(session, TxSession) and session._sender is self._sender) or (
+            isinstance(session, RxSession) and session._receiver is self._receiver
+        )
+        if not local:
+            raise ValueError("ALIGN session belongs to another transfer worker")
+        permit = session._cleanup.alignment_permit
+        table = self._execution_authority
+        if permit is None or table is None:
+            raise ValueError("session has no ALIGN transfer permit")
+        if not session.is_completed() or not session.resources_drained():
+            raise RuntimeError("ALIGN transfer has not completed successfully")
+        try:
+            validate_prefix()
+        except Exception as error:
+            table.fail_alignment_transfer(permit, error)
+            session.close()
+            raise
+        if not session.close():
+            raise RuntimeError("ALIGN transfer cleanup remains incomplete")
+        table.accept_alignment_transfer(permit)
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
         return self._sender.has_all_peer_req_infos(unique_rid)

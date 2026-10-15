@@ -156,6 +156,7 @@ class _AlignmentRecord:
     resume_prefix_length: int | None = None
     request_id: int | None = None
     attached: bool = False
+    transfer_drains: list[Callable[[], bool]] = field(default_factory=list)
 
 
 class WorkerAlignmentState:
@@ -214,6 +215,27 @@ class WorkerAlignmentState:
         version = request.revision.successor_version
         return self._current.get((version.tenant_id, version.scope_id)) == version
 
+    def retain_transfer(self, request: AlignmentRequest, drained: Callable[[], bool]) -> None:
+        """Keep this reservation until a copy's physical owner has finished.
+
+        The callback must only inspect host lifetime state and never acquire
+        execution authority. Native cache cleanup remains on the engine thread.
+        """
+        with self._lock:
+            record = self._records.get(request)
+            if self._closed or not self._is_current(request) or record is None:
+                raise RuntimeError("ALIGN copy has no current reservation plan")
+            if record.error is not None or record.resumed:
+                raise RuntimeError("ALIGN copy cannot extend a failed or resumed plan")
+            record.transfer_drains.append(drained)
+
+    def wake_reclaim(self) -> None:
+        """Notify the engine after transfer cleanup, including during shutdown."""
+        with self._lock:
+            if self._records and not self._wake_pending:
+                self._wake_pending = True
+                self._wake()
+
     def process(self) -> None:
         """Engine safe point: reserve successors before dropping superseded holds."""
         with self._lock:
@@ -247,9 +269,11 @@ class WorkerAlignmentState:
                         record.error = error
             for request, record in list(self._records.items()):
                 if self._closed or not self._is_current(request) or record.error is not None:
-                    self._reclaim(record)
-                    if self._closed or not self._is_current(request):
+                    reclaimed = self._reclaim(record)
+                    if reclaimed and (self._closed or not self._is_current(request)):
                         del self._records[request]
+            if self._closed and self._records:
+                raise RuntimeError("ALIGN transfers still retain KV; teardown must wait")
 
     @contextmanager
     def releasing_owner(self) -> Iterator[None]:
@@ -396,14 +420,19 @@ class WorkerAlignmentState:
                 record.attached = True
             self._reclaim(record, settle=True)
 
-    def _reclaim(self, record: _AlignmentRecord, *, settle: bool = True) -> None:
+    def _reclaim(self, record: _AlignmentRecord, *, settle: bool = True) -> bool:
         # Native calls belong to the engine thread. Preserve ownership and stop
         # further cleanup when a copy wait or release has unknown completion.
         if self._unsafe_error is not None:
             raise self._unsafe_error
-        if record.reservation is None:
-            return
         try:
+            record.transfer_drains = [
+                drained for drained in record.transfer_drains if not drained()
+            ]
+            if record.transfer_drains:
+                return False
+            if record.reservation is None:
+                return True
             if settle:
                 record.reservation.settle()
             record.reservation.close()
@@ -414,6 +443,7 @@ class WorkerAlignmentState:
             record.error = self._unsafe_error
             raise self._unsafe_error from error
         record.reservation = None
+        return True
 
     def terminal(self, version: ExecutionVersion, request_id: int) -> None:
         """Mark an abandoned claim; defer native release to an engine safe point."""
@@ -438,6 +468,7 @@ class WorkerAlignmentState:
             if any(
                 (record.receipt is None and record.error is None)
                 or (record.reservation is not None and record.reservation.num_tokens > 0)
+                or bool(record.transfer_drains)
                 for record in self._records.values()
             ):
                 raise RuntimeError("cannot reset prefix cache while ALIGN owns or prepares KV")

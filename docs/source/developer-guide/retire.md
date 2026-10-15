@@ -779,7 +779,8 @@ wins, a stale or unknown epoch is rejected before allocation or session setup;
 ordinary rejection does not poison drain. If the claim wins, publication can
 continue while session construction runs. That claim keeps FENCE pending until
 physical cleanup, even if the request is canceled during construction. A pending
-ALIGN/RESUME cannot admit a session. Binding only a drain tracker is insufficient
+ALIGN/RESUME cannot admit an ordinary request session. The explicit ALIGN copy
+path below has separate permission. Binding only a drain tracker is insufficient
 for tagged sessions.
 
 The native Python transfer worker also binds each exchange to an immutable wire
@@ -817,7 +818,7 @@ delayed message from reaching a different allocation. These bindings currently
 last for the worker's lifetime and are not compacted. They identify exchanges
 within the trusted control plane; they do not authenticate a network peer.
 
-Each operation also checks current authority and completed RESUME before sender
+Ordinary transfers check current authority and completed RESUME before sender
 task admission, destination publication reservation and backend submission. The
 check requires a local session in the matching direction. A sender rechecks after
 queued preparation, so an earlier task admission cannot authorize a stale DMA
@@ -833,15 +834,39 @@ Matching completion evidence can still retire those owners after revocation.
 FENCE waits for physical drain and successful session cleanup, including when
 rejection happened before any destination was published.
 
+An ALIGN copy can run before RESUME through an `AlignmentTransferPermit`. This
+worker-local object names one revision, local staging request, exchange,
+direction and prefix length. It grants no generation or output authority.
+The runtime supplies its completed global FENCE receipt; the worker rechecks its
+own FENCE and the exact currently published revised input. The copied prefix must
+match those tokens, salt and LoRA ID, use the agreed positions, and leave the
+final input token for computation. A caller cannot reuse a retired exchange ID.
+
+The native transfer worker accepts `alignment` and `fence` when creating this
+session. Its resource claim does not enqueue a generation request. Sender task
+admission, receive publication and backend submission check the copy permit.
+A later revision closes those checks immediately. The claim remains live until
+physical cleanup, blocks a later FENCE, and keeps the associated ALIGN reservation
+from being reclaimed. Shutdown refuses cache teardown while a copy retains it.
+
+Copy cleanup and prefix acceptance are separate. Even after the session closes,
+ALIGN and RESUME remain blocked until the engine validates the result. The engine
+calls `finish_alignment_transfer(session, validate_prefix)` after successful
+transfer completion. The callback must validate and attach the retained prefix
+at the intended placement; it runs outside authority locks. A racing revision
+rejects acceptance while still allowing safe physical cleanup. Failed validation
+requires a new revision. Multiple copies must all finish and be accepted.
+Contradictory evidence after acceptance closes the worker's authority.
+
 These claims account for resource lifetime; they do not publish authority or
 prove the contents of transferred memory. End-to-end disaggregated RETIRE still
 needs runtime wiring of shared authority and cache context across prefill and
-decode, source KV holds and destination prefix validation. ALIGN may need a copy
-before RESUME, so it also needs permission for that specific transfer without
-granting permission to generate. The current operation checks require RESUME and
-do not provide that permission. Physical retirement must be qualified for each
-supported layout and transport. Device guards continue to reject transfer and
-connector configurations until those paths are integrated and qualified.
+decode, source/destination KV holds, a copy plan and the engine callback that
+validates and attaches the received prefix. The permit API does not supply those
+pieces or turn a cache lookup count into HBM evidence. Physical retirement must
+be qualified for each supported layout and transport. Device guards continue to
+reject transfer and connector configurations until those paths are integrated
+and qualified.
 
 ## ALIGN (step 7)
 

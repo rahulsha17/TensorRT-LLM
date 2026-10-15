@@ -17,6 +17,7 @@ __all__ = [
     "RevisionFence",
     "RequestDrainTracker",
     "RequestResourceClaim",
+    "ScopeResourceClaim",
 ]
 
 
@@ -70,6 +71,18 @@ class RequestResourceClaim:
     owner: str
 
 
+@dataclass(frozen=True, eq=False)
+class ScopeResourceClaim:
+    """A non-generating accessor, such as an ALIGN copy, that a later FENCE must drain.
+
+    The authority owner must authorize acquisition. This tracks physical lifetime;
+    it neither enqueues a request nor authorizes execution or KV reuse.
+    """
+
+    version: ExecutionVersion
+    owner: str
+
+
 class RequestDrainTracker:
     """Track engine admissions and resource accessors through their cleanup.
 
@@ -81,7 +94,7 @@ class RequestDrainTracker:
     def __init__(self) -> None:
         self._lock = Lock()
         self._requests: dict[int, ExecutionVersion] = {}
-        self._resources: dict[RequestResourceClaim, ExecutionVersion] = {}
+        self._resources: dict[RequestResourceClaim | ScopeResourceClaim, ExecutionVersion] = {}
         self._broadcasted: set[int] = set()
         self._error: Exception | None = None
 
@@ -189,10 +202,31 @@ class RequestDrainTracker:
             self._resources[claim] = version
             return claim
 
-    def release_resource(self, claim: RequestResourceClaim) -> None:
+    def acquire_scope_resource(self, version: ExecutionVersion, owner: str) -> ScopeResourceClaim:
+        """Track an independently authorized accessor without admitting generation."""
+        if not isinstance(version, ExecutionVersion):
+            raise TypeError("scope resource requires an execution version")
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("resource owner must be a nonempty string")
+        with self._lock:
+            self._require_healthy()
+            claim = ScopeResourceClaim(version, owner)
+            self._resources[claim] = version
+            return claim
+
+    def has_resource(self, claim: RequestResourceClaim | ScopeResourceClaim) -> bool:
+        """Observe a claim's lifetime; an unhealthy tracker cannot prove completion."""
+        with self._lock:
+            self._require_healthy()
+            return claim in self._resources
+
+    def release_resource(self, claim: RequestResourceClaim | ScopeResourceClaim) -> None:
         """Record proven accessor completion after its native release succeeds."""
         with self._lock:
-            if not isinstance(claim, RequestResourceClaim) or claim not in self._resources:
+            if (
+                not isinstance(claim, (RequestResourceClaim, ScopeResourceClaim))
+                or claim not in self._resources
+            ):
                 error = RuntimeError("resource completion has no matching live claim")
                 if self._error is None:
                     self._error = error

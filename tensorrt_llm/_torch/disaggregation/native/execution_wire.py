@@ -16,7 +16,7 @@ from typing import Literal
 import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.execution_content import TransferPrefixIdentity
-from tensorrt_llm.execution_mailbox import WorkerVersionTable
+from tensorrt_llm.execution_mailbox import AlignmentTransferPermit, WorkerVersionTable
 from tensorrt_llm.execution_version import ExecutionVersion
 
 
@@ -147,6 +147,7 @@ class TransferExecutionIdentity:
 class _Exchange:
     identity: TransferExecutionIdentity | None
     local_directions: set[str] = field(default_factory=set)
+    alignment_permits: dict[str, AlignmentTransferPermit] = field(default_factory=dict)
 
 
 class ExecutionTransferWire:
@@ -193,6 +194,7 @@ class ExecutionTransferWire:
         version: ExecutionVersion | None,
         cache_salt: str | None,
         prefix: TransferPrefixIdentity | None = None,
+        alignment_permit: AlignmentTransferPermit | None = None,
     ) -> None:
         if direction not in ("send", "receive"):
             raise TransferIdentityError("invalid transfer direction")
@@ -200,6 +202,24 @@ class ExecutionTransferWire:
             raise TransferIdentityError("unversioned transfer cannot discard a prefix identity")
         if version is not None and not isinstance(prefix, TransferPrefixIdentity):
             raise TransferIdentityError("tagged transfer requires a prefix identity")
+        if alignment_permit is not None:
+            if not isinstance(alignment_permit, AlignmentTransferPermit) or prefix is None:
+                raise TransferIdentityError("ALIGN copy requires a typed permit and prefix")
+            alignment = alignment_permit.request
+            revised = alignment.revised_input
+            expected_prefix = TransferPrefixIdentity.from_tokens(
+                prefix.cache_context_id,
+                revised.input_token_ids[: alignment_permit.prefix_length],
+                lora_task_id=revised.lora_task_id,
+            )
+            if (
+                version != alignment.revision.successor_version
+                or alignment_permit.transfer_id != transfer_id
+                or alignment_permit.direction != direction
+                or cache_salt != revised.cache_salt
+                or prefix != expected_prefix
+            ):
+                raise TransferIdentityError("ALIGN copy does not match its permitted prefix")
         with self._lock:
             self._traffic_started = True
             if self._table is None:
@@ -208,6 +228,11 @@ class ExecutionTransferWire:
                 return
             _check_transfer_id(transfer_id)
             assert self._authority_session is not None
+            if (
+                alignment_permit is not None
+                and alignment_permit.request.session_id != self._authority_session
+            ):
+                raise TransferIdentityError("ALIGN copy belongs to another authority session")
             identity = (
                 None
                 if version is None
@@ -225,10 +250,12 @@ class ExecutionTransferWire:
             if direction in previous.local_directions:
                 raise TransferIdentityError("transfer ID cannot be reused after local admission")
             previous.local_directions.add(direction)
+            if alignment_permit is not None:
+                previous.alignment_permits[direction] = alignment_permit
 
     @contextmanager
     def admission(self, transfer_id: int, direction: Literal["send", "receive"]) -> Iterator[None]:
-        """Reserve a short host operation under current, resumed authority.
+        """Reserve an operation under resumed authority or one pending ALIGN copy permit.
 
         The caller retains physical ownership before leaving this context and
         performs network/CUDA work afterward. Completion processing does not use
@@ -238,6 +265,7 @@ class ExecutionTransferWire:
         if direction not in ("send", "receive"):
             raise TransferIdentityError("invalid transfer direction")
         with self._lock:
+            alignment_permit = None
             table = self._table
             if table is None:
                 identity = None
@@ -246,10 +274,15 @@ class ExecutionTransferWire:
                 if exchange is None or direction not in exchange.local_directions:
                     raise TransferIdentityError("operation requires a locally admitted exchange")
                 identity = exchange.identity
+                alignment_permit = exchange.alignment_permits.get(direction)
         if identity is None:
             yield
             return
         assert table is not None
+        if alignment_permit is not None:
+            with table.alignment_transfer_admission(alignment_permit):
+                yield
+            return
         with table.admission(identity.version) as execution:
             try:
                 yield

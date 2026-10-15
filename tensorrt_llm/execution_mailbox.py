@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from threading import Event, Lock, RLock, Thread
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import uuid4
 
 from .execution_alignment import (
@@ -26,11 +26,13 @@ from .execution_fence import (
     RequestDrainTracker,
     RequestResourceClaim,
     RevisionFence,
+    ScopeResourceClaim,
 )
 from .execution_gate import ExecutionAuthorityError, HostExecution, HostExecutionGate
 from .execution_version import ExecutionVersion
 
 __all__ = [
+    "AlignmentTransferPermit",
     "DeviceVersionPublisher",
     "ExecutionController",
     "LocalPublicationTransport",
@@ -179,6 +181,30 @@ class DeviceVersionPublisher(Protocol):
     def publish(self, version: ExecutionVersion) -> None: ...
 
 
+@dataclass(frozen=True, eq=False)
+class AlignmentTransferPermit:
+    """Worker-local permission for one copy; never permission to generate.
+
+    Only the table that issued this exact object can admit its operations.
+    Transport code must also bind the exchange to the revised prefix identity.
+    """
+
+    request: AlignmentRequest
+    request_id: int
+    transfer_id: int
+    direction: Literal["send", "receive"]
+    prefix_length: int
+    claim: ScopeResourceClaim
+
+
+@dataclass
+class _AlignmentTransfer:
+    tracker: RequestDrainTracker
+    alignment_state: WorkerAlignmentState
+    accepted: bool = False
+    error: Exception | None = None
+
+
 class WorkerVersionTable:
     """Store one owner's versions; readers cannot choose or advance authority.
 
@@ -204,6 +230,7 @@ class WorkerVersionTable:
         self._publication_error: Exception | None = None
         self.drain_tracker: RequestDrainTracker | None = None
         self.alignment_state: WorkerAlignmentState | None = None
+        self._alignment_transfers: dict[AlignmentTransferPermit, _AlignmentTransfer] = {}
 
     def poll_fence(self, request: FenceRequest) -> FenceReceipt | None:
         """Check a drain without blocking publication or waiting on the GPU."""
@@ -235,6 +262,15 @@ class WorkerVersionTable:
                 raise RuntimeError("alignment was superseded")
             if self.alignment_state is None:
                 raise RuntimeError("worker does not support ALIGN")
+            for permit, transfer in self._alignment_transfers.items():
+                if permit.request != request:
+                    continue
+                if transfer.error is not None:
+                    raise RuntimeError(
+                        "ALIGN copy failed; a new revision is required"
+                    ) from transfer.error
+                if not transfer.accepted or self._alignment_transfer_live(permit, transfer):
+                    return None
             receipt = self.alignment_state.poll(request)
             if (
                 receipt is None
@@ -376,6 +412,141 @@ class WorkerVersionTable:
                 return self.drain_tracker.acquire_resource(request_id, version, owner)
             finally:
                 execution.finish()
+
+    def _require_alignment_pending(self, request: AlignmentRequest) -> None:
+        self._require_open()
+        if not isinstance(request, AlignmentRequest) or request.session_id != self.session_id:
+            raise ValueError("ALIGN copy belongs to another authority session")
+        version = request.revision.successor_version
+        update = self._versions.get((version.tenant_id, version.scope_id))
+        if update is None or update.version != version or update.alignment != request:
+            raise ExecutionAuthorityError("ALIGN copy requires the current published input")
+        if update.resume is not None:
+            raise ExecutionAuthorityError("ALIGN copy admission ends at RESUME")
+        if self.alignment_state is None or self.drain_tracker is None:
+            raise RuntimeError("ALIGN copy requires alignment and physical drain tracking")
+
+    def _alignment_transfer_live(
+        self, permit: AlignmentTransferPermit, transfer: _AlignmentTransfer
+    ) -> bool:
+        if self.drain_tracker is not transfer.tracker:
+            raise RuntimeError("ALIGN copy drain tracker changed")
+        if self.alignment_state is not transfer.alignment_state:
+            raise RuntimeError("ALIGN copy reservation state changed")
+        return transfer.tracker.has_resource(permit.claim)
+
+    def admit_alignment_transfer(
+        self,
+        request: AlignmentRequest,
+        fence: FenceReceipt,
+        *,
+        request_id: int,
+        transfer_id: int,
+        direction: Literal["send", "receive"],
+        prefix_length: int,
+    ) -> AlignmentTransferPermit:
+        """Register one non-generating copy after the runtime's global FENCE.
+
+        The trusted runtime supplies its completed cohort receipt. The worker
+        rechecks its own FENCE and pending input under the publication lock.
+        Callers must hold the source and destination memory before using this
+        permit and retain the claim through physical cleanup. No native work or
+        network call runs under this lock.
+        """
+        if (
+            type(request_id) is not int
+            or type(transfer_id) is not int
+            or not 0 <= transfer_id < (1 << 63)
+        ):
+            raise ValueError("ALIGN copy requires a request ID and nonnegative int64 transfer ID")
+        if direction not in ("send", "receive"):
+            raise ValueError("invalid ALIGN copy direction")
+        with self._lock:
+            self._require_alignment_pending(request)
+            if type(prefix_length) is not int or not 0 < prefix_length < len(
+                request.revised_input.input_token_ids
+            ):
+                raise ValueError("ALIGN copy must leave the final input token for computation")
+            expected = FenceReceipt(FenceRequest(self.session_id, request.revision))
+            if (
+                not isinstance(fence, FenceReceipt)
+                or fence != expected
+                or self.poll_fence(expected.request) != expected
+            ):
+                raise ExecutionAuthorityError("ALIGN copy requires completed FENCE")
+            if any(
+                p.transfer_id == transfer_id and p.direction == direction
+                for p in self._alignment_transfers
+            ):
+                raise ValueError("ALIGN copy exchange cannot be reused")
+            tracker = self.drain_tracker
+            assert tracker is not None
+            claim = tracker.acquire_scope_resource(
+                request.revision.successor_version, f"align-{direction}-session"
+            )
+            assert self.alignment_state is not None
+            try:
+                self.alignment_state.retain_transfer(
+                    request, lambda: not tracker.has_resource(claim)
+                )
+            except Exception:
+                tracker.release_resource(claim)
+                raise
+            permit = AlignmentTransferPermit(
+                request, request_id, transfer_id, direction, prefix_length, claim
+            )
+            self._alignment_transfers[permit] = _AlignmentTransfer(tracker, self.alignment_state)
+            return permit
+
+    @contextmanager
+    def alignment_transfer_admission(self, permit: AlignmentTransferPermit) -> Iterator[None]:
+        """Reserve a copy operation while its exact permit and physical owner are live."""
+        with self._lock:
+            self._require_open()
+            transfer = self._alignment_transfers.get(permit)
+            if transfer is None:
+                raise ExecutionAuthorityError("unknown ALIGN copy permit")
+            self._require_alignment_pending(permit.request)
+            if (
+                transfer.accepted
+                or transfer.error is not None
+                or not self._alignment_transfer_live(permit, transfer)
+            ):
+                raise ExecutionAuthorityError("ALIGN copy admission is closed")
+            yield
+
+    def accept_alignment_transfer(self, permit: AlignmentTransferPermit) -> None:
+        """Record engine-validated copy success after physical cleanup.
+
+        Resource release alone never calls this method. The engine must validate
+        the copied prefix and its placement before accepting it. This receipt
+        does not change the cache reservation or grant execution authority.
+        """
+        with self._lock:
+            self._require_alignment_pending(permit.request)
+            transfer = self._alignment_transfers.get(permit)
+            if transfer is None:
+                raise ExecutionAuthorityError("unknown ALIGN copy permit")
+            if transfer.error is not None:
+                raise RuntimeError("failed ALIGN copy cannot be accepted") from transfer.error
+            if self._alignment_transfer_live(permit, transfer):
+                raise RuntimeError("ALIGN copy still owns physical resources")
+            transfer.accepted = True
+
+    def fail_alignment_transfer(self, permit: AlignmentTransferPermit, error: Exception) -> None:
+        """Reject reuse without releasing memory or erasing future FENCE obligations."""
+        if not isinstance(error, Exception):
+            raise TypeError("ALIGN failure must be an exception")
+        with self._lock:
+            transfer = self._alignment_transfers.get(permit)
+            if transfer is None:
+                raise ExecutionAuthorityError("unknown ALIGN copy permit")
+            if transfer.error is None:
+                transfer.error = error
+            if transfer.accepted:
+                # Contradictory evidence after acceptance invalidates authority;
+                # it cannot silently leave a resumed successor running.
+                self.close()
 
     def close(self) -> None:
         """Invalidate observations when the worker stops."""
