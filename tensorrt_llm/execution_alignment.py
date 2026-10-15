@@ -15,6 +15,7 @@ from .execution_version import ExecutionVersion
 
 __all__ = [
     "ExecutionPlacement",
+    "PrefixTransferPlan",
     "AlignmentInput",
     "AlignmentRequest",
     "AlignmentReceipt",
@@ -38,6 +39,24 @@ class ExecutionPlacement:
 
 
 @dataclass(frozen=True)
+class PrefixTransferPlan:
+    """Runtime-selected source and complete prefix length for one destination.
+
+    This identifies required work, not memory addresses or completion. Every
+    source and destination rank must retain its own physical copy obligations.
+    """
+
+    source: ExecutionPlacement
+    num_tokens: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, ExecutionPlacement):
+            raise TypeError("prefix source must be an ExecutionPlacement")
+        if type(self.num_tokens) is not int or not 0 < self.num_tokens < 2**31:
+            raise ValueError("transfer prefix length must be a positive int32 integer")
+
+
+@dataclass(frozen=True)
 class AlignmentInput:
     """The runtime's complete revised text input and cache namespace.
 
@@ -48,7 +67,9 @@ class AlignmentInput:
 
     destination selects one prepared frontend lifetime, including all its ranks.
     None retains common-prefix alignment across the complete cohort. Selection
-    does not move KV: the chosen destination must own the reusable prefix locally.
+    does not move KV. transfer additionally retains a source hold and requires
+    both endpoints' copy acceptance. The engine must still allocate, copy and
+    attach the actual destination prefix before ALIGN can complete.
     """
 
     input_token_ids: tuple[int, ...]
@@ -56,6 +77,7 @@ class AlignmentInput:
     lora_task_id: int | None = None
     min_reuse_tokens: int = 0
     destination: ExecutionPlacement | None = None
+    transfer: PrefixTransferPlan | None = None
 
     def __post_init__(self) -> None:
         if self.destination is not None and not isinstance(self.destination, ExecutionPlacement):
@@ -74,6 +96,20 @@ class AlignmentInput:
             0 <= self.min_reuse_tokens < len(self.input_token_ids)
         ):
             raise ValueError("min_reuse_tokens must leave at least one input token to compute")
+        if self.transfer is not None:
+            if not isinstance(self.transfer, PrefixTransferPlan):
+                raise TypeError("transfer must be a PrefixTransferPlan or None")
+            if self.destination is None or self.transfer.source == self.destination:
+                raise ValueError("prefix transfer requires distinct source and destination")
+            if self.transfer.source.session_id != self.destination.session_id:
+                raise ValueError("prefix endpoints must share one authority session")
+            if not self.min_reuse_tokens <= self.transfer.num_tokens < len(self.input_token_ids):
+                raise ValueError("transfer must cover required reuse and leave the final token")
+
+    @property
+    def required_prefix_length(self) -> int:
+        """The promised prefix includes any runtime-selected transfer."""
+        return self.min_reuse_tokens if self.transfer is None else self.transfer.num_tokens
 
 
 @dataclass(frozen=True)
@@ -113,7 +149,7 @@ class AlignmentReceipt:
             raise ValueError("reservation_id must be a nonempty string")
         count = self.reusable_prefix_length
         if type(count) is not int or not (
-            self.request.revised_input.min_reuse_tokens
+            self.request.revised_input.required_prefix_length
             <= count
             < len(self.request.revised_input.input_token_ids)
         ):
@@ -157,6 +193,8 @@ class _AlignmentRecord:
     request_id: int | None = None
     attached: bool = False
     transfer_drains: list[Callable[[], bool]] = field(default_factory=list)
+    source_only: bool = False
+    source_released: bool = False
 
 
 class WorkerAlignmentState:
@@ -186,7 +224,13 @@ class WorkerAlignmentState:
         self._wake_pending = False
         self._unsafe_error: AlignmentSafetyError | None = None
 
-    def observe(self, version: ExecutionVersion, request: AlignmentRequest | None) -> None:
+    def observe(
+        self,
+        version: ExecutionVersion,
+        request: AlignmentRequest | None,
+        *,
+        source_only: bool = False,
+    ) -> None:
         """Arm before old cancellation; retries never duplicate a reservation."""
         with self._lock:
             if self._closed:
@@ -196,8 +240,10 @@ class WorkerAlignmentState:
             if previous is not None and version.epoch < previous.epoch:
                 return
             self._current[key] = version
+            if request in self._records and self._records[request].source_only != source_only:
+                raise RuntimeError("ALIGN cannot change its source role")
             if request is not None and request not in self._records:
-                record = _AlignmentRecord(request)
+                record = _AlignmentRecord(request, source_only=source_only)
                 occupied = {
                     (r.revision.successor_version.tenant_id, r.revision.successor_version.scope_id)
                     for r, entry in self._records.items()
@@ -225,7 +271,7 @@ class WorkerAlignmentState:
             record = self._records.get(request)
             if self._closed or not self._is_current(request) or record is None:
                 raise RuntimeError("ALIGN copy has no current reservation plan")
-            if record.error is not None or record.resumed:
+            if record.error is not None or record.resumed or record.source_released:
                 raise RuntimeError("ALIGN copy cannot extend a failed or resumed plan")
             record.transfer_drains.append(drained)
 
@@ -253,7 +299,7 @@ class WorkerAlignmentState:
                         record.reservation = reservation
                         count = reservation.num_tokens
                         if (
-                            not request.revised_input.min_reuse_tokens
+                            not request.revised_input.required_prefix_length
                             <= count
                             < len(request.revised_input.input_token_ids)
                         ):
@@ -268,7 +314,12 @@ class WorkerAlignmentState:
                         # partial ownership until the engine can close it below.
                         record.error = error
             for request, record in list(self._records.items()):
-                if self._closed or not self._is_current(request) or record.error is not None:
+                if (
+                    self._closed
+                    or not self._is_current(request)
+                    or record.error is not None
+                    or record.source_released
+                ):
                     reclaimed = self._reclaim(record)
                     if reclaimed and (self._closed or not self._is_current(request)):
                         del self._records[request]
@@ -322,6 +373,8 @@ class WorkerAlignmentState:
                         "attached": record.attached,
                         "request_id": record.request_id,
                         "failed": record.error is not None,
+                        "source_only": record.source_only,
+                        "source_released": record.source_released,
                     }
                 )
             held = [record for record in records if record["has_reservation"]]
@@ -341,16 +394,32 @@ class WorkerAlignmentState:
                 raise RuntimeError("RESUME does not match the live ALIGN reservation")
             if prefix_length is not None and (
                 type(prefix_length) is not int
-                or not receipt.request.revised_input.min_reuse_tokens
+                or not receipt.request.revised_input.required_prefix_length
                 <= prefix_length
                 <= receipt.reusable_prefix_length
             ):
                 raise ValueError("RESUME prefix is not covered by this reservation")
             record = self._records[receipt.request]
+            if record.source_only:
+                raise RuntimeError("a prefix source cannot RESUME successor execution")
             if record.resumed and record.resume_prefix_length != prefix_length:
                 raise RuntimeError("RESUME cannot change the agreed prefix")
             record.resume_prefix_length = prefix_length
             record.resumed = True
+
+    def release_source(self, request: AlignmentRequest) -> None:
+        """Retire a source hold after global copy acceptance; cleanup stays on the engine.
+
+        Keep its receipt for idempotent publication retries. It describes an
+        already accepted copy after release, never permission to start another.
+        """
+        with self._lock:
+            receipt = self.poll(request)
+            record = self._records.get(request)
+            if receipt is None or record is None or not record.source_only:
+                raise RuntimeError("source release requires its prepared ALIGN hold")
+            record.source_released = True
+            self.wake_reclaim()
 
     def _record_for_version(self, version: ExecutionVersion) -> _AlignmentRecord | None:
         # Callers hold the state lock. Initial versions have no alignment record.

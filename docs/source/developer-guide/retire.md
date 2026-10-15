@@ -393,7 +393,8 @@ be supplied to a deferred `controller.align(revision, revised)` call.
 Every member still receives ADVANCE, revokes old work, and contributes to FENCE.
 An outstanding transfer at the old placement therefore keeps FENCE and ALIGN
 pending even if the destination already has its prefix. Only the destination
-reserves KV and admits the successor after all publication acknowledgements.
+reserves KV, unless the runtime also names a transfer source as described below,
+and admits the successor after all publication acknowledgements.
 Other workers record the current epoch with execution disabled. Their request
 admission, host commits and early-exit observations remain closed for that epoch;
 matching old completion evidence can still retire resources. ADVANCE without
@@ -411,6 +412,48 @@ Transferred bytes still need content/layout validation and physical retirement
 proof before disaggregated RETIRE can be enabled. Host/IPC tests cover destination
 selection, rank agreement, global FENCE, disabled non-destinations, partial failure
 and retargeting. Real-model and transfer qualification remain required.
+
+### Retaining a prefix at a different source
+
+The runtime can add a `PrefixTransferPlan` to the revised input:
+
+```python
+from tensorrt_llm.execution_alignment import PrefixTransferPlan
+
+revised = AlignmentInput(
+    tuple(revised_tokens),
+    cache_salt="conversation-123",
+    destination=members[1].placement,
+    transfer=PrefixTransferPlan(source=members[0].placement, num_tokens=1024),
+)
+```
+
+Both placements must belong to the prepared authority cohort. The prefix must
+cover `min_reuse_tokens` and leave the last input token to recompute. Source,
+destination, prefix length and revised input are fixed for this revision; a
+change requires a new epoch.
+
+The source receives ALIGN with execution disabled. Its engine retains a real
+cache reservation before dropping the old request's hold. After global FENCE,
+that source can obtain send permits for the planned prefix; the destination can
+obtain receive permits for the same prefix. Neither permit allows generation.
+An ordinary cache hit cannot satisfy the transfer plan: every source and
+destination rank must complete and explicitly accept its copy before global
+ALIGN returns. A source acquisition failure is reported even when no copy has
+started or another endpoint is still pending.
+
+RESUME opens execution only at the destination and retires the source hold at an
+engine safe point. The source retains its acceptance receipt for lost-ACK
+retries, but cannot start another copy or execute the successor. A revision
+during transfer closes admission while keeping the hold until physical cleanup.
+The destination keeps its hold until the successor acquires the promised prefix.
+
+This implements control routing and source retention, not destination import.
+The current cache adapters reserve existing prefixes; a cold destination still
+fails acquisition. Runtime staging allocation, page selection, transport setup
+and validated cache attachment remain required before enabling this path in
+disaggregated serving. Local, IPC and nested collective tests use reservation
+fixtures and are not GPU transfer qualification.
 
 ### Coordinating model execution
 
@@ -861,9 +904,10 @@ Contradictory evidence after acceptance closes the worker's authority.
 These claims account for resource lifetime; they do not publish authority or
 prove the contents of transferred memory. End-to-end disaggregated RETIRE still
 needs runtime wiring of shared authority and cache context across prefill and
-decode, source/destination KV holds, a copy plan and the engine callback that
-validates and attaches the received prefix. The permit API does not supply those
-pieces or turn a cache lookup count into HBM evidence. Physical retirement must
+decode, destination staging ownership, physical page selection and the engine
+callback that validates and attaches the received prefix. `PrefixTransferPlan`
+routes source retention and acceptance; it does not supply those engine pieces
+or turn a cache lookup count into HBM evidence. Physical retirement must
 be qualified for each supported layout and transport. Device guards continue to
 reject transfer and connector configurations until those paths are integrated
 and qualified.

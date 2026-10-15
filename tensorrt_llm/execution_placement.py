@@ -16,13 +16,29 @@ __all__ = ["PlacementPublicationTransport", "placement_update"]
 
 
 def placement_update(update: VersionUpdate, placement: ExecutionPlacement) -> VersionUpdate:
-    """A non-destination observes the new epoch but cannot reserve or execute its work."""
+    """Only the destination executes; a selected source can retain and send its prefix."""
     request = update.alignment
     destination = None if request is None else request.revised_input.destination
     if destination is None or destination == placement:
         return update
+    transfer = request.revised_input.transfer
+    if transfer is not None and transfer.source == placement:
+        return replace(
+            update,
+            resume=None,
+            resume_prefix_length=None,
+            admit_requests=False,
+            source_only=True,
+            release_source=update.release_source or update.resume is not None,
+        )
     return replace(
-        update, alignment=None, resume=None, resume_prefix_length=None, admit_requests=False
+        update,
+        alignment=None,
+        resume=None,
+        resume_prefix_length=None,
+        admit_requests=False,
+        source_only=False,
+        release_source=False,
     )
 
 
@@ -30,14 +46,15 @@ def placement_update(update: VersionUpdate, placement: ExecutionPlacement) -> Ve
 class _PlacementAlignment:
     receipt: AlignmentReceipt
     local: AlignmentReceipt
+    source: AlignmentReceipt | None = None
 
 
 class PlacementPublicationTransport(CollectivePublicationTransport):
     """Select a whole frontend group, never an individual rank within that group.
 
     Every participant still receives authority and contributes to FENCE. ALIGN
-    reserves only at its explicit destination, whose child collective enforces
-    the common prefix across its TP/PP ranks. Untargeted input retains the normal
+    reserves at its destination and optional transfer source. Each child
+    collective enforces its prefix across its TP/PP ranks. Untargeted input retains the normal
     all-placement common-prefix behavior. The publisher thread owns this object.
     """
 
@@ -69,6 +86,15 @@ class PlacementPublicationTransport(CollectivePublicationTransport):
         except KeyError as error:
             raise ValueError("ALIGN destination is not in this frontend cohort") from error
 
+    def _source(self, request: AlignmentRequest) -> PublicationTransport | None:
+        plan = request.revised_input.transfer
+        if plan is None:
+            return None
+        try:
+            return self._transport_by_placement[plan.source]
+        except KeyError as error:
+            raise ValueError("ALIGN source is not in this frontend cohort") from error
+
     def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
         self._require_open(stop)
         key = (update.version.tenant_id, update.version.scope_id)
@@ -80,6 +106,8 @@ class PlacementPublicationTransport(CollectivePublicationTransport):
             del self._routed_alignments[key]
             aligned = None
         destination = None if update.alignment is None else self._destination(update.alignment)
+        if update.alignment is not None:
+            self._source(update.alignment)
         if destination is None:
             return super().publish(update, stop)
         local = update
@@ -110,23 +138,36 @@ class PlacementPublicationTransport(CollectivePublicationTransport):
         if destination is None:
             return super().poll_alignment(request, stop)
         fence = self.poll_fence(FenceRequest(request.session_id, request.revision), stop)
-        local = destination.poll_alignment(request, stop)
-        if local is not None and (
-            not isinstance(local, AlignmentReceipt) or local.request != request
-        ):
-            raise ValueError("destination acknowledgement does not match ALIGN")
+        source = self._source(request)
+
+        def poll_one(transport: PublicationTransport) -> AlignmentReceipt | None:
+            if transport is not destination and transport is not source:
+                return None
+            receipt = transport.poll_alignment(request, stop)
+            if receipt is not None and (
+                not isinstance(receipt, AlignmentReceipt) or receipt.request != request
+            ):
+                raise ValueError("endpoint acknowledgement does not match ALIGN")
+            return receipt
+
+        if source is None:
+            local, source_receipt = poll_one(destination), None
+        else:
+            receipts = self._call_all("source/destination ALIGN", poll_one, stop)
+            by_transport = dict(zip(map(id, self._transports), receipts))
+            local, source_receipt = by_transport[id(destination)], by_transport[id(source)]
         self._require_open(stop)
-        if fence is None or local is None:
+        if fence is None or local is None or (source is not None and source_receipt is None):
             return None
         version = request.revision.successor_version
         key = (version.tenant_id, version.scope_id)
         previous = self._routed_alignments.get(key)
         if previous is not None and previous.receipt.request == request:
-            if previous.local != local:
+            if previous.local != local or previous.source != source_receipt:
                 raise RuntimeError("destination reservation changed after ALIGN")
             return previous.receipt
         receipt = AlignmentReceipt(request, uuid4().hex, local.reusable_prefix_length)
-        self._routed_alignments[key] = _PlacementAlignment(receipt, local)
+        self._routed_alignments[key] = _PlacementAlignment(receipt, local, source_receipt)
         return receipt
 
     def close(self) -> None:

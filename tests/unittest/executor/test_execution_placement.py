@@ -198,3 +198,389 @@ def test_routing_cannot_turn_a_retired_member_into_a_resume_recipient(cluster):
     assert routed.version == update.version and routed.sequence == update.sequence
     with pytest.raises(ValueError):
         replace(update, admit_requests=False)
+
+
+@pytest.fixture(params=["local", "ipc", "tp2"])
+def copy_cluster(request):
+    from tensorrt_llm.execution_alignment import PrefixTransferPlan
+    from tensorrt_llm.execution_collective import CollectivePublicationTransport
+    from tensorrt_llm.executor.execution_mailbox import (
+        ExecutionMailboxServer,
+        IpcPublicationTransport,
+    )
+
+    groups, servers = [], []
+    children = []
+    ranks = 2 if request.param == "tp2" else 1
+    for _ in PLACEMENTS:
+        tables = [WorkerVersionTable("session") for _ in range(ranks)]
+        endpoints = []
+        for table in tables:
+            table.drain_tracker = RequestDrainTracker()
+            table.alignment_state = WorkerAlignmentState(
+                Mock(side_effect=lambda _: Mock(num_tokens=3)), Mock()
+            )
+            if request.param == "ipc":
+                server = ExecutionMailboxServer(table)
+                servers.append(server)
+                endpoints.append(IpcPublicationTransport(server.address))
+            else:
+                endpoints.append(LocalPublicationTransport(table))
+        participants = tuple(ExecutionParticipant(i, 0) for i in range(ranks))
+        child = CollectivePublicationTransport(participants, dict(zip(participants, endpoints)))
+        children.append(Mock(wraps=child))
+        groups.append(tables)
+    participants = tuple(ExecutionParticipant(0, 0, i) for i in range(2))
+    transport = PlacementPublicationTransport(
+        participants, dict(zip(participants, children)), dict(zip(participants, PLACEMENTS))
+    )
+    controller = ExecutionController("session", transport, placements=frozenset(PLACEMENTS))
+    revised = replace(INPUT, transfer=PrefixTransferPlan(PLACEMENTS[0], 3))
+    yield SimpleNamespace(
+        groups=groups,
+        children=children,
+        controller=controller,
+        transport=transport,
+        revised=revised,
+    )
+    controller.close()
+    for server in servers:
+        server.close()
+    for group in groups:
+        for table in group:
+            for permit in table._alignment_transfers:
+                if table.drain_tracker.has_resource(permit.claim):
+                    table.drain_tracker.release_resource(permit.claim)
+            table.close()
+            if table.alignment_state._unsafe_error is None:
+                table.alignment_state.process()
+
+
+def start_copy(cluster):
+    cluster.controller.register(OLD).wait()
+    result = cluster.controller.advance(REVISION, alignment=cluster.revised)
+    result.publication.wait()
+    for group in cluster.groups:
+        for table in group:
+            table.alignment_state.process()
+    return result
+
+
+def prepare_copies(cluster, result):
+    fence = result.fence.wait()
+    permits = []
+    for index, group in enumerate(cluster.groups):
+        for table in group:
+            permit = table.admit_alignment_transfer(
+                result.alignment.request,
+                fence,
+                request_id=7,
+                transfer_id=99,
+                direction="send" if index == 0 else "receive",
+                prefix_length=3,
+            )
+            permits.append((table, permit))
+    return permits
+
+
+def accept_copies(permits):
+    for table, permit in permits:
+        table.drain_tracker.release_resource(permit.claim)
+        table.accept_alignment_transfer(permit)
+
+
+def test_source_copy_role_keeps_hold_without_generation_and_reclaims_after_resume(copy_cluster):
+    c = copy_cluster
+    result = start_copy(c)
+    with pytest.raises(TimeoutError):
+        result.alignment.wait(0.01)  # A pre-existing prefix is not copy acceptance.
+    for group in c.groups:
+        for table in group:
+            assert table.alignment_state.snapshot()["held_count"] == 1
+            with pytest.raises(ExecutionAuthorityError):
+                with table.admission(NEW):
+                    pytest.fail("pending copy admitted generation")
+    permits = prepare_copies(c, result)
+    accept_copies(permits)
+    receipt = result.alignment.wait()
+    c.controller.resume(receipt).wait()
+    for source in c.groups[0]:
+        with pytest.raises(ExecutionAuthorityError):
+            with source.admission(NEW):
+                pytest.fail("source received successor authority")
+        source.alignment_state.process()
+        assert source.alignment_state.snapshot()["held_count"] == 0
+        assert source.poll_alignment(receipt.request) is not None
+        with pytest.raises(ExecutionAuthorityError, match="RESUME"):
+            source.admit_alignment_transfer(
+                receipt.request,
+                result.fence.wait(),
+                request_id=7,
+                transfer_id=100,
+                direction="send",
+                prefix_length=3,
+            )
+    for destination in c.groups[1]:
+        assert destination.alignment_state.snapshot()["held_count"] == 1
+        with destination.admission(NEW) as execution:
+            execution.finish()
+        destination.alignment_state.claim(NEW, 9, INPUT.input_token_ids, None, None)
+        destination.alignment_state.confirm_attachment(NEW, 9, 3)
+        assert destination.alignment_state.snapshot()["held_count"] == 0
+
+
+def test_source_hold_is_armed_before_old_owner_release(copy_cluster):
+    c = copy_cluster
+    c.controller.register(OLD).wait()
+    source = c.groups[0][0]
+    source.drain_tracker.enqueue(OLD, lambda: 7)
+    result = c.controller.advance(REVISION, alignment=c.revised)
+    result.publication.wait()
+    source.alignment_state._reserve.assert_not_called()
+    with source.alignment_state.releasing_owner():
+        source.alignment_state._reserve.assert_called_once_with(c.revised)
+        source.drain_tracker.complete(7, OLD)
+    assert source.alignment_state.snapshot()["held_count"] == 1
+    result.fence.wait()
+
+
+@pytest.mark.parametrize("endpoint", [0, 1])
+def test_copy_plan_rejects_wrong_endpoint_direction(copy_cluster, endpoint):
+    result = start_copy(copy_cluster)
+    table = copy_cluster.groups[endpoint][0]
+    with pytest.raises(ValueError, match="endpoint"):
+        table.admit_alignment_transfer(
+            result.alignment.request,
+            result.fence.wait(),
+            request_id=7,
+            transfer_id=99,
+            direction="receive" if endpoint == 0 else "send",
+            prefix_length=3,
+        )
+    assert not table.drain_tracker._resources
+
+
+@pytest.mark.parametrize("length", [1, 2, 4])
+def test_copy_plan_rejects_another_prefix_length(copy_cluster, length):
+    result = start_copy(copy_cluster)
+    source = copy_cluster.groups[0][0]
+    with pytest.raises(ValueError, match="endpoint"):
+        source.admit_alignment_transfer(
+            result.alignment.request,
+            result.fence.wait(),
+            request_id=7,
+            transfer_id=99,
+            direction="send",
+            prefix_length=length,
+        )
+    assert not source.drain_tracker._resources
+
+
+@pytest.mark.parametrize("missing_endpoint", [0, 1])
+def test_global_alignment_waits_for_every_endpoint_copy_acceptance(copy_cluster, missing_endpoint):
+    result = start_copy(copy_cluster)
+    permits = prepare_copies(copy_cluster, result)
+    missing_table = copy_cluster.groups[missing_endpoint][-1]
+    accept_copies([(t, p) for t, p in permits if t is not missing_table])
+    with pytest.raises(TimeoutError):
+        result.alignment.wait(0.01)
+    accept_copies([(t, p) for t, p in permits if t is missing_table])
+    assert result.alignment.wait().reusable_prefix_length == 3
+
+
+def test_source_release_cannot_substitute_for_copy_completion(copy_cluster):
+    result = start_copy(copy_cluster)
+    prepare_copies(copy_cluster, result)
+    source = copy_cluster.groups[0][0]
+    with pytest.raises(RuntimeError, match="completed ALIGN"):
+        source.apply(
+            VersionUpdate(
+                "session",
+                3,
+                NEW,
+                result.alignment.request,
+                admit_requests=False,
+                source_only=True,
+                release_source=True,
+            )
+        )
+    source.alignment_state.process()
+    assert source.alignment_state.snapshot()["held_count"] == 1
+
+
+def test_supersession_retains_source_memory_until_physical_copy_drains(copy_cluster):
+    c = copy_cluster
+    result = start_copy(c)
+    permits = prepare_copies(c, result)
+    second = c.controller.advance(Revision("second", NEW, replace(NEW, epoch=2)))
+    second.publication.wait()
+    for group in c.groups:
+        for table in group:
+            table.alignment_state.process()
+            assert table.alignment_state.snapshot()["held_count"] == 1
+    with pytest.raises(TimeoutError):
+        second.fence.wait(0.01)
+    for table, permit in permits:
+        table.drain_tracker.release_resource(permit.claim)
+        table.alignment_state.process()
+        assert table.alignment_state.snapshot()["held_count"] == 0
+        with pytest.raises(ExecutionAuthorityError):
+            table.accept_alignment_transfer(permit)
+    second.fence.wait()
+
+
+@pytest.mark.parametrize("lost_endpoint", [0, 1])
+def test_lost_resume_ack_retry_preserves_source_release_and_destination_authority(
+    copy_cluster, lost_endpoint
+):
+    c = copy_cluster
+    result = start_copy(c)
+    accept_copies(prepare_copies(c, result))
+    receipt = result.alignment.wait()
+    child = c.children[lost_endpoint]
+    original = child._mock_wraps.publish
+
+    def lost_ack(update, stop):
+        original(update, stop)
+        for table in c.groups[lost_endpoint]:
+            table.alignment_state.process()
+        raise TimeoutError("lost resume ACK")
+
+    child.publish.side_effect = lost_ack
+    with pytest.raises(RuntimeError, match="placement publication"):
+        c.controller.resume(receipt).wait()
+    with pytest.raises(ExecutionAuthorityError):
+        with c.controller.admission(NEW, placement=PLACEMENTS[1]):
+            pytest.fail("lost acknowledgement opened frontend")
+    child.publish.side_effect = None
+    c.controller.resume(receipt).wait()
+    with c.controller.admission(NEW, placement=PLACEMENTS[1]) as execution:
+        pass
+    execution.finish()
+    for source in c.groups[0]:
+        source.alignment_state.process()
+        assert source.alignment_state.snapshot()["held_count"] == 0
+        assert source.observe_allowed((NEW,)) == (False,)
+
+
+def test_source_routing_is_idempotent_and_observers_do_not_acquire_copy_roles():
+    from tensorrt_llm.execution_alignment import AlignmentReceipt, PrefixTransferPlan
+
+    revised = replace(INPUT, transfer=PrefixTransferPlan(PLACEMENTS[0], 3))
+    request = AlignmentRequest("session", REVISION, revised)
+    for resume in (None, AlignmentReceipt(request, "ready", 3)):
+        update = VersionUpdate(
+            "session", 3, NEW, request, resume, admit_requests=resume is not None
+        )
+        source = placement_update(update, PLACEMENTS[0])
+        assert source.source_only and source.release_source == (resume is not None)
+        assert not source.admit_requests and source.resume is None
+        assert placement_update(source, PLACEMENTS[0]) == source
+        observer = placement_update(update, ExecutionPlacement("session", "observer"))
+        assert (
+            observer.alignment is None and not observer.source_only and not observer.admit_requests
+        )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "absent_destination",
+        "same_endpoint",
+        "foreign_session",
+        "short_prefix",
+        "full_input",
+        "bool_length",
+        "foreign_type",
+    ],
+)
+def test_invalid_prefix_transfer_plan_is_rejected(change):
+    from tensorrt_llm.execution_alignment import PrefixTransferPlan
+
+    kwargs = dict(transfer=PrefixTransferPlan(PLACEMENTS[0], 3))
+    if change == "absent_destination":
+        kwargs["destination"] = None
+    elif change == "same_endpoint":
+        kwargs["destination"] = PLACEMENTS[0]
+    elif change == "foreign_session":
+        kwargs["transfer"] = PrefixTransferPlan(ExecutionPlacement("foreign", "source"), 3)
+    elif change == "short_prefix":
+        kwargs["transfer"] = PrefixTransferPlan(PLACEMENTS[0], 2)
+    elif change == "full_input":
+        kwargs["transfer"] = PrefixTransferPlan(PLACEMENTS[0], 5)
+    elif change == "foreign_type":
+        kwargs["transfer"] = "source"
+    else:
+        with pytest.raises(ValueError):
+            PrefixTransferPlan(PLACEMENTS[0], True)
+        return
+    with pytest.raises((ValueError, TypeError)):
+        replace(INPUT, **kwargs)
+
+
+def test_source_must_be_in_prepared_runtime_cohort(cluster):
+    from tensorrt_llm.execution_alignment import PrefixTransferPlan
+
+    cluster.controller.register(OLD).wait()
+    revised = replace(
+        INPUT, transfer=PrefixTransferPlan(ExecutionPlacement("session", "unknown"), 3)
+    )
+    with pytest.raises(ValueError, match="source is not a member"):
+        cluster.controller.advance(REVISION, alignment=revised)
+    assert cluster.controller.snapshot("tenant", "scope").current_version == OLD
+
+
+def test_source_copy_cannot_start_before_engine_acquires_the_hold(copy_cluster):
+    c = copy_cluster
+    c.controller.register(OLD).wait()
+    result = c.controller.advance(REVISION, alignment=c.revised)
+    result.publication.wait()
+    source = c.groups[0][0]
+    with pytest.raises(RuntimeError, match="prepared source"):
+        source.admit_alignment_transfer(
+            result.alignment.request,
+            result.fence.wait(),
+            request_id=7,
+            transfer_id=99,
+            direction="send",
+            prefix_length=3,
+        )
+    assert not source.drain_tracker._resources
+
+
+def test_failed_source_reservation_does_not_wait_forever_for_copy_acceptance(copy_cluster):
+    c = copy_cluster
+    c.groups[0][0].alignment_state._reserve.side_effect = RuntimeError("source cache unavailable")
+    result = start_copy(c)
+    with pytest.raises(RuntimeError, match="source/destination ALIGN"):
+        result.alignment.wait()
+    for child in c.children:
+        child.poll_alignment.assert_called()
+
+
+def test_changed_source_receipt_prevents_global_resume(copy_cluster):
+    c = copy_cluster
+    result = start_copy(c)
+    accept_copies(prepare_copies(c, result))
+    receipt = result.alignment.wait()
+    child = c.children[0]
+    original = child.poll_alignment(receipt.request, Event())
+    child.poll_alignment.return_value = replace(original, reservation_id="another-source-hold")
+    with pytest.raises(RuntimeError, match="reservation changed"):
+        c.controller.resume(receipt).wait()
+    for source in c.groups[0]:
+        assert source.alignment_state.snapshot()["held_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "changes", [dict(admit_requests=True), dict(source_only=False, release_source=True)]
+)
+def test_source_control_publication_cannot_enable_generation(changes):
+    from tensorrt_llm.execution_alignment import PrefixTransferPlan
+
+    request = AlignmentRequest(
+        "session", REVISION, replace(INPUT, transfer=PrefixTransferPlan(PLACEMENTS[0], 3))
+    )
+    update = VersionUpdate("session", 2, NEW, request, admit_requests=False, source_only=True)
+    with pytest.raises(ValueError):
+        replace(update, **changes)

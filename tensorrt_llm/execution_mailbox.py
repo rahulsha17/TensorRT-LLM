@@ -74,6 +74,10 @@ class VersionUpdate:
         admit_requests: Whether this worker may execute this version. Pending
             revisions and non-destination placements still observe authority and
             drain old work, without permission to admit or commit successor work.
+        source_only: Retain the selected prefix at a source placement without
+            granting successor execution authority.
+        release_source: Global ALIGN completed; retire the source hold without
+            granting RESUME. Physical cleanup still belongs to the engine.
     """
 
     session_id: str
@@ -83,10 +87,14 @@ class VersionUpdate:
     resume: AlignmentReceipt | None = None
     resume_prefix_length: int | None = None
     admit_requests: bool = True
+    source_only: bool = False
+    release_source: bool = False
 
     def __post_init__(self) -> None:
         if type(self.admit_requests) is not bool:
             raise TypeError("admit_requests must be a bool")
+        if type(self.source_only) is not bool or type(self.release_source) is not bool:
+            raise TypeError("source permissions must be bools")
         if self.resume is not None and not self.admit_requests:
             raise ValueError("RESUME must enable execution at its destination")
         if not isinstance(self.session_id, str) or not self.session_id:
@@ -108,11 +116,20 @@ class VersionUpdate:
         if self.resume_prefix_length is not None and (
             self.resume is None
             or type(self.resume_prefix_length) is not int
-            or not self.resume.request.revised_input.min_reuse_tokens
+            or not self.resume.request.revised_input.required_prefix_length
             <= self.resume_prefix_length
             <= self.resume.reusable_prefix_length
         ):
             raise ValueError("RESUME prefix must be covered by the live reservation")
+        if self.source_only and (
+            self.alignment is None
+            or self.alignment.revised_input.transfer is None
+            or self.admit_requests
+            or self.resume is not None
+        ):
+            raise ValueError("source publication requires a non-generating transfer plan")
+        if self.release_source and not self.source_only:
+            raise ValueError("only a prefix source can release its hold")
 
 
 @dataclass(frozen=True)
@@ -262,6 +279,13 @@ class WorkerVersionTable:
                 raise RuntimeError("alignment was superseded")
             if self.alignment_state is None:
                 raise RuntimeError("worker does not support ALIGN")
+            update = self._versions[(target.tenant_id, target.scope_id)]
+            if update.alignment != request:
+                # A deferred ALIGN query may arrive before its publication.
+                # It cannot acknowledge a plan this worker has not observed.
+                return None
+            receipt = self.alignment_state.poll(request)
+            copies = 0
             for permit, transfer in self._alignment_transfers.items():
                 if permit.request != request:
                     continue
@@ -271,7 +295,9 @@ class WorkerVersionTable:
                     ) from transfer.error
                 if not transfer.accepted or self._alignment_transfer_live(permit, transfer):
                     return None
-            receipt = self.alignment_state.poll(request)
+                copies += 1
+            if request.revised_input.transfer is not None and not copies:
+                return None
             if (
                 receipt is None
                 or self.poll_fence(FenceRequest(self.session_id, request.revision)) is None
@@ -355,8 +381,16 @@ class WorkerVersionTable:
                     raise RuntimeError("RESUME requires the live ALIGN receipt and completed FENCE")
                 assert self.alignment_state is not None
                 self.alignment_state.authorize_resume(update.resume, update.resume_prefix_length)
+            if update.release_source:
+                assert update.alignment is not None
+                if self.poll_alignment(update.alignment) is None:
+                    raise RuntimeError("source release requires completed ALIGN and FENCE")
+                assert self.alignment_state is not None
+                self.alignment_state.release_source(update.alignment)
             if self.alignment_state is not None:
-                self.alignment_state.observe(update.version, update.alignment)
+                self.alignment_state.observe(
+                    update.version, update.alignment, source_only=update.source_only
+                )
             self._versions[key] = update
             with self._observation_lock:
                 self._observed_versions[key] = update.version if update.admit_requests else None
@@ -413,7 +447,7 @@ class WorkerVersionTable:
             finally:
                 execution.finish()
 
-    def _require_alignment_pending(self, request: AlignmentRequest) -> None:
+    def _require_alignment_pending(self, request: AlignmentRequest) -> VersionUpdate:
         self._require_open()
         if not isinstance(request, AlignmentRequest) or request.session_id != self.session_id:
             raise ValueError("ALIGN copy belongs to another authority session")
@@ -421,10 +455,11 @@ class WorkerVersionTable:
         update = self._versions.get((version.tenant_id, version.scope_id))
         if update is None or update.version != version or update.alignment != request:
             raise ExecutionAuthorityError("ALIGN copy requires the current published input")
-        if update.resume is not None:
+        if update.resume is not None or update.release_source:
             raise ExecutionAuthorityError("ALIGN copy admission ends at RESUME")
         if self.alignment_state is None or self.drain_tracker is None:
             raise RuntimeError("ALIGN copy requires alignment and physical drain tracking")
+        return update
 
     def _alignment_transfer_live(
         self, permit: AlignmentTransferPermit, transfer: _AlignmentTransfer
@@ -462,11 +497,20 @@ class WorkerVersionTable:
         if direction not in ("send", "receive"):
             raise ValueError("invalid ALIGN copy direction")
         with self._lock:
-            self._require_alignment_pending(request)
+            update = self._require_alignment_pending(request)
             if type(prefix_length) is not int or not 0 < prefix_length < len(
                 request.revised_input.input_token_ids
             ):
                 raise ValueError("ALIGN copy must leave the final input token for computation")
+            plan = request.revised_input.transfer
+            if plan is not None:
+                expected_direction = "send" if update.source_only else "receive"
+                if direction != expected_direction or prefix_length != plan.num_tokens:
+                    raise ValueError("ALIGN copy does not match this endpoint's transfer plan")
+                if update.source_only:
+                    assert self.alignment_state is not None
+                    if self.alignment_state.poll(request) is None:
+                        raise RuntimeError("ALIGN copy requires the prepared source hold")
             expected = FenceReceipt(FenceRequest(self.session_id, request.revision))
             if (
                 not isinstance(fence, FenceReceipt)
@@ -830,6 +874,12 @@ class ExecutionController:
             and alignment.destination not in self._placements
         ):
             raise ValueError("ALIGN destination is not a member of this authority")
+        if (
+            alignment is not None
+            and alignment.transfer is not None
+            and alignment.transfer.source not in self._placements
+        ):
+            raise ValueError("ALIGN source is not a member of this authority")
 
     def snapshot(self, tenant_id: str, scope_id: str) -> ScopeSnapshot:
         """Read accepted authority, including when publication has failed."""
