@@ -962,7 +962,12 @@ def run_backend(
                 max_num_tokens=case.max_num_tokens,
                 kv_cache_manager=mgr,
                 request_ids=request_ids,
-                prompt_lens=case.seq_lens if case.is_cross else case.token_nums,
+                # Context rows append only this chunk; cached tokens belong
+                # to the KV length, not to the query/context length.
+                prompt_lens=[
+                    case.seq_lens[i] if case.is_cross or i < num_contexts else case.token_nums[i]
+                    for i in range(case.num_seqs)
+                ],
                 kv_layout=kv_layout,
             )
 

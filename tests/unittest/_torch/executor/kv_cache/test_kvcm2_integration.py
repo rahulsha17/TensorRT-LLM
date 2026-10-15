@@ -1401,6 +1401,7 @@ def test_retire_recovers_completed_context_before_stopping_native_cache() -> Non
 def test_retire_native_decode_commit_survives_owner_close(prompt_length, frontier) -> None:
     from tensorrt_llm.execution_version import ExecutionVersion
 
+    torch.empty(1, device="cuda")
     core = KVCacheManager(
         KVCacheManagerConfig(
             tokens_per_block=4,

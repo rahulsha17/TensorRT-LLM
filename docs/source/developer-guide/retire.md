@@ -795,6 +795,13 @@ Captured graphs require stable addresses, with row identities refreshed before
 each replay. Existing cubins without the authority ABI cannot serve a guarded
 call. Rebuild native libraries and bindings together.
 
+When reusing a build directory, pass `--generate_fmha` to
+`scripts/build_wheel.py`. The FMHA generation stamp records completion, not
+the generator's source revision. Without regeneration, a new wheel can retain
+an older dispatch table that selects unguarded head-size-128 cubins. Keep the
+operator gate enabled: a wheel's source commit alone does not verify its
+generated kernels.
+
 Enable executor binding before constructing the LLM:
 
 ```bash

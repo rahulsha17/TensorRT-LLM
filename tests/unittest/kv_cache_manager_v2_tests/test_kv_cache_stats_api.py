@@ -109,7 +109,9 @@ def test_prefix_residency_observes_offload_without_restoring() -> None:
     manager = KVCacheManager(config)
     cache = None
     stream = torch.cuda.Stream()
-    tokens = list(range(2048))
+    # GPU quotas round up to the allocator's physical chunk size. A 4 MiB
+    # prefix exceeds the rounded 2 MiB tier after the shrink below.
+    tokens = list(range(4096))
     try:
         cache = manager.create_kv_cache(None, tokens)
         assert cache.resume(stream.cuda_stream)
@@ -123,6 +125,7 @@ def test_prefix_residency_observes_offload_without_restoring() -> None:
 
         # Keep the prefix owned while forcing real migration out of HBM.
         assert manager.resize(GPU_LEVEL, 1 << 20)
+        assert manager.get_quota(GPU_LEVEL) < len(tokens) // config.tokens_per_block * 4096
         torch.cuda.synchronize()
         before = manager.get_committed_stats()
         offloaded = manager.probe_reuse_residency(None, tokens)
