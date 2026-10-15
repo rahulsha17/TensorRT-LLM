@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from ..execution_alignment import AlignmentInput, AlignmentReceipt, AlignmentRequest
 from ..execution_authority import Revision
-from ..execution_collective import CollectivePublicationTransport, ExecutionParticipant
+from ..execution_collective import ExecutionParticipant
 from ..execution_fence import FenceReceipt, FenceRequest
 from ..execution_gate import ExecutionAuthorityError
 from ..execution_mailbox import (
@@ -21,6 +21,7 @@ from ..execution_mailbox import (
     VersionPublication,
     VersionUpdate,
 )
+from ..execution_placement import PlacementPublicationTransport, placement_update
 from ..execution_version import ExecutionVersion
 from .execution_frontend_ipc import FrontendAuthorityClient, _timeout
 from .execution_member import ExecutionMemberEndpoint, MemberPublicationClient
@@ -51,6 +52,7 @@ class _FrontendCohort:
     def __init__(
         self, members: tuple[ExecutionMemberEndpoint, ...], owner: str, timeout: float, lease: float
     ) -> None:
+        self.placements = tuple(member.placement for member in members)
         self.clients = tuple(
             FrontendAuthorityClient(m.host, owner, timeout=timeout) for m in members
         )
@@ -100,13 +102,20 @@ class _FrontendCohort:
         self._call("host seal", tuple(lambda c=c: c.seal(revision) for c in self.clients))
 
     def acknowledge(self, update: VersionUpdate) -> None:
-        self._call("host observation", tuple(lambda c=c: c.observe(update) for c in self.clients))
+        local = tuple(placement_update(update, p) for p in self.placements)
+        self._call(
+            "host observation",
+            tuple(lambda c=c, u=u: c.observe(u) for c, u in zip(self.clients, local)),
+        )
         with self._lock:
             initial = self._initial.get((update.version.tenant_id, update.version.scope_id))
-        if update.resume is not None or update.version == initial:
-            opened = self._call(
-                "host activation", tuple(lambda c=c: c.activate(update) for c in self.clients)
-            )
+        activations = tuple(
+            lambda c=c, u=u: c.activate(u)
+            for c, u in zip(self.clients, local)
+            if u.admit_requests and (u.resume is not None or u.version == initial)
+        )
+        if activations:
+            opened = self._call("host activation", activations)
             if not all(opened):
                 # A concurrent newer seal may legitimately overtake publication.
                 # No stale activation can reopen a sealed frontend.
@@ -187,7 +196,7 @@ class _RemoteExecutionController(ExecutionController):
     ) -> None:
         self._transitions = Lock()
         self._frontends = frontends
-        super().__init__(session, transport)
+        super().__init__(session, transport, placements=frozenset(frontends.placements))
 
     def register(self, version: ExecutionVersion) -> VersionPublication:
         if not isinstance(version, ExecutionVersion):
@@ -211,8 +220,7 @@ class _RemoteExecutionController(ExecutionController):
         with self._transitions:
             with self._lock:
                 self._require_open()
-                if alignment is not None and not isinstance(alignment, AlignmentInput):
-                    raise TypeError("alignment must be an AlignmentInput or None")
+                self._validate_alignment(alignment)
                 previous = self._registry.check_advance(revision)
                 if (
                     revision in self._alignment_inputs
@@ -256,7 +264,9 @@ def create_remote_execution_controller(
 
     Partial host/control failure closes this authority. Recovery requires a new
     runtime session and normal worker teardown; a host lease cannot prove GPU
-    drain. Common-prefix ALIGN still requires local reservations on every worker.
+    drain. Untargeted ALIGN requires local reservations on every worker. An
+    AlignmentInput.destination selects one member.placement; only that frontend
+    activates the successor, after every member acknowledges publication/FENCE.
     This does not enable disaggregated transfers or remove device/topology guards.
     """
     timeout, lease_seconds = _timeout(timeout), _timeout(lease_seconds)
@@ -291,7 +301,11 @@ def create_remote_execution_controller(
         if len(set(workers)) != len(workers):
             raise ValueError("remote authority contains a repeated worker table")
         participants = tuple(ExecutionParticipant(0, 0, group) for group in range(len(clients)))
-        publication = CollectivePublicationTransport(participants, dict(zip(participants, clients)))
+        publication = PlacementPublicationTransport(
+            participants,
+            dict(zip(participants, clients)),
+            dict(zip(participants, frontends.placements)),
+        )
         controller = _RemoteExecutionController(
             session, _RemotePublicationTransport(publication, frontends), frontends
         )

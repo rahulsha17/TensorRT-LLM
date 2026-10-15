@@ -288,9 +288,10 @@ closing authority alone does not prove that GPU or transfer access has ended.
 
 This supplies a common owner for separate placements, but does not yet enable
 disaggregated RETIRE. Existing transfer and connector guards remain in place.
-ALIGN currently reserves on every member and uses the shortest common prefix.
-Destination-specific ALIGN, version-bound transfer messages and transfer
-qualification are still required before prefill/decode transfer can be enabled.
+Untargeted ALIGN reserves on every member and uses the shortest common prefix.
+A destination can instead select one prepared placement, as described below.
+Transferred-content validation and physical transfer qualification are still
+required before prefill/decode transfer can be enabled.
 For frontends in separate runtime processes, use the external owner described
 below. Independent local controllers with matching epochs are separate authorities.
 
@@ -360,10 +361,56 @@ waiting for its lease is not proof of safe physical reclamation.
 
 The control path is tested over real IPC and separately spawned processes with
 worker version tables, drain tracking and ALIGN reservations. It preserves the
-existing supported executor topologies. Common-prefix ALIGN still reserves on
-every worker; destination-specific transfer remains separate work. Existing
-transfer and connector guards remain enabled. Host tests do not qualify GPU
-execution or disaggregated KV transfer.
+existing supported executor topologies. Existing transfer and connector guards
+remain enabled. Host tests do not qualify GPU execution or disaggregated transfer.
+
+### Choosing where the successor runs
+
+The runtime can choose one frontend as the successor's destination. A placement
+identifies that frontend lifetime and all of its workers; it is separate from a
+scope, execution epoch, request ID and cache salt. Use the identity returned by
+bootstrap, rather than constructing one from a network address or GPU number:
+
+```python
+# The remote runtime already collected the complete set of member descriptors.
+revised = AlignmentInput(
+    tuple(revised_tokens),
+    cache_salt="conversation-123",
+    destination=members[1].placement,
+)
+advanced = controller.advance(revision, alignment=revised)
+advanced.publication.wait()
+advanced.fence.wait()
+aligned = advanced.alignment.wait()
+controller.resume(aligned).wait()
+# Submit the successor through members[1]'s frontend process.
+```
+
+For frontends sharing one runtime process, use `frontend.get_execution_placement()`
+after `create_shared_execution_controller(frontends)`. The destination can also
+be supplied to a deferred `controller.align(revision, revised)` call.
+
+Every member still receives ADVANCE, revokes old work, and contributes to FENCE.
+An outstanding transfer at the old placement therefore keeps FENCE and ALIGN
+pending even if the destination already has its prefix. Only the destination
+reserves KV and admits the successor after all publication acknowledgements.
+Other workers record the current epoch with execution disabled. Their request
+admission, host commits and early-exit observations remain closed for that epoch;
+matching old completion evidence can still retire resources. ADVANCE without
+ALIGN also leaves worker admission disabled until RESUME.
+
+Within the destination, its TP ranks must agree on a common prefix as before.
+Other frontends' cache misses no longer shorten that prefix. Omitting the
+destination retains the all-placement common-prefix behavior. An unknown or
+foreign-session destination is rejected before ADVANCE seals any frontend or
+changes the registry. Retries must keep the same destination; moving a successor
+requires a new epoch. Old ALIGN receipts cannot authorize the new placement.
+
+This selects locally owned KV; it does not copy KV from the old placement.
+Transferred bytes still need content/layout validation and physical retirement
+proof before disaggregated RETIRE can be enabled. Host/IPC tests cover destination
+selection, rank agreement, global FENCE, disabled non-destinations, partial failure
+and retargeting. Real-model and transfer qualification remain required.
 
 ### Coordinating model execution
 

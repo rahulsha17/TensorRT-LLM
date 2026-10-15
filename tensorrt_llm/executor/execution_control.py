@@ -8,6 +8,7 @@ from time import monotonic_ns
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from ..execution_alignment import ExecutionPlacement
 from ..execution_gate import ExecutionAuthorityError, HostExecution
 from ..execution_mailbox import (
     ExecutionController,
@@ -38,6 +39,7 @@ class ExecutionControlMixin:
         self._execution_session_id = uuid4().hex
         self._execution_controller: ExecutionController | None = None
         self._execution_shared = False
+        self._execution_placement: ExecutionPlacement | None = None
         self._execution_version_table: WorkerVersionTable | None = None
         self._execution_mailbox_server: ExecutionMailboxServer | None = None
         self._execution_frontend_gate: FrontendAuthorityGate | None = None
@@ -45,6 +47,16 @@ class ExecutionControlMixin:
         self._execution_member_server: MemberPublicationServer | None = None
         self._execution_member_endpoint: ExecutionMemberEndpoint | None = None
         self._execution_member_bind_host: str | None = None
+
+    def get_execution_placement(self) -> ExecutionPlacement:
+        """Return the immutable destination assigned by shared/remote runtime bootstrap."""
+        with self._execution_control_lock:
+            self._require_execution_control_open()
+            if self._execution_placement is None:
+                raise RuntimeError(
+                    "prepare shared or remote authority before selecting a placement"
+                )
+            return self._execution_placement
 
     def get_execution_controller(self) -> ExecutionController:
         """Get host authority for an explicitly supported executor topology.
@@ -107,6 +119,8 @@ class ExecutionControlMixin:
                     "register execution authority before submitting tagged work"
                 )
             self._execution_submit_started = True
+        if owner is self._execution_controller and self._execution_placement is not None:
+            return owner.admission(version, placement=self._execution_placement)
         return owner.admission(version)
 
     @staticmethod

@@ -5,7 +5,7 @@
 from dataclasses import dataclass
 from threading import Event
 
-from ..execution_alignment import AlignmentReceipt, AlignmentRequest
+from ..execution_alignment import AlignmentReceipt, AlignmentRequest, ExecutionPlacement
 from ..execution_fence import FenceReceipt, FenceRequest
 from ..execution_mailbox import (
     PublicationReceipt,
@@ -39,6 +39,11 @@ class ExecutionMemberEndpoint:
 
     host: FrontendAuthorityEndpoint
     publication: FrontendAuthorityEndpoint
+
+    @property
+    def placement(self) -> ExecutionPlacement:
+        """Destination bound to this authenticated frontend lifetime, without its keys."""
+        return ExecutionPlacement(self.host.identity.session_id, self.host.identity.worker_id)
 
     def __post_init__(self) -> None:
         if not isinstance(self.host, FrontendAuthorityEndpoint) or not isinstance(
@@ -224,6 +229,7 @@ def prepare_execution_member(
             frontend._execution_member_server = member_server
             frontend._execution_member_endpoint = endpoint
             frontend._execution_member_bind_host = bind_host
+            frontend._execution_placement = endpoint.placement
             return endpoint
         except Exception as error:
             frontend._execution_control_error = error

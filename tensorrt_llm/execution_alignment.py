@@ -14,6 +14,7 @@ from .execution_authority import Revision
 from .execution_version import ExecutionVersion
 
 __all__ = [
+    "ExecutionPlacement",
     "AlignmentInput",
     "AlignmentRequest",
     "AlignmentReceipt",
@@ -25,6 +26,18 @@ __all__ = [
 
 
 @dataclass(frozen=True)
+class ExecutionPlacement:
+    """One frontend lifetime within a runtime authority session, including its ranks."""
+
+    session_id: str
+    placement_id: str
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(v, str) or not v for v in (self.session_id, self.placement_id)):
+            raise ValueError("execution placement requires a session and frontend lifetime")
+
+
+@dataclass(frozen=True)
 class AlignmentInput:
     """The runtime's complete revised text input and cache namespace.
 
@@ -32,14 +45,21 @@ class AlignmentInput:
     obtain logits. min_reuse_tokens can require a prefix instead of allowing
     recomputation on a cache miss. Salt and LoRA identity use ordinary TRT-LLM
     reuse semantics; neither is derived from the execution epoch.
+
+    destination selects one prepared frontend lifetime, including all its ranks.
+    None retains common-prefix alignment across the complete cohort. Selection
+    does not move KV: the chosen destination must own the reusable prefix locally.
     """
 
     input_token_ids: tuple[int, ...]
     cache_salt: str | None = None
     lora_task_id: int | None = None
     min_reuse_tokens: int = 0
+    destination: ExecutionPlacement | None = None
 
     def __post_init__(self) -> None:
+        if self.destination is not None and not isinstance(self.destination, ExecutionPlacement):
+            raise TypeError("destination must be an ExecutionPlacement or None")
         if not isinstance(self.input_token_ids, tuple) or not self.input_token_ids:
             raise ValueError("input_token_ids must be a nonempty tuple")
         if any(type(t) is not int or not 0 <= t < 2**31 for t in self.input_token_ids):
@@ -71,6 +91,9 @@ class AlignmentRequest:
             raise TypeError("revision must be a Revision")
         if not isinstance(self.revised_input, AlignmentInput):
             raise TypeError("revised_input must be an AlignmentInput")
+        destination = self.revised_input.destination
+        if destination is not None and destination.session_id != self.session_id:
+            raise ValueError("ALIGN destination belongs to another authority session")
 
 
 @dataclass(frozen=True)

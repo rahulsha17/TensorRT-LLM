@@ -13,7 +13,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm.execution_alignment import AlignmentInput, WorkerAlignmentState
+from tensorrt_llm.execution_alignment import (
+    AlignmentInput,
+    ExecutionPlacement,
+    WorkerAlignmentState,
+)
 from tensorrt_llm.execution_authority import Revision
 from tensorrt_llm.execution_collective import CollectivePublicationTransport, ExecutionParticipant
 from tensorrt_llm.execution_fence import RequestDrainTracker
@@ -120,6 +124,106 @@ def reject(frontend, version):
     with pytest.raises(RuntimeError):
         with frontend._execution_admission(version):
             pytest.fail("unauthorized request was admitted")
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_destination_alignment_keeps_global_fence_and_only_resumes_selected_group(
+    cluster, deferred
+):
+    controller = cluster.controller
+    if len(cluster.workers) == 4:
+        cluster.workers[-1].tokens = 4
+    controller.register(OLD).wait()
+    destination = cluster.endpoints[1].placement
+    assert cluster.frontends[1].get_execution_placement() == destination
+    revised = replace(INPUT, destination=destination, min_reuse_tokens=3)
+    cluster.tables[0].drain_tracker.enqueue(OLD, lambda: 42)
+    result = controller.advance(REVISION, alignment=None if deferred else revised)
+    result.publication.wait()
+    if deferred:
+        for table in cluster.tables:
+            with pytest.raises(ExecutionAuthorityError):
+                with table.admission(NEW):
+                    pytest.fail("deferred ALIGN admitted work at a worker")
+        result = controller.align(REVISION, revised)
+        result.publication.wait()
+    for table in cluster.tables:
+        table.alignment_state.process()
+    with pytest.raises(TimeoutError):
+        result.alignment.wait(0.05)
+    with pytest.raises(TimeoutError):
+        result.fence.wait(0.05)
+    assert not cluster.workers[0].holds
+    cluster.tables[0].drain_tracker.complete(42, OLD)
+    result.fence.wait()
+    aligned = result.alignment.wait()
+    assert aligned.reusable_prefix_length == 3
+    for frontend in cluster.frontends:
+        reject(frontend, NEW)
+    controller.resume(aligned).wait()
+    reject(cluster.frontends[0], NEW)
+    with cluster.frontends[1]._execution_admission(NEW) as execution:
+        execution.check()
+    for table, worker in zip(cluster.tables, cluster.workers):
+        if not worker.holds:
+            assert table.observe_allowed((NEW, None)) == (False, True)
+            with table.guard_versions([NEW, None]) as allowed:
+                assert allowed == [False, True]
+            with pytest.raises(ExecutionAuthorityError):
+                with table.admission(NEW):
+                    pytest.fail("non-destination admitted the successor")
+        else:
+            with table.admission(NEW):
+                pass
+            limit = table.alignment_state.claim(
+                NEW, 43, INPUT.input_token_ids, INPUT.cache_salt, None
+            )
+            assert limit in (None, 3)
+            table.alignment_state.confirm_attachment(NEW, 43, 3)
+            worker.holds[-1].close.assert_called_once()
+
+
+@pytest.mark.parametrize("foreign_session", [False, True])
+def test_unknown_destination_does_not_seal_or_advance_authority(cluster, foreign_session):
+    cluster.controller.register(OLD).wait()
+    destination = ExecutionPlacement("other" if foreign_session else "session", "unknown")
+    with pytest.raises(ValueError, match="destination"):
+        cluster.controller.advance(REVISION, alignment=replace(INPUT, destination=destination))
+    assert cluster.controller.snapshot("tenant", "scope").current_version == OLD
+    for frontend in cluster.frontends:
+        with frontend._execution_admission(OLD) as execution:
+            execution.check()
+
+
+def test_destination_cannot_change_on_retry_and_old_receipt_cannot_move_work(cluster):
+    controller = cluster.controller
+    controller.register(OLD).wait()
+    first = replace(INPUT, destination=cluster.endpoints[1].placement)
+    result = controller.advance(REVISION, alignment=first)
+    result.publication.wait()
+    for table in cluster.tables:
+        table.alignment_state.process()
+    receipt = result.alignment.wait()
+    with pytest.raises(ValueError, match="retry changed"):
+        controller.advance(
+            REVISION, alignment=replace(first, destination=cluster.endpoints[0].placement)
+        )
+    with pytest.raises(ValueError, match="retry changed"):
+        controller.align(REVISION, replace(first, destination=cluster.endpoints[0].placement))
+    next_version = replace(NEW, epoch=9)
+    changed = controller.advance(
+        Revision("move", NEW, next_version),
+        alignment=replace(INPUT, destination=cluster.endpoints[0].placement),
+    )
+    changed.publication.wait()
+    for table in cluster.tables:
+        table.alignment_state.process()
+    with pytest.raises(ValueError):
+        controller.resume(receipt)
+    controller.resume(changed.alignment.wait()).wait()
+    with cluster.frontends[0]._execution_admission(next_version):
+        pass
+    reject(cluster.frontends[1], next_version)
 
 
 def test_remote_scope_lifecycle_preserves_topology_and_common_prefix(cluster):
@@ -548,6 +652,8 @@ def _frontend_process(pipe, tokens):
                         execution.check()
                         state = worker._execution_version_table.alignment_state
                         value = state.claim(NEW, 43, INPUT.input_token_ids, INPUT.cache_salt, None)
+                        if value is None:
+                            value = worker.tokens
                         state.confirm_attachment(NEW, 43, value)
                 else:
                     raise ValueError("unknown test operation")
@@ -565,7 +671,8 @@ def _probe(pipe, operation):
     return pipe.recv()
 
 
-def test_full_lifecycle_with_two_frontends_in_separate_processes():
+@pytest.mark.parametrize("targeted", [False, True])
+def test_full_lifecycle_with_two_frontends_in_separate_processes(targeted):
     context = multiprocessing.get_context("spawn")
     processes, pipes, endpoints = [], [], []
     controller = None
@@ -583,7 +690,12 @@ def test_full_lifecycle_with_two_frontends_in_separate_processes():
         controller.register(OLD).wait()
         for pipe in pipes:
             assert _probe(pipe, "old") == "admitted"
-        revision = controller.advance(REVISION, alignment=INPUT)
+        revised = (
+            replace(INPUT, destination=endpoints[1].placement, min_reuse_tokens=3)
+            if targeted
+            else INPUT
+        )
+        revision = controller.advance(REVISION, alignment=revised)
         revision.publication.wait()
         for pipe in pipes:
             assert _probe(pipe, "old-output")[0] == "rejected"
@@ -596,10 +708,14 @@ def test_full_lifecycle_with_two_frontends_in_separate_processes():
         assert _probe(pipes[1], "drain") == "drained"
         revision.fence.wait()
         aligned = revision.alignment.wait()
-        assert aligned.reusable_prefix_length == 2
+        assert aligned.reusable_prefix_length == (3 if targeted else 2)
         controller.resume(aligned).wait()
-        for pipe in pipes:
-            assert _probe(pipe, "new") == 2
+        if targeted:
+            assert _probe(pipes[0], "new")[0] == "rejected"
+            assert _probe(pipes[1], "new") == 3
+        else:
+            for pipe in pipes:
+                assert _probe(pipe, "new") == 2
         controller.close()
         for pipe in pipes:
             assert _probe(pipe, "new")[0] == "rejected"

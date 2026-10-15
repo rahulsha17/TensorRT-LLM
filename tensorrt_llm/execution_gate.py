@@ -114,14 +114,14 @@ class HostExecutionGate:
                 execution._wake = execution._cancel = None
                 raise
 
-    def revoke_locked(self, current: ExecutionVersion) -> None:
+    def revoke_locked(self, current: ExecutionVersion, *, admit_current: bool = True) -> None:
         """Invalidate requests in the changed scope while the owner holds its lock."""
         for execution in list(self._executions):
             version = execution.version
             if (version.tenant_id, version.scope_id) == (
                 current.tenant_id,
                 current.scope_id,
-            ) and version != current:
+            ) and (version != current or not admit_current):
                 execution._revoke_locked(
                     ExecutionAuthorityError(f"execution {version!r} superseded by {current!r}")
                 )

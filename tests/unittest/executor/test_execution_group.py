@@ -187,6 +187,43 @@ def test_all_worker_fence_precedes_common_prefix_resume(cluster):
         worker.hold.close.assert_called_once()
 
 
+@pytest.mark.parametrize("deferred", [False, True])
+def test_shared_destination_owns_only_its_prefix_without_weakening_global_fence(cluster, deferred):
+    controller = cluster.controller
+    if len(cluster.workers) == 6:
+        cluster.workers[-1].hold.num_tokens = 4
+    controller.register(OLD).wait()
+    revised = replace(
+        INPUT, destination=cluster.frontends[1].get_execution_placement(), min_reuse_tokens=3
+    )
+    cluster.tables[0].drain_tracker.enqueue(OLD, lambda: 42)
+    result = controller.advance(REVISION, alignment=None if deferred else revised)
+    result.publication.wait()
+    if deferred:
+        result = controller.align(REVISION, revised)
+        result.publication.wait()
+    for table in cluster.tables:
+        table.alignment_state.process()
+    with pytest.raises(TimeoutError):
+        result.alignment.wait(0.05)
+    cluster.tables[0].drain_tracker.complete(42, OLD)
+    receipt = result.alignment.wait()
+    assert receipt.reusable_prefix_length == 3
+    controller.resume(receipt).wait()
+    with cluster.frontends[1]._execution_admission(NEW) as execution:
+        assert execution.version == NEW
+    execution.check()
+    for call in (
+        lambda: cluster.frontends[0]._execution_admission(NEW),
+        lambda: controller.admission(NEW),
+    ):
+        with pytest.raises(ExecutionAuthorityError, match="placement"):
+            with call():
+                pytest.fail("successor admitted without its destination")
+    assert not cluster.tables[0]._versions[(NEW.tenant_id, NEW.scope_id)].admit_requests
+    assert not cluster.tables[0].alignment_state._records
+
+
 def test_lost_member_does_not_hide_revocation_from_healthy_groups(cluster):
     cluster.controller.register(OLD).wait()
     cluster.tables[0].close()

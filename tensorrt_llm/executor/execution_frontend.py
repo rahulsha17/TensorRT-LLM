@@ -177,6 +177,8 @@ class FrontendAuthorityGate:
                         self._protocol_failure_locked("new epoch lacks a frontend seal")
             self._observed[key] = update
             self._active.pop(key, None)
+            if not update.admit_requests:
+                self._gate.revoke_locked(update.version, admit_current=False)
             return PublicationReceipt(update, update.version)
 
     def activate(self, owner: str, update: VersionUpdate) -> bool:
@@ -192,6 +194,8 @@ class FrontendAuthorityGate:
             self._require_live_locked(owner)
             if self._observed.get(key) != update:
                 return False
+            if not update.admit_requests:
+                raise ExecutionAuthorityError("execution is not admitted at this placement")
             floor = self._floors.get(key)
             if floor is not None:
                 if update.version != floor:

@@ -15,6 +15,7 @@ from .execution_alignment import (
     AlignmentInput,
     AlignmentReceipt,
     AlignmentRequest,
+    ExecutionPlacement,
     RevisionAlignment,
     WorkerAlignmentState,
 )
@@ -68,6 +69,9 @@ class VersionUpdate:
         resume_prefix_length: Common cache-lookup bound for collective RESUME.
             None keeps ordinary single-worker reuse. The local receipt must
             cover this length, and a retry cannot change it.
+        admit_requests: Whether this worker may execute this version. Pending
+            revisions and non-destination placements still observe authority and
+            drain old work, without permission to admit or commit successor work.
     """
 
     session_id: str
@@ -76,8 +80,13 @@ class VersionUpdate:
     alignment: AlignmentRequest | None = None
     resume: AlignmentReceipt | None = None
     resume_prefix_length: int | None = None
+    admit_requests: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.admit_requests) is not bool:
+            raise TypeError("admit_requests must be a bool")
+        if self.resume is not None and not self.admit_requests:
+            raise ValueError("RESUME must enable execution at its destination")
         if not isinstance(self.session_id, str) or not self.session_id:
             raise ValueError("session_id must be a nonempty string")
         if type(self.sequence) is not int or self.sequence <= 0:
@@ -187,7 +196,7 @@ class WorkerVersionTable:
         # Forward submission holds the device lock. Its advisory polls must not
         # take _lock, which the publisher holds while acquiring the device lock.
         self._observation_lock = Lock()
-        self._observed_versions: dict[tuple[str, str], ExecutionVersion] = {}
+        self._observed_versions: dict[tuple[str, str], ExecutionVersion | None] = {}
         self._observation_failed = False
         self._closed = False
         self._gate = HostExecutionGate(self._lock, self._current_version_locked)
@@ -247,7 +256,14 @@ class WorkerVersionTable:
         """Order short host state commits with mailbox updates; never wait for CUDA here."""
         with self._lock:
             self._require_open()
-            yield [v is None or self._current_version_locked(v) == v for v in versions]
+            yield [
+                v is None
+                or (
+                    self._current_version_locked(v) == v
+                    and self._versions[(v.tenant_id, v.scope_id)].admit_requests
+                )
+                for v in versions
+            ]
 
     def observe_allowed(self, versions: tuple[ExecutionVersion | None, ...]) -> tuple[bool, ...]:
         """Poll authority for early exit, never for admission or token/KV commit.
@@ -307,8 +323,8 @@ class WorkerVersionTable:
                 self.alignment_state.observe(update.version, update.alignment)
             self._versions[key] = update
             with self._observation_lock:
-                self._observed_versions[key] = update.version
-            self._gate.revoke_locked(update.version)
+                self._observed_versions[key] = update.version if update.admit_requests else None
+            self._gate.revoke_locked(update.version, admit_current=update.admit_requests)
             if self._device_publisher is not None:
                 try:
                     self._device_publisher.publish(update.version)
@@ -331,6 +347,8 @@ class WorkerVersionTable:
             update = self._versions[(version.tenant_id, version.scope_id)]
             if update.alignment is not None and update.resume is None:
                 raise ExecutionAuthorityError("successor is pending ALIGN and RESUME")
+            if not update.admit_requests:
+                raise ExecutionAuthorityError("execution is not admitted at this worker")
             yield execution
 
     def current_version(self, tenant_id: str, scope_id: str) -> ExecutionVersion | None:
@@ -428,6 +446,8 @@ class ExecutionController:
         max_pending: Maximum queued or in-flight publications. An accepted
             revision beyond this limit gets a failed publication handle and can
             be retried once space is available.
+        placements: Fixed frontend lifetimes supplied by runtime bootstrap to a
+            placement-aware transport. A destination must belong to this set.
 
     Acceptance completes before publication. Publication failure never rolls
     back the registry. Retrying register/advance republishes the latest version
@@ -435,12 +455,22 @@ class ExecutionController:
     """
 
     def __init__(
-        self, session_id: str, transport: PublicationTransport, max_pending: int = 256
+        self,
+        session_id: str,
+        transport: PublicationTransport,
+        max_pending: int = 256,
+        *,
+        placements: frozenset[ExecutionPlacement] = frozenset(),
     ) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a nonempty string")
         if type(max_pending) is not int or max_pending <= 0:
             raise ValueError("max_pending must be a positive integer")
+        if not isinstance(placements, frozenset) or any(
+            not isinstance(p, ExecutionPlacement) or p.session_id != session_id for p in placements
+        ):
+            raise ValueError("placements must identify frontend lifetimes in this session")
+        self._placements = placements
         self._session_id = session_id
         self._transport = transport
         self._max_pending = max_pending
@@ -485,8 +515,7 @@ class ExecutionController:
         """
         with self._lock:
             self._require_open()
-            if alignment is not None and not isinstance(alignment, AlignmentInput):
-                raise TypeError("alignment must be an AlignmentInput or None")
+            self._validate_alignment(alignment)
             if revision in self._alignment_inputs and self._alignment_inputs[revision] != alignment:
                 raise ValueError("revision retry changed its revised input")
             receipt = self._registry.advance(revision)
@@ -525,6 +554,7 @@ class ExecutionController:
             raise TypeError("alignment must be an AlignmentInput")
         with self._lock:
             self._require_open()
+            self._validate_alignment(alignment)
             if revision not in self._alignment_inputs:
                 raise ValueError("ALIGN requires an accepted revision")
             version = revision.successor_version
@@ -600,7 +630,9 @@ class ExecutionController:
             return None
 
     @contextmanager
-    def admission(self, version: ExecutionVersion) -> Iterator[HostExecution]:
+    def admission(
+        self, version: ExecutionVersion, *, placement: ExecutionPlacement | None = None
+    ) -> Iterator[HostExecution]:
         """Admit published initial work or an acknowledged, resumed successor."""
         with self._gate.admission(version) as execution:
             snapshot = self._registry.snapshot(version.tenant_id, version.scope_id)
@@ -609,7 +641,24 @@ class ExecutionController:
             publication = self._latest[(version.tenant_id, version.scope_id)]
             if not publication._future.done() or publication._future.exception() is not None:
                 raise ExecutionAuthorityError("execution authority has not been published")
+            request = self._alignment_current.get(version)
+            if (
+                request is not None
+                and request.revised_input.destination is not None
+                and request.revised_input.destination != placement
+            ):
+                raise ExecutionAuthorityError("successor belongs to another execution placement")
             yield execution
+
+    def _validate_alignment(self, alignment: AlignmentInput | None) -> None:
+        if alignment is not None and not isinstance(alignment, AlignmentInput):
+            raise TypeError("alignment must be an AlignmentInput or None")
+        if (
+            alignment is not None
+            and alignment.destination is not None
+            and alignment.destination not in self._placements
+        ):
+            raise ValueError("ALIGN destination is not a member of this authority")
 
     def snapshot(self, tenant_id: str, scope_id: str) -> ScopeSnapshot:
         """Read accepted authority, including when publication has failed."""
@@ -669,6 +718,11 @@ class ExecutionController:
                 version,
                 self._alignment_current.get(version),
                 self._resumes.get(version),
+                admit_requests=(
+                    version in self._resumes
+                    or self._registry.snapshot(version.tenant_id, version.scope_id).pending_revision
+                    is None
+                ),
             )
         publication = VersionPublication(update, Future())
         self._latest[key] = publication

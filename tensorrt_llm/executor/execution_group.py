@@ -5,8 +5,10 @@
 from contextlib import ExitStack
 from uuid import uuid4
 
+from ..execution_alignment import ExecutionPlacement
 from ..execution_collective import CollectivePublicationTransport, ExecutionParticipant
 from ..execution_mailbox import ExecutionController, LocalPublicationTransport, PublicationTransport
+from ..execution_placement import PlacementPublicationTransport
 from .execution_control import ExecutionControlMixin
 from .execution_mailbox import IpcPublicationTransport
 
@@ -54,6 +56,9 @@ def create_shared_execution_controller(
 
     Bootstrap holds all frontend admission locks. A partial failure leaves every
     member unavailable until restart, rather than allowing separate authorities.
+    AlignmentInput.destination can select one frontend's get_execution_placement().
+    Only that group reserves and admits the successor; every member still
+    participates in revocation, publication and FENCE. No KV transfer is implied.
     Closing any member's control path closes the shared controller and prevents
     further submissions on every member. Close each executor normally to stop
     its workers; closing authority alone is not proof of physical reclamation.
@@ -94,13 +99,17 @@ def create_shared_execution_controller(
             participants = tuple(
                 ExecutionParticipant(0, 0, group) for group in range(len(frontends))
             )
-            publication = CollectivePublicationTransport(
-                participants, dict(zip(participants, transports))
+            placements = tuple(ExecutionPlacement(session, uuid4().hex) for _ in frontends)
+            publication = PlacementPublicationTransport(
+                participants,
+                dict(zip(participants, transports)),
+                dict(zip(participants, placements)),
             )
-            controller = ExecutionController(session, publication)
-            for frontend in frontends:
+            controller = ExecutionController(session, publication, placements=frozenset(placements))
+            for frontend, placement in zip(frontends, placements):
                 frontend._execution_controller = controller
                 frontend._execution_shared = True
+                frontend._execution_placement = placement
             return controller
         except Exception as error:
             for frontend in frontends:
