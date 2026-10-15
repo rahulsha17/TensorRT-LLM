@@ -10,8 +10,11 @@ import pytest
 
 from tensorrt_llm.execution_alignment import (
     AlignmentInput,
+    AlignmentReceipt,
     AlignmentRequest,
     AlignmentSafetyError,
+    ExecutionPlacement,
+    PrefixTransferPlan,
     WorkerAlignmentState,
 )
 from tensorrt_llm.execution_authority import Revision
@@ -31,6 +34,62 @@ OLD = ExecutionVersion("tenant", "scope", 7)
 NEW = replace(OLD, epoch=8)
 REVISION = Revision("edit", OLD, NEW)
 INPUT = AlignmentInput((1, 2, 3, 4, 5), cache_salt="shared")
+
+
+@pytest.mark.parametrize("limit", [-1, 5, True, 1.5, "2"])
+def test_alignment_rejects_invalid_reuse_limit(limit):
+    with pytest.raises(ValueError, match="max_reuse_tokens"):
+        replace(INPUT, max_reuse_tokens=limit)
+
+
+def test_reuse_limit_must_cover_minimum_and_transfer():
+    with pytest.raises(ValueError, match="max_reuse_tokens"):
+        replace(INPUT, min_reuse_tokens=3, max_reuse_tokens=2)
+    with pytest.raises(ValueError, match="transfer exceeds"):
+        replace(
+            INPUT,
+            destination=ExecutionPlacement("session", "decode"),
+            transfer=PrefixTransferPlan(ExecutionPlacement("session", "prefill"), 3),
+            max_reuse_tokens=2,
+        )
+
+
+@pytest.mark.parametrize("limit,acquired", [(0, 0), (2, 0), (2, 2), (4, 3)])
+def test_bounded_resume_enforces_actual_acquired_prefix_through_ipc(setup, limit, acquired):
+    controller, _, _, state, reserve, _ = setup
+    revised = replace(INPUT, max_reuse_tokens=limit)
+    hold = Mock(num_tokens=acquired)
+    reserve.side_effect = lambda _: hold
+    advance = controller.advance(REVISION, alignment=revised)
+    advance.publication.wait()
+    state.process()
+    receipt = advance.alignment.wait()
+    assert receipt.reusable_prefix_length == acquired
+    controller.resume(receipt).wait()
+    controller.resume(receipt).wait()
+    assert state.claim(NEW, 10, revised.input_token_ids, revised.cache_salt, None) == acquired
+    # A longer ordinary cache hit must not silently cross the agreed boundary,
+    # even when it would still fit beneath the runtime's upper bound.
+    with pytest.raises(RuntimeError, match="agreed KV prefix"):
+        state.confirm_attachment(NEW, 10, acquired + 1)
+    hold.close.assert_not_called()
+    state.confirm_attachment(NEW, 10, acquired)
+    hold.close.assert_called_once()
+
+
+def test_over_limit_reservation_is_rejected_and_reclaimed():
+    revised = replace(INPUT, max_reuse_tokens=2)
+    request = AlignmentRequest("session", REVISION, revised)
+    with pytest.raises(ValueError, match="reserved prefix"):
+        AlignmentReceipt(request, "hold", 3)
+    hold = Mock(num_tokens=3)
+    state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    with pytest.raises(RuntimeError, match="reserved prefix"):
+        state.poll(request)
+    hold.settle.assert_called_once()
+    hold.close.assert_called_once()
 
 
 @pytest.mark.parametrize("prefix", [-1, 4, True, 1.5])
@@ -132,6 +191,7 @@ def test_idle_alignment_and_retry_are_idempotent(setup):
         replace(INPUT, cache_salt="other"),
         replace(INPUT, lora_task_id=2),
         replace(INPUT, min_reuse_tokens=2),
+        replace(INPUT, max_reuse_tokens=2),
         None,
     ],
 )

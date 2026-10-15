@@ -70,6 +70,11 @@ class AlignmentInput:
     does not move KV. transfer additionally retains a source hold and requires
     both endpoints' copy acceptance. The engine must still allocate, copy and
     attach the actual destination prefix before ALIGN can complete.
+
+    max_reuse_tokens bounds both reservation and successor cache lookup. A
+    runtime enforcing a numerical contract supplies its validated boundary,
+    or zero when it has no reuse evidence. None preserves ordinary cache reuse;
+    token and namespace matches alone do not certify cold-output equivalence.
     """
 
     input_token_ids: tuple[int, ...]
@@ -78,6 +83,7 @@ class AlignmentInput:
     min_reuse_tokens: int = 0
     destination: ExecutionPlacement | None = None
     transfer: PrefixTransferPlan | None = None
+    max_reuse_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.destination is not None and not isinstance(self.destination, ExecutionPlacement):
@@ -96,6 +102,11 @@ class AlignmentInput:
             0 <= self.min_reuse_tokens < len(self.input_token_ids)
         ):
             raise ValueError("min_reuse_tokens must leave at least one input token to compute")
+        if self.max_reuse_tokens is not None and (
+            type(self.max_reuse_tokens) is not int
+            or not self.min_reuse_tokens <= self.max_reuse_tokens < len(self.input_token_ids)
+        ):
+            raise ValueError("max_reuse_tokens must cover required reuse and leave the final token")
         if self.transfer is not None:
             if not isinstance(self.transfer, PrefixTransferPlan):
                 raise TypeError("transfer must be a PrefixTransferPlan or None")
@@ -105,6 +116,17 @@ class AlignmentInput:
                 raise ValueError("prefix endpoints must share one authority session")
             if not self.min_reuse_tokens <= self.transfer.num_tokens < len(self.input_token_ids):
                 raise ValueError("transfer must cover required reuse and leave the final token")
+            if self.transfer.num_tokens > self.reuse_limit:
+                raise ValueError("transfer exceeds max_reuse_tokens")
+
+    @property
+    def reuse_limit(self) -> int:
+        """Maximum permitted cache lookup depth, excluding the final input token."""
+        return (
+            len(self.input_token_ids) - 1
+            if self.max_reuse_tokens is None
+            else self.max_reuse_tokens
+        )
 
     @property
     def required_prefix_length(self) -> int:
@@ -151,7 +173,7 @@ class AlignmentReceipt:
         if type(count) is not int or not (
             self.request.revised_input.required_prefix_length
             <= count
-            < len(self.request.revised_input.input_token_ids)
+            <= self.request.revised_input.reuse_limit
         ):
             raise ValueError("invalid reserved prefix length")
 
@@ -301,7 +323,7 @@ class WorkerAlignmentState:
                         if (
                             not request.revised_input.required_prefix_length
                             <= count
-                            < len(request.revised_input.input_token_ids)
+                            <= request.revised_input.reuse_limit
                         ):
                             raise RuntimeError("reserved prefix does not satisfy revised input")
                         record.receipt = AlignmentReceipt(request, uuid4().hex, count)
@@ -392,6 +414,10 @@ class WorkerAlignmentState:
         with self._lock:
             if self.poll(receipt.request) != receipt:
                 raise RuntimeError("RESUME does not match the live ALIGN reservation")
+            if prefix_length is None and receipt.request.revised_input.max_reuse_tokens is not None:
+                # Bind single-worker admission too: a later cache hit must not
+                # extend a numerically bounded reservation into its suffix.
+                prefix_length = receipt.reusable_prefix_length
             if prefix_length is not None and (
                 type(prefix_length) is not int
                 or not receipt.request.revised_input.required_prefix_length

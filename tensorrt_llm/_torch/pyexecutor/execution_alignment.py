@@ -42,7 +42,7 @@ class KVAlignmentAdapter:
         sequence_limit = self._executor.max_seq_len or self._manager.max_seq_len
         if len(revised.input_token_ids) > sequence_limit:
             raise ValueError("revised input exceeds max_seq_len")
-        if not self._manager.enable_block_reuse or len(revised.input_token_ids) == 1:
+        if not self._manager.enable_block_reuse or revised.reuse_limit == 0:
             return _Reservation(0, lambda: None)
         if self._executor._is_kv_manager_v2:
             return self._reserve_v2(revised)
@@ -56,7 +56,7 @@ class KVAlignmentAdapter:
             ReuseScope(
                 lora_id=revised.lora_task_id, salt=manager._derive_reuse_salt(revised.cache_salt)
             ),
-            list(revised.input_token_ids[:-1]),
+            list(revised.input_token_ids[: revised.reuse_limit]),
             expected_prompt_length=len(revised.input_token_ids),
         )
         # Suspended caches retain native PageHolders without occupying an
@@ -78,7 +78,7 @@ class KVAlignmentAdapter:
         matched = manager.probe_prefix_match_length(
             list(revised.input_token_ids), revised.lora_task_id, revised.cache_salt
         )
-        matched = min(matched, (len(revised.input_token_ids) - 1) // block_size * block_size)
+        matched = min(matched, revised.reuse_limit // block_size * block_size)
         if matched == 0:
             return _Reservation(0, lambda: None)
         # A cache-only sequence acquires the same native references as an

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the actual V1/V2 reservation adapters with controlled native APIs."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -49,6 +50,45 @@ def test_v2_owns_a_suspended_cache_with_exact_namespace_and_last_token_excluded(
     hold.close()
     hold.close()
     cache.close.assert_called_once()
+
+
+@pytest.mark.parametrize("v2", [False, True])
+def test_zero_limit_never_acquires_cached_pages(engine, v2):
+    engine._is_kv_manager_v2 = v2
+    hold = KVAlignmentAdapter(engine).reserve(replace(INPUT, max_reuse_tokens=0))
+    assert hold.num_tokens == 0
+    assert engine.kv_cache_manager.mock_calls == []
+    hold.settle()
+    hold.close()
+
+
+@pytest.mark.parametrize("limit", [1, 7, 8, 16])
+def test_v2_lookup_cannot_cross_runtime_boundary(engine, limit):
+    manager = engine.kv_cache_manager
+    manager.impl.create_kv_cache.return_value = Mock(num_committed_tokens=0)
+    hold = KVAlignmentAdapter(engine).reserve(replace(INPUT, max_reuse_tokens=limit))
+    args, kwargs = manager.impl.create_kv_cache.call_args
+    assert args[1] == list(INPUT.input_token_ids[:limit])
+    assert kwargs["expected_prompt_length"] == len(INPUT.input_token_ids)
+    hold.close()
+
+
+@pytest.mark.parametrize("limit,expected", [(1, 0), (7, 4), (8, 8), (16, 12)])
+def test_v1_rounds_runtime_boundary_down_to_complete_blocks(engine, limit, expected):
+    engine._is_kv_manager_v2 = False
+    manager = engine.kv_cache_manager
+
+    def allocate(infos, requests):
+        assert infos == [(99, expected + 1, 1)]
+        assert requests[0].get_tokens(0) == list(INPUT.input_token_ids[: expected + 1])
+        requests[0].set_prepopulated_prompt_len(expected, 4)
+
+    manager.impl.add_sequence_batch.side_effect = allocate
+    hold = KVAlignmentAdapter(engine).reserve(replace(INPUT, max_reuse_tokens=limit))
+    assert hold.num_tokens == expected
+    if expected == 0:
+        manager.impl.add_sequence_batch.assert_not_called()
+    hold.close()
 
 
 def test_v1_acquires_native_sequence_and_reports_actual_match(engine):
