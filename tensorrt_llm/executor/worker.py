@@ -16,7 +16,6 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
-from ..execution_mailbox import WorkerVersionTable
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -24,7 +23,6 @@ from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker, _init_hf_modules
-from .execution_control import WorkerExecutionControlMixin
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
@@ -50,14 +48,7 @@ _MEGA_MOE_DEEPGEMM_MODULE = (
     "tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm")
 
 
-class GenerationExecutorWorker(WorkerExecutionControlMixin, RpcWorkerMixin,
-                               BaseWorker):
-
-    def _create_execution_version_table(self,
-                                        session_id: str) -> WorkerVersionTable:
-        table = WorkerVersionTable(session_id)
-        self.engine.configure_execution_authority(table)
-        return table
+class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,

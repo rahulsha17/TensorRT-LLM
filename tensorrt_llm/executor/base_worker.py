@@ -36,12 +36,14 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
+from ..execution_mailbox import WorkerVersionTable
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
+from .execution_control import WorkerExecutionControlMixin
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
@@ -86,7 +88,13 @@ def _init_hf_modules():
 _init_hf_modules()
 
 
-class BaseWorker(GenerationExecutor):
+class BaseWorker(WorkerExecutionControlMixin, GenerationExecutor):
+
+    def _create_execution_version_table(self,
+                                        session_id: str) -> WorkerVersionTable:
+        table = WorkerVersionTable(session_id)
+        self.engine.configure_execution_authority(table)
+        return table
 
     class WorkerExit(GeneratorExit):
         pass
@@ -1053,6 +1061,7 @@ class BaseWorker(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
+        self._shutdown_execution_control()
         if self.engine is not None:
             can_shutdown = getattr(self.engine, "can_shutdown", None)
             if can_shutdown is None:

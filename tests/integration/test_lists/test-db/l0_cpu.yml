@@ -148,6 +148,7 @@ l0_cpu:
   - unittest/executor/test_execution_fence.py
   - unittest/executor/test_execution_mailbox.py
   - unittest/executor/test_execution_collective.py
+  - unittest/executor/test_execution_rpc_control.py
   - unittest/executor/test_execution_mailbox_ipc.py
   - unittest/executor/test_execution_control_wiring.py
   - unittest/executor/test_execution_gate.py

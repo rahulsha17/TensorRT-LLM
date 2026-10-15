@@ -1,13 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import os
 import threading
+from concurrent.futures import Future
 from typing import Callable, List, Optional
 
 from .._utils import nvtx_range_debug
+from ..execution_collective import CollectivePublicationTransport, ExecutionParticipant
+from ..execution_mailbox import ExecutionController
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
 from ..logger import logger
+from .execution_mailbox import IpcPublicationTransport
 from .postproc_worker import PostprocWorker
 from .request import GenerationRequest
 from .result import GenerationResult
@@ -38,6 +45,29 @@ class RpcExecutorMixin:
         self.main_loop_task_obj = None
         self.main_loop = None
         self.main_loop_thread = None
+
+    def _create_execution_controller(self) -> ExecutionController:
+        args = self.worker_kwargs["llm_args"]
+        if (
+            args.backend != "pytorch"
+            or args.parallel_config.world_size != 1
+            or getattr(self, "model_world_size", 1) != 1
+            or getattr(self, "world_size", 1) != 1
+            or args.num_serve_frontends != 1
+        ):
+            raise NotImplementedError(
+                "execution publication requires one frontend and one PyTorch rank"
+            )
+        if self._shutdown_event.is_set() or self.rpc_client is None:
+            raise RuntimeError("execution publication requires a running worker")
+        address = self.rpc_client.start_execution_mailbox(self._execution_session_id).remote(
+            timeout=5
+        )
+        participant = ExecutionParticipant(0, 0)
+        transport = CollectivePublicationTransport(
+            (participant,), {participant: IpcPublicationTransport(address)}
+        )
+        return ExecutionController(self._execution_session_id, transport)
 
     def setup_mainloop(
         self, tasks: Optional[List[Callable]] = None, thread_name: str = "rpc_proxy_main_loop"
@@ -82,12 +112,11 @@ class RpcExecutorMixin:
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         request.set_id(self._get_next_client_id())
+        return self._submit_rpc_generation(request)
+
+    def _submit_rpc_generation(self, request: GenerationRequest) -> GenerationResult:
+        """Bind authority and result routing before asynchronous ingress can reply."""
         logprob_params = self._get_logprob_params(request)
-
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -95,8 +124,31 @@ class RpcExecutorMixin:
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params,
         )
-        self._results[request.id] = result
+        sent = None
+        with self._execution_admission(request.execution_version) as execution:
+            self._bind_execution_result(result, execution)
+            self._results[request.id] = result
+            try:
+                with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                    if execution is None:
+                        self.rpc_client.submit(request).remote(need_response=False)
+                    else:
+                        # Queue transport work without waiting under authority.
+                        # A delayed send is rechecked by worker admission.
+                        sent = self.rpc_client.submit(request).remote_future(need_response=False)
+            except Exception:
+                self._results.pop(request.id, None)
+                raise
+        if sent is not None:
 
+            def ingress_done(future: Future) -> None:
+                error = "RPC submission was cancelled" if future.cancelled() else future.exception()
+                if error is not None and self._results.get(request.id) is result:
+                    self.handle_responses([ErrorResponse(request.id, str(error), -1)])
+
+            # A completed future may invoke its callback immediately. Register
+            # outside admission because terminal handling also takes authority.
+            sent.add_done_callback(ingress_done)
         return result
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
@@ -109,18 +161,19 @@ class RpcExecutorMixin:
                 nonlocal event_loop
                 nonlocal async_queues
 
-                if client_id not in self._results:
+                result = self._results.get(client_id)
+                if result is None:
                     logger.warning(f"Received response for unknown client_id: {client_id}")
                     continue
 
-                queue = self._results[client_id].queue
+                queue = result.queue
                 if isinstance(queue, _SyncQueue):
-                    queue.put_nowait(r)
-                    async_queues.append(queue)
-                    # all the loops are identical
-                    event_loop = event_loop or queue.loop
+                    if result._publish_response(lambda: queue.put_nowait(r)):
+                        async_queues.append(queue)
+                        # all the loops are identical
+                        event_loop = event_loop or queue.loop
                 else:
-                    queue.put(r)
+                    result._publish_response(lambda: queue.put(r))
 
                 # PostprocWorker.Output records arrive on the same stream when
                 # postprocess parallelism is enabled (worker-side pool); they
@@ -132,6 +185,8 @@ class RpcExecutorMixin:
                     or (isinstance(r, PostprocWorker.Output) and r.is_final)
                 ):
                     self._results.pop(client_id, None)
+                    if result._execution is not None:
+                        result._execution.finish()
 
         # Handle the case where responses might not be a list of lists
         if responses and not isinstance(responses[0], list):

@@ -292,6 +292,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         return self.rpc_client.stop_profile().remote(need_response=True)
 
     def shutdown(self):
+        self._shutdown_execution_control()
         if self._shutdown_event.is_set():
             return
         self._shutdown_event.set()

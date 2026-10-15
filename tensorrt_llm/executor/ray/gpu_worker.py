@@ -350,7 +350,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         pass
 
     def shutdown(self):
-
+        self._shutdown_execution_control()
         if self.doing_shutdown:
             return
         else:

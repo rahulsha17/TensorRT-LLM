@@ -105,3 +105,66 @@ def test_attached_frontend_rejects_publication_without_worker_attributes() -> No
         proxy.get_execution_controller()
     assert proxy._execution_controller is None
     proxy._shutdown_execution_control()
+
+
+@pytest.mark.parametrize("kind", ["base", "rpc", "ray"])
+def test_all_worker_paths_bind_engine_authority(kind) -> None:
+    from tensorrt_llm.executor.base_worker import BaseWorker
+    from tensorrt_llm.executor.rpc_worker import RpcWorker
+
+    worker_type = BaseWorker if kind == "base" else RpcWorker
+    if kind == "ray":
+        pytest.importorskip("ray")
+        from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
+
+        worker_type = RayGPUWorker
+    worker = object.__new__(worker_type)
+    worker.shutdown = MagicMock()
+    worker._init_execution_control()
+    worker.doing_shutdown = False
+    worker._is_pytorch_backend = True
+    worker.llm_args = SimpleNamespace(
+        parallel_config=SimpleNamespace(world_size=1), num_serve_frontends=1
+    )
+    worker.engine = SimpleNamespace(configure_execution_authority=MagicMock())
+    try:
+        control = worker.get_execution_controller()
+        table = worker.get_execution_version_table()
+        worker.engine.configure_execution_authority.assert_called_once_with(table)
+        version = ExecutionVersion("tenant", "scope", 0)
+        control.register(version).wait()
+        assert table.current_version("tenant", "scope") == version
+    finally:
+        worker._shutdown_execution_control()
+
+
+def test_base_worker_closes_authority_before_engine_shutdown() -> None:
+    from tensorrt_llm.executor.base_worker import BaseWorker
+
+    worker = object.__new__(BaseWorker)
+    worker.shutdown = MagicMock()
+    worker._init_execution_control()
+    worker.doing_shutdown = False
+
+    def shutdown_engine():
+        assert worker._execution_control_closed
+
+    worker.engine = SimpleNamespace(can_shutdown=lambda: True, shutdown=shutdown_engine)
+    BaseWorker.shutdown(worker)
+    assert worker.engine is None
+
+
+@pytest.mark.parametrize("identity", [None, 88])
+def test_ray_submit_uses_common_authority_path_and_preserves_assigned_id(identity) -> None:
+    pytest.importorskip("ray")
+    from tensorrt_llm.executor.ray.executor import RayExecutor
+
+    executor = object.__new__(RayExecutor)
+    executor.shutdown = MagicMock()
+    executor._get_next_client_id = MagicMock(return_value=41)
+    executor._submit_rpc_generation = MagicMock()
+    request = SimpleNamespace(id=identity)
+    request.set_id = lambda value: setattr(request, "id", value)
+    assert RayExecutor.submit(executor, request) is executor._submit_rpc_generation.return_value
+    assert request.id == (41 if identity is None else identity)
+    executor._submit_rpc_generation.assert_called_once_with(request)

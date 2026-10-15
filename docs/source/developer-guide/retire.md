@@ -194,13 +194,21 @@ Runtime -> executor controller -> ScopeRegistry accepts epoch 8
                        publication handle <-----+ acknowledgement
 ```
 
-The first supported setup is one frontend and one PyTorch rank, using the direct
-`GenerationExecutorWorker` or classic IPC `GenerationExecutorProxy`. RPC/Ray
-executors, attached frontends, and multi-rank configurations reject controller
-creation. Publication starts only when the runtime explicitly requests the
+The execution guard requires one frontend and one PyTorch rank. The direct
+`GenerationExecutorWorker` and classic IPC `GenerationExecutorProxy` have model
+coverage. The RPC and Ray paths now use the same worker mailbox and frontend
+authority gates; their model qualification is still pending. Attached frontends
+and multi-rank configurations reject controller creation. Publication starts
+only when the runtime explicitly requests the
 controller. Untagged generation calls keep their existing behavior. Tagged work
 requires explicit registration and a successful initial publication; missing
 authority fails instead of silently running without checks.
+
+RPC and Ray register result routing before sending a request. Tagged sends run
+asynchronously so a congested ingress cannot hold the authority lock and delay
+ADVANCE. The worker rechecks authority when the request arrives. Transport
+failures reach the result, and responses pass the frontend gate before entering
+the consumer queue. Shutdown closes authority before tearing down workers.
 
 `CollectivePublicationTransport` provides the control-plane aggregation needed
 for multi-rank integration. The executor supplies the complete expected set of
@@ -225,7 +233,7 @@ an acknowledgement timeout does not release memory. A later revision or worker
 teardown reclaims abandoned holds through the existing worker lifecycle.
 
 This transport is tested with local tables and authenticated IPC mailboxes. It
-is not yet connected to MPI/Ray bootstrap, and does not coordinate model
+is connected to the single-worker RPC/Ray bootstrap, and does not coordinate model
 collectives or per-layer exit. Multi-rank executor support remains disabled
 until those paths can keep all ranks in the same collective schedule. Closing
 the transport only closes channels; it does not certify drain or native cleanup.

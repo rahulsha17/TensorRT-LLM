@@ -33,7 +33,6 @@ except ImportError:
     # Older Ray re-exported it from ray.util.placement_group
     from ray.util.placement_group import PlacementGroupSchedulingStrategy
 
-from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.executor.ray.utils import unwrap_ray_errors
 from tensorrt_llm.logger import logger
 
@@ -283,20 +282,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         """
         if request.id is None:
             request.set_id(self._get_next_client_id())
-        logprob_params = self._get_logprob_params(request)
-
-        with nvtx_range_debug("rpc_submit"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
-        result = GenerationResult(
-            request,
-            background_error_handler=self._handle_background_error,
-            executor=self,
-            disaggregated_params=request.disaggregated_params,
-            logprob_params=logprob_params)
-        self._results[request.id] = result
-
-        return result
+        return self._submit_rpc_generation(request)
 
     def start(self):
         pass
@@ -342,6 +328,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             result.abort()
 
     def shutdown(self):
+        self._shutdown_execution_control()
         if hasattr(self, '_shutdown_event') and self._shutdown_event.is_set():
             return
         if hasattr(self, '_shutdown_event'):
