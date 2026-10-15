@@ -212,7 +212,9 @@ RPC and Ray register result routing before sending a request. Submission runs
 asynchronously so a congested ingress cannot hold the authority lock and delay
 ADVANCE. The worker rechecks authority when the request arrives, then replies
 with an admission acknowledgement. Admission errors, including the worker
-traceback, and transport failures reach the result. A successful acknowledgement
+traceback, and transport failures reach the result. The RPC client registers the
+reply future before sending, so a fast acknowledgement cannot be dropped while
+the send is still pending. A successful acknowledgement
 does not finish the request or establish FENCE; tokens use the response stream
 and pass the frontend authority gate before entering the consumer queue. A late
 admission error cannot affect a replacement result. Shutdown closes authority

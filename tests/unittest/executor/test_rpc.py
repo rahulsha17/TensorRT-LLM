@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import concurrent.futures
 import threading
@@ -26,6 +28,112 @@ class RpcServerWrapper(RPCServer):
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.shutdown()
+
+
+class TestRpcReplyRouting:
+
+    @pytest.mark.parametrize("mode", ["sync", "async", "future"])
+    @pytest.mark.parametrize("worker_error", [False, True])
+    def test_reply_before_send_returns(self, monkeypatch, mode, worker_error):
+
+        class App:
+
+            def reply(self):
+                if worker_error:
+                    raise ValueError("admission rejected")
+                return "admitted"
+
+        with RpcServerWrapper(App()) as server:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
+                received = threading.Event()
+                registered = []
+                handle = client._handle_regular_response
+                send = client._client_socket.put_async
+
+                def receive(response):
+                    registered.append(
+                        response.request_id in client._pending_futures)
+                    handle(response)
+                    received.set()
+
+                async def send_until_reply(request):
+                    await send(request)
+                    assert await asyncio.to_thread(received.wait, 3)
+
+                monkeypatch.setattr(client, "_handle_regular_response", receive)
+                monkeypatch.setattr(client._client_socket, "put_async",
+                                    send_until_reply)
+
+                def call():
+                    remote = client.reply()
+                    if mode == "sync":
+                        return remote.remote(timeout=1)
+                    if mode == "async":
+                        return asyncio.run(remote.remote_async(timeout=1))
+                    return remote.remote_future(timeout=1).result(5)
+
+                if worker_error:
+                    with pytest.raises(RPCError, match="admission rejected"):
+                        call()
+                else:
+                    assert call() == "admitted"
+                assert registered == [True]
+                assert not client._pending_futures
+
+    @pytest.mark.parametrize("need_response", [False, True])
+    @pytest.mark.parametrize("failure", ["send_error", "cancelled"])
+    def test_failed_send_releases_routing(self, monkeypatch, need_response,
+                                          failure):
+        with RpcServerWrapper(object()) as server:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
+                pending = []
+
+                async def fail(request):
+                    pending.extend(client._pending_futures.values())
+                    if failure == "send_error":
+                        raise OSError("send failed")
+                    raise asyncio.CancelledError()
+
+                monkeypatch.setattr(client._client_socket, "put_async", fail)
+
+                async def call():
+                    error = OSError if failure == "send_error" else asyncio.CancelledError
+                    with pytest.raises(error):
+                        await client.unused().remote_async(
+                            need_response=need_response)
+
+                asyncio.run(call())
+                assert len(pending) == int(need_response)
+                assert all(future.cancelled() for future, _ in pending)
+                assert not client._pending_futures
+
+    def test_fire_and_forget_does_not_allocate_reply_future(self, monkeypatch):
+
+        class App:
+
+            def __init__(self):
+                self.called = threading.Event()
+
+            def reply(self):
+                self.called.set()
+
+        app = App()
+        with RpcServerWrapper(app) as server:
+            with RPCClient(server.addr, hmac_key=server.hmac_key) as client:
+                send = client._client_socket.put_async
+                registered = []
+
+                async def observe(request):
+                    registered.append(
+                        request.request_id in client._pending_futures)
+                    await send(request)
+
+                monkeypatch.setattr(client._client_socket, "put_async", observe)
+                assert client.reply().remote_future(
+                    need_response=False).result(5) is None
+                assert app.called.wait(3)
+                assert registered == [False]
+                assert not client._pending_futures
 
 
 class TestRpcBasics:

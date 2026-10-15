@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import concurrent.futures
 import os
@@ -471,17 +473,19 @@ class RPCClient:
                              kwargs=kwargs,
                              need_response=need_response,
                              timeout=timeout)
-        await self._client_socket.put_async(request)
-        logger_debug(f"[client] RPC Client sent request: {request}")
-
-        if not need_response:
-            return None
-
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self._pending_futures[request_id] = (future, loop)
+        future = None
+        if need_response:
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            # Sending may yield while the reader receives the worker's reply.
+            self._pending_futures[request_id] = (future, loop)
 
         try:
+            await self._client_socket.put_async(request)
+            logger_debug(f"[client] RPC Client sent request: {request}")
+            if future is None:
+                return None
+
             # If timeout, the remote call should return a timeout error timely,
             # so we add 1 second to the timeout to ensure the client can get
             # that result.
@@ -501,6 +505,12 @@ class RPCClient:
             raise e
         finally:
             self._pending_futures.pop(request_id, None)
+            if future is not None:
+                if not future.done():
+                    future.cancel()
+                elif not future.cancelled():
+                    # A send failure can win after a reply has already arrived.
+                    future.exception()
 
     def _ensure_event_loop(self):
         """Create and start the background event loop.
