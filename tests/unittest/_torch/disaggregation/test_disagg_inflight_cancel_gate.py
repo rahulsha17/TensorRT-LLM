@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import TransferOwner
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
@@ -256,7 +257,9 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     assert request.py_kv_transfer_start_time is None
     assert request.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
     # The queued transfer is released from the async manager at once.
-    coordinator._transfers.end_transfer.assert_called_once_with(request)
+    coordinator._transfers.end_transfer.assert_called_once_with(
+        request, owner=TransferOwner.TRANSCEIVER
+    )
     effects.terminate_request.assert_called_once_with(request)
 
 
@@ -292,7 +295,9 @@ def test_context_transfer_error_keeps_request_active_until_all_owners_release():
 
     coordinator.release_transfer(request)
 
-    coordinator._transfers.end_transfer.assert_called_once_with(request)
+    coordinator._transfers.end_transfer.assert_called_once_with(
+        request, owner=TransferOwner.TRANSCEIVER
+    )
     assert active_requests == [request]
     effects.terminate_request.assert_not_called()
 

@@ -20,7 +20,10 @@ import pytest
 
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import CtxTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
-from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+    AsyncTransferManager,
+    TransferOwner,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
@@ -80,6 +83,7 @@ def _finished_ctx_only_request(request_id: int = 1) -> SimpleNamespace:
         is_child=False,
         parent_request_id=None,
         py_request_id=request_id,
+        py_execution_version=None,
         py_kv_transfer_start_time=None,
     )
 
@@ -106,7 +110,9 @@ def test_connector_save_uses_previous_batch_with_overlap_scheduler() -> None:
     PyExecutor._save_kv_to_connector_async(executor, [current_req])
 
     executor.kv_connector_manager.request_finished.assert_called_once_with(prev_req, [7], None)
-    executor.async_transfer_manager.start_transfer.assert_called_once_with(prev_req)
+    executor.async_transfer_manager.start_transfer.assert_called_once_with(
+        prev_req, owner=TransferOwner.CONNECTOR
+    )
 
 
 def test_connector_save_uses_scheduled_batch_without_overlap_scheduler() -> None:
@@ -118,7 +124,9 @@ def test_connector_save_uses_scheduled_batch_without_overlap_scheduler() -> None
     PyExecutor._save_kv_to_connector_async(executor, [finished, running])
 
     executor.kv_connector_manager.request_finished.assert_called_once_with(finished, [7], None)
-    executor.async_transfer_manager.start_transfer.assert_called_once_with(finished)
+    executor.async_transfer_manager.start_transfer.assert_called_once_with(
+        finished, owner=TransferOwner.CONNECTOR
+    )
 
 
 def test_connector_save_skips_transfer_when_connector_declines() -> None:
@@ -205,6 +213,30 @@ def test_reap_releases_request_once_connector_declines() -> None:
     assert 9 not in executor.async_transfer_manager.requests_in_transfer()
     executor.kv_cache_manager.unpin_blocks_by_id.assert_called_once()
     executor._terminate_request.assert_called_once_with(req)
+
+
+@pytest.mark.parametrize("with_transceiver", [False, True])
+def test_connector_completion_releases_only_its_own_claim(with_transceiver: bool) -> None:
+    executor = _dual_claim_executor()
+    if not with_transceiver:
+        executor.kv_cache_transceiver = None
+    request = _dual_claim_request(9)
+    manager = executor.async_transfer_manager
+    manager.start_transfer(request, owner=TransferOwner.CONNECTOR)
+    if with_transceiver:
+        manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
+
+    PyExecutor._release_transfer(executor, request)
+    PyExecutor._release_transfer(executor, request)  # duplicate connector report
+
+    if with_transceiver:
+        assert manager.has_transfer(request, owner=TransferOwner.TRANSCEIVER)
+        executor._terminate_request.assert_not_called()
+        executor.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+        executor.disagg.release_transfer(request)
+    assert not manager.has_any_inflight_requests()
+    executor._terminate_request.assert_called_once_with(request)
+    executor.kv_cache_manager.unpin_blocks_by_id.assert_called_once()
 
 
 def test_connector_release_without_transceiver_terminates_on_last_claim() -> None:

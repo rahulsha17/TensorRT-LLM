@@ -66,7 +66,8 @@ from ..disaggregation.orchestration.coordinator import (
     transfer_window_bypass_eligible)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
-from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
+from ..disaggregation.orchestration.transfer_manager import (
+    AsyncTransferManager, TransferOwner)
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
 from ..models.modeling_multimodal_mixin import \
@@ -1316,17 +1317,18 @@ class PyExecutor:
                 "KvCacheConfig.disk_cache_size=0 to run GPU-only.")
 
     def _release_transfer(self, request: LlmRequest) -> None:
-        """Release one transfer claim held by the KV connector or transceiver.
+        """Release the KV connector's claim after its save has completed.
 
         With a transceiver the coordinator owns the release (response
-        staging, shared refcount with the connector). Without one only the
+        staging, independent holds for each accessor). Without one only the
         connector holds claims, so the request terminates as soon as its last
         save completes.
         """
         if self.kv_cache_transceiver is not None:
-            self.disagg.release_transfer(request)
+            self.disagg.release_transfer(request, owner=TransferOwner.CONNECTOR)
             return
-        if self.async_transfer_manager.end_transfer(request):
+        if self.async_transfer_manager.end_transfer(
+                request, owner=TransferOwner.CONNECTOR):
             if not self.force_terminate_ctx_for_partial_reuse:
                 self._terminate_request(request)
 
@@ -7850,7 +7852,8 @@ class PyExecutor:
             else:
                 if self.kv_connector_manager.request_finished(
                         req, cache_block_ids, by_layer_group):
-                    self.async_transfer_manager.start_transfer(req)
+                    self.async_transfer_manager.start_transfer(
+                        req, owner=TransferOwner.CONNECTOR)
 
         if not self.disable_overlap_scheduler:
             requests = self.previous_batch.scheduled_requests.all_requests(

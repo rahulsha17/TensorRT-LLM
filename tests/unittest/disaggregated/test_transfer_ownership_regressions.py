@@ -38,6 +38,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Receiver,
     RxSession,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import TransferOwner
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
@@ -1562,9 +1563,13 @@ def test_bridge_rejection_releases_only_without_physical_owner(
 
     executor.disagg.send_completed_context([request])
 
-    async_transfer_manager.start_transfer.assert_called_once_with(request)
+    async_transfer_manager.start_transfer.assert_called_once_with(
+        request, owner=TransferOwner.TRANSCEIVER
+    )
     if releases_claim:
-        async_transfer_manager.end_transfer.assert_called_once_with(request)
+        async_transfer_manager.end_transfer.assert_called_once_with(
+            request, owner=TransferOwner.TRANSCEIVER
+        )
         assert request.py_kv_transfer_start_time is None
     else:
         async_transfer_manager.end_transfer.assert_not_called()

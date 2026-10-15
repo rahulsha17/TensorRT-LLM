@@ -17,6 +17,7 @@ from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import TransferOwner
 from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
@@ -213,7 +214,7 @@ def test_send_completion_does_not_release_a_claim_the_connector_still_holds() ->
     h = _Harness()
     req = _Request(1)
     h.send(req)
-    h.transfers.start_transfer(req)  # the connector's claim
+    h.transfers.start_transfer(req, owner=TransferOwner.CONNECTOR)  # the connector's claim
     h.transceiver.finish_send(req)
 
     h.coordinator.reap_context_sends(0)
@@ -222,10 +223,33 @@ def test_send_completion_does_not_release_a_claim_the_connector_still_holds() ->
     h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
     assert h.effects.terminated == []
 
-    h.coordinator.release_transfer(req)  # the connector finishes
+    # A duplicate transceiver completion cannot consume the connector's hold.
+    h.coordinator.release_transfer(req)
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    assert h.effects.terminated == []
+
+    h.coordinator.release_transfer(req, owner=TransferOwner.CONNECTOR)  # the connector finishes
 
     assert not h.in_transfer(req)
     assert h.effects.terminated == [req]
+
+
+def test_duplicate_completion_does_not_publish_another_response() -> None:
+    h = _Harness()
+    response = SimpleNamespace(result=SimpleNamespace(cached_tokens=0))
+    req = _Request(1, response=response)
+    h.active.append(req)
+    h.send(req)
+    h.transfers.start_transfer(req, owner=TransferOwner.CONNECTOR)
+    h.transceiver.finish_send(req)
+    h.coordinator.reap_context_sends(0)
+    assert len(h.effects.staged_responses) == 1
+
+    h.coordinator.release_transfer(req)
+    assert len(h.effects.staged_responses) == 1
+    assert h.in_transfer(req)
+    h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
 
 
 def test_legacy_timeout_cancels_and_releases_a_queued_send(clock) -> None:

@@ -36,6 +36,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TxSession,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import TransferOwner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
@@ -1409,7 +1410,9 @@ def test_send_disagg_ctx_kv_sends_final_chunk_in_generation_complete_state():
 
     coordinator.send_completed_context([request])
 
-    transfer_manager.start_transfer.assert_called_once_with(request)
+    transfer_manager.start_transfer.assert_called_once_with(
+        request, owner=TransferOwner.TRANSCEIVER
+    )
     transceiver.respond_and_send_async.assert_called_once_with(request)
 
 

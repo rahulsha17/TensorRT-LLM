@@ -18,11 +18,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+    AsyncTransferManager,
+    TransferOwner,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.execution_version import ExecutionVersion
 
 pytestmark = pytest.mark.cpu_only
 
@@ -31,6 +35,7 @@ def create_mock_request(request_id: int):
     """Create a mock LlmRequest with the given request ID."""
     request = MagicMock()
     request.py_request_id = request_id
+    request.py_execution_version = None
     request.state = LlmRequestState.GENERATION_IN_PROGRESS
     return request
 
@@ -69,7 +74,7 @@ def test_start_transfer_single_request():
     manager = AsyncTransferManager(resource_manager)
 
     request = create_mock_request(42)
-    manager.start_transfer(request)
+    manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
 
     # Check request is tracked
     assert 42 in manager._requests_in_transfer
@@ -88,35 +93,125 @@ def test_start_transfer_single_request():
     # Check seq slot manager was called to free resources
     seq_slot_manager.free_resources.assert_called_once_with(request)
 
-    manager.end_transfer(request)
+    manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
     kv_cache_manager.unpin_blocks_by_id.assert_called_once()
 
 
-def test_start_transfer_multiple_transfers_same_request():
-    """Test starting multiple transfers for the same request."""
+@pytest.mark.parametrize("first_owner", list(TransferOwner))
+def test_two_transfer_owners_release_independently(first_owner: TransferOwner) -> None:
     kv_cache_manager = MagicMock()
     kv_cache_manager.store_blocks_for_reuse.return_value = 100
-    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
-    manager = AsyncTransferManager(resource_manager)
-
+    manager = AsyncTransferManager(create_mock_resource_manager(kv_cache_manager=kv_cache_manager))
     request = create_mock_request(42)
-    manager.start_transfer(request)
-    manager.start_transfer(request)
-    manager.start_transfer(request)
-
-    # Counter should be incremented
-    transfer_metadata = manager._request_transfer_metadata[42]
-    assert transfer_metadata.counter == 3
-
-    # store_blocks_for_reuse should only be called once
+    second_owner = next(owner for owner in TransferOwner if owner is not first_owner)
+    for owner in (first_owner, second_owner):
+        manager.start_transfer(request, owner=owner)
+    assert manager._request_transfer_metadata[42].counter == 2
     kv_cache_manager.store_blocks_for_reuse.assert_called_once()
 
-    for _ in range(2):
-        manager.end_transfer(request)
-        kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    assert not manager.end_transfer(request, owner=first_owner)
+    assert not manager.end_transfer(request, owner=first_owner)  # duplicate completion
+    assert manager.has_transfer(request, owner=second_owner)
+    kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    assert manager.end_transfer(request, owner=second_owner)
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(100)
+    assert not manager.end_transfer(request, owner=second_owner)
+    assert not manager.has_any_inflight_requests()
 
-    manager.end_transfer(request)
-    kv_cache_manager.unpin_blocks_by_id.assert_called_once()
+
+@pytest.mark.parametrize("owner", list(TransferOwner))
+def test_duplicate_start_preserves_the_original_hold(owner: TransferOwner) -> None:
+    cache, slots = MagicMock(), MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache, slots))
+    request = create_mock_request(42)
+    manager.start_transfer(request, owner=owner)
+
+    with pytest.raises(RuntimeError, match="already holds"):
+        manager.start_transfer(request, owner=owner)
+
+    assert manager._request_transfer_metadata[42].counter == 1
+    cache.store_blocks_for_reuse.assert_called_once()
+    slots.free_resources.assert_called_once()
+    cache.unpin_blocks_by_id.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["start_transfer", "end_transfer", "has_transfer"])
+@pytest.mark.parametrize("mutation", ["request", "version", "request_id"])
+def test_mismatched_identity_cannot_touch_live_claims(operation: str, mutation: str) -> None:
+    cache = MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache))
+    request = create_mock_request(42)
+    request.py_execution_version = ExecutionVersion("tenant", "scope", 1)
+    manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
+
+    if mutation == "request":
+        other = create_mock_request(42)
+        other.py_execution_version = request.py_execution_version
+    elif mutation == "version":
+        other = request
+        other.py_execution_version = ExecutionVersion("tenant", "scope", 2)
+    else:
+        other = create_mock_request(43)
+        manager.start_transfer(other, owner=TransferOwner.CONNECTOR)
+        other.py_request_id = 42
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        getattr(manager, operation)(other, owner=TransferOwner.CONNECTOR)
+
+    assert manager._requests_in_transfer[42] is request
+    assert manager._request_transfer_metadata[42].version.epoch == 1
+    assert manager._request_transfer_metadata[42].owners == {TransferOwner.TRANSCEIVER}
+    cache.unpin_blocks_by_id.assert_not_called()
+
+
+def test_late_completion_cannot_release_a_new_request_with_the_same_id() -> None:
+    cache = MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache))
+    old, new = create_mock_request(42), create_mock_request(42)
+    manager.start_transfer(old, owner=TransferOwner.TRANSCEIVER)
+    assert manager.end_transfer(old, owner=TransferOwner.TRANSCEIVER)
+    manager.start_transfer(new, owner=TransferOwner.TRANSCEIVER)
+    cache.unpin_blocks_by_id.reset_mock()
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        manager.end_transfer(old, owner=TransferOwner.TRANSCEIVER)
+
+    assert manager.has_transfer(new, owner=TransferOwner.TRANSCEIVER)
+    cache.unpin_blocks_by_id.assert_not_called()
+
+
+@pytest.mark.parametrize("owner", list(TransferOwner))
+def test_failed_unpin_keeps_ownership_and_request_state(owner: TransferOwner) -> None:
+    cache = MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache))
+    request = create_mock_request(42)
+    manager.start_transfer(request, owner=owner)
+    cache.unpin_blocks_by_id.side_effect = RuntimeError("unpin failed")
+
+    with pytest.raises(RuntimeError, match="unpin failed"):
+        manager.end_transfer(request, owner=owner)
+
+    assert manager.has_transfer(request, owner=owner)
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    assert manager.has_any_inflight_requests()
+    cache.unpin_blocks_by_id.side_effect = None
+    with pytest.raises(RuntimeError, match="release is unknown"):
+        manager.end_transfer(request, owner=owner)
+    with pytest.raises(RuntimeError, match="release is unknown"):
+        manager.start_transfer(request, owner=owner)
+    cache.unpin_blocks_by_id.assert_called_once()
+
+
+@pytest.mark.parametrize("operation", ["start_transfer", "end_transfer", "has_transfer"])
+def test_unknown_owner_does_not_change_resources(operation: str) -> None:
+    cache, slots = MagicMock(), MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache, slots))
+    request = create_mock_request(42)
+    with pytest.raises(TypeError, match="TransferOwner"):
+        getattr(manager, operation)(request, owner="transceiver")
+    assert not manager.has_any_inflight_requests()
+    cache.store_blocks_for_reuse.assert_not_called()
+    slots.free_resources.assert_not_called()
 
 
 def test_transfer_without_storing_blocks():
@@ -130,7 +225,7 @@ def test_transfer_without_storing_blocks():
     manager = AsyncTransferManager(resource_manager, should_store_blocks=False)
 
     request = create_mock_request(42)
-    manager.start_transfer(request)
+    manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
 
     # Check request is tracked
     assert 42 in manager._requests_in_transfer
@@ -142,7 +237,7 @@ def test_transfer_without_storing_blocks():
     kv_cache_manager.store_blocks_for_reuse.assert_not_called()
     spec_resource_manager.free_resources.assert_called_once_with(request)
 
-    assert manager.end_transfer(request)
+    assert manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
 
     kv_cache_manager.unpin_blocks_by_id.assert_not_called()
 
@@ -155,12 +250,12 @@ def test_end_transfer_preserves_error_state():
     manager = AsyncTransferManager(resource_manager)
 
     request = create_mock_request(42)
-    manager.start_transfer(request)
+    manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
 
     # Set error state before end_transfer
     request.state = LlmRequestState.DISAGG_TRANS_ERROR
 
-    manager.end_transfer(request)
+    manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
 
     # Error state should be preserved
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
@@ -177,9 +272,9 @@ def test_requests_in_transfer():
     request2 = create_mock_request(2)
     request3 = create_mock_request(3)
 
-    manager.start_transfer(request1)
-    manager.start_transfer(request2)
-    manager.start_transfer(request3)
+    manager.start_transfer(request1, owner=TransferOwner.TRANSCEIVER)
+    manager.start_transfer(request2, owner=TransferOwner.TRANSCEIVER)
+    manager.start_transfer(request3, owner=TransferOwner.TRANSCEIVER)
 
     in_transfer = manager.requests_in_transfer()
 
@@ -194,6 +289,7 @@ def _slot_request(request_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         request_id=request_id,
         py_request_id=request_id,
+        py_execution_version=None,
         state=LlmRequestState.CONTEXT_INIT,
         seq_slot=None,
         py_seq_slot=None,
@@ -231,7 +327,7 @@ def test_start_transfer_frees_the_sequence_slot_so_the_next_request_fits():
     with pytest.raises(NoFreeSlotsError):
         prepare(second)
 
-    manager.start_transfer(first)
+    manager.start_transfer(first, owner=TransferOwner.TRANSCEIVER)
 
     prepare(second)
     assert second.py_seq_slot == 0

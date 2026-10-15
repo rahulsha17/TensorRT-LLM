@@ -24,6 +24,7 @@ from tensorrt_llm.logger import logger
 
 from .admission import DisaggTransferAdmissionController
 from .interfaces import ActiveRequestRegistry, ExecutorEffects
+from .transfer_manager import TransferOwner
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
@@ -432,7 +433,7 @@ class DisaggTransferCoordinator:
                 # and pins them; it must run before respond_and_send_async
                 # sends the final slice and (for the Python transceiver) moves
                 # the request toward completion.
-                self._transfers.start_transfer(req)
+                self._transfers.start_transfer(req, owner=TransferOwner.TRANSCEIVER)
                 self._transceiver.respond_and_send_async(req)
                 # Bridge validation can reject before a transfer session exists.
                 # Release the claim right away: there is no physical accessor
@@ -517,20 +518,24 @@ class DisaggTransferCoordinator:
         if not self.inflight_cancel_active():
             self._check_transfer_errors("generation requests")
 
-    def release_transfer(self, request: LlmRequest) -> None:
+    def release_transfer(
+        self, request: LlmRequest, *, owner: TransferOwner = TransferOwner.TRANSCEIVER
+    ) -> None:
         """Release one transfer claim and terminate once the last owner releases.
 
         The transceiver and the KV connector can both hold a claim on the same
-        request; ``AsyncTransferManager`` counts them. A request that is still
+        request; ``AsyncTransferManager`` tracks them separately. A request that is still
         active gets its response created here (the transfer completed before
         the response pass could run) and staged for the rank-synchronized
         flush; a failed transfer only releases its claim so the synchronized
         error path can respond once every owner is done.
         """
+        if not self._transfers.has_transfer(request, owner=owner):
+            return
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
         if self._registry.contains(request):
             if transfer_failed:
-                self._transfers.end_transfer(request)
+                self._transfers.end_transfer(request, owner=owner)
                 return
             # Create the response while the state is still TRANS_IN_PROGRESS
             # (required by C++ createResult).
@@ -538,7 +543,7 @@ class DisaggTransferCoordinator:
             if response:
                 response.result.cached_tokens = request.cached_tokens
                 attach_ctx_usage(request, response)
-            released = self._transfers.end_transfer(request)
+            released = self._transfers.end_transfer(request, owner=owner)
             if released:
                 self._registry.remove(request)
             if response:
@@ -548,7 +553,7 @@ class DisaggTransferCoordinator:
             elif released:
                 self._effects.terminate_request(request)
             return
-        if self._transfers.end_transfer(request):
+        if self._transfers.end_transfer(request, owner=owner):
             if transfer_failed:
                 return
             # Skip if the PP=1 early path already terminated this request;
@@ -838,7 +843,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def reap_gen_receives(self, at_least: int = 0) -> None:
         return None
 
-    def release_transfer(self, request: LlmRequest) -> None:
+    def release_transfer(
+        self, request: LlmRequest, *, owner: TransferOwner = TransferOwner.TRANSCEIVER
+    ) -> None:
         raise RuntimeError(
             "release_transfer has no transceiver to serve; connector-only "
             "releases are handled by the executor"

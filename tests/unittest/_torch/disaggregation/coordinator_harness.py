@@ -27,6 +27,7 @@ class TransferRequest(SimpleNamespace):
     def __init__(self, rid: int, **overrides) -> None:
         defaults = dict(
             py_request_id=rid,
+            py_execution_version=None,
             request_id=rid,
             parent_request_id=None,
             is_child=False,

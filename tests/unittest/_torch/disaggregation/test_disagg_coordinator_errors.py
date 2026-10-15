@@ -18,7 +18,10 @@ from fake_dist import FakeDistGroup
 from fake_kv_cache_transceiver import FakeKvCacheTransceiver
 
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
-from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+    AsyncTransferManager,
+    TransferOwner,
+)
 from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
     PyExecutorEffects,
     PyExecutorRequestRegistry,
@@ -121,7 +124,7 @@ def test_failed_context_send_waits_until_every_transfer_owner_released_it() -> N
     failed = TransferRequest(7)
     h.active.append(failed)
     h.send(failed)
-    h.transfers.start_transfer(failed)  # the connector's claim
+    h.transfers.start_transfer(failed, owner=TransferOwner.CONNECTOR)  # the connector's claim
     h.transceiver.finish_send(failed, outcome="error")
 
     h.coordinator.reap_context_sends(0)
@@ -132,7 +135,7 @@ def test_failed_context_send_waits_until_every_transfer_owner_released_it() -> N
     assert h.effects.failed == []
     h.kv_cache_manager.unpin_blocks_by_id.assert_not_called()
 
-    h.coordinator.release_transfer(failed)  # the connector lets go
+    h.coordinator.release_transfer(failed, owner=TransferOwner.CONNECTOR)  # the connector lets go
     h.coordinator._check_transfer_errors("context requests")
 
     assert not h.in_transfer(failed)
@@ -254,7 +257,7 @@ def test_a_locally_blocked_request_vetoes_the_vote_on_every_rank(blocker: str) -
     if blocker == "user_cancelled":
         ranks[0].registry.canceled = [7]
     else:
-        ranks[0].transfers.start_transfer(blocked)
+        ranks[0].transfers.start_transfer(blocked, owner=TransferOwner.CONNECTOR)
     # The send fails after the transfer started: start_transfer itself moves
     # the request to TRANS_IN_PROGRESS, so the error state must come last.
     blocked.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -282,7 +285,7 @@ def test_a_vetoed_error_is_cleaned_up_once_the_blocker_clears(blocker: str) -> N
     if blocker == "user_cancelled":
         ranks[0].registry.canceled = [7]
     else:
-        ranks[0].transfers.start_transfer(blocked)
+        ranks[0].transfers.start_transfer(blocked, owner=TransferOwner.CONNECTOR)
     blocked.state = LlmRequestState.DISAGG_TRANS_ERROR
     failed = _failed_gen(7)
     ranks[1].active.append(failed)
@@ -299,7 +302,9 @@ def test_a_vetoed_error_is_cleaned_up_once_the_blocker_clears(blocker: str) -> N
         ranks[0].registry.canceled = []
         rank0_round2_vote, rank0_failed = _vote(), [(_VOTE_MSG, [], False)]
     else:
-        ranks[0].coordinator.release_transfer(blocked)  # the connector lets go
+        ranks[0].coordinator.release_transfer(
+            blocked, owner=TransferOwner.CONNECTOR
+        )  # the connector lets go
         rank0_round2_vote, rank0_failed = _vote(error_ids=[7]), [(_VOTE_MSG, [blocked], False)]
 
     vote_round()  # consensus

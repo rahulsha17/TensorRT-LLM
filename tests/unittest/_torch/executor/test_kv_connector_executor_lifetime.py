@@ -9,7 +9,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+    AsyncTransferManager,
+    TransferOwner,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorManager
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     CONTROL_REQUEST_ID,
@@ -49,6 +52,7 @@ def _request(request_id: int = 1) -> SimpleNamespace:
     response = SimpleNamespace(result=SimpleNamespace(cached_tokens=0))
     request = SimpleNamespace(
         py_request_id=request_id,
+        py_execution_version=None,
         is_child=False,
         is_dummy_request=False,
         is_finished=False,
@@ -260,7 +264,7 @@ def test_polling_continues_for_save_after_load_completion(use_kv_cache_manager_v
     executor._release_transfer = MethodType(PyExecutor._release_transfer, executor)
     request = _request()
     request.is_finished = True
-    executor.async_transfer_manager.start_transfer(request)
+    executor.async_transfer_manager.start_transfer(request, owner=TransferOwner.CONNECTOR)
     connector.get_finished.side_effect = [[], [request]]
 
     for _ in range(2):
