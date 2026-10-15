@@ -142,11 +142,9 @@ class CollectivePublicationTransport:
                 raise ValueError("RESUME requires this collective's live ALIGN receipt")
             if self.poll_alignment(update.resume.request, stop) != update.resume:
                 raise RuntimeError("RESUME requires every worker's live reservation and FENCE")
-            prefix_length = (
-                aligned.receipt.reusable_prefix_length
-                if update.resume_prefix_length is None
-                else update.resume_prefix_length
-            )
+            prefix_length = update.resume_prefix_length
+            if prefix_length is None and len(self._participants) > 1:
+                prefix_length = aligned.receipt.reusable_prefix_length
             local_updates = {
                 id(t): replace(
                     update,

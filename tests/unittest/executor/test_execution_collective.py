@@ -34,6 +34,35 @@ ALIGN = AlignmentRequest("session", REVISION, INPUT)
 FENCE = FenceRequest("session", REVISION)
 
 
+@pytest.mark.parametrize("parent_limit", [None, 2])
+def test_single_worker_keeps_extra_reuse_unless_parent_requires_a_bound(parent_limit):
+    participant = ExecutionParticipant(0, 0)
+    table = WorkerVersionTable("session")
+    hold = Mock(num_tokens=3)
+    table.drain_tracker = RequestDrainTracker()
+    table.alignment_state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    transport = CollectivePublicationTransport(
+        (participant,), {participant: LocalPublicationTransport(table)}
+    )
+    try:
+        transport.publish(VersionUpdate("session", 1, OLD), Event())
+        transport.publish(VersionUpdate("session", 2, NEW, ALIGN), Event())
+        table.alignment_state.process()
+        receipt = transport.poll_alignment(ALIGN, Event())
+        transport.publish(VersionUpdate("session", 3, NEW, ALIGN, receipt, parent_limit), Event())
+        assert (
+            table.alignment_state.claim(NEW, 101, INPUT.input_token_ids, INPUT.cache_salt, None)
+            == parent_limit
+        )
+        # Additional matching KV may appear after the original reservation.
+        table.alignment_state.confirm_attachment(NEW, 101, 4 if parent_limit is None else 2)
+        hold.close.assert_called_once()
+    finally:
+        transport.close()
+        table.close()
+        table.alignment_state.process()
+
+
 def test_source_wake_runs_only_after_every_peer_records_alignment_and_reclaim():
     participants = (ExecutionParticipant(0, 0), ExecutionParticipant(1, 0))
     tables = [WorkerVersionTable("session") for _ in participants]
