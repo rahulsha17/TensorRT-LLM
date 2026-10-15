@@ -13,6 +13,8 @@ from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatch
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.execution_fence import RequestDrainTracker
+from tensorrt_llm.execution_gate import ExecutionAuthorityError
+from tensorrt_llm.execution_mailbox import VersionUpdate, WorkerVersionTable
 from tensorrt_llm.execution_version import ExecutionVersion
 
 pytestmark = pytest.mark.cpu_only
@@ -23,6 +25,7 @@ def _worker():
     worker = object.__new__(TransferWorker)
     worker._execution_session_lock = threading.Lock()
     worker._execution_drain = None
+    worker._execution_authority = None
     worker._sessions_started = False
     worker._config = TransferWorkerConfig(
         kv_cache_manager=Mock(),
@@ -56,6 +59,14 @@ def _request(version=VERSION, wire_id=99):
     )
 
 
+def _bind(worker, drain):
+    table = WorkerVersionTable("authority")
+    table.drain_tracker = drain
+    table.apply(VersionUpdate("authority", 1, VERSION))
+    worker.bind_execution_authority(table)
+    return table
+
+
 def _create(worker, direction, request):
     return (worker.create_tx_session if direction == "send" else worker.create_rx_session)(request)
 
@@ -67,7 +78,7 @@ def _peer(worker, direction):
 @pytest.mark.parametrize("direction", ["send", "receive"])
 def test_claim_precedes_session_publication(direction):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     drain.enqueue(VERSION, lambda: 41)
 
     def published(session):
@@ -88,7 +99,7 @@ def test_claim_precedes_session_publication(direction):
 @pytest.mark.parametrize("cleanup_fails", [False, True])
 def test_cleanup_before_claim_attachment_is_not_lost(direction, cleanup_fails):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     drain.enqueue(VERSION, lambda: 41)
 
     def published(session):
@@ -116,7 +127,7 @@ def test_cleanup_before_claim_attachment_is_not_lost(direction, cleanup_fails):
 @pytest.mark.parametrize("direction", ["send", "receive"])
 def test_cancelled_session_keeps_fence_pending_until_physical_drain_and_cleanup(direction):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     drain.enqueue(VERSION, lambda: 41)
     session = _create(worker, direction, _request())
     accessor = object()
@@ -140,7 +151,7 @@ def test_cancelled_session_keeps_fence_pending_until_physical_drain_and_cleanup(
 @pytest.mark.parametrize("stage", ["construct", "release"])
 def test_uncertain_setup_or_cleanup_never_proves_fence(direction, stage):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     drain.enqueue(VERSION, lambda: 41)
     peer = _peer(worker, direction)
     if stage == "construct":
@@ -164,12 +175,13 @@ def test_uncertain_setup_or_cleanup_never_proves_fence(direction, stage):
 @pytest.mark.parametrize("direction", ["send", "receive"])
 def test_reused_request_id_does_not_release_successor_session(direction):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     drain.enqueue(VERSION, lambda: 41)
     old = _create(worker, direction, _request())
     drain.complete(41, VERSION)
     successor = replace(VERSION, epoch=1)
     drain.enqueue(successor, lambda: 41)
+    worker._execution_authority.apply(VersionUpdate("authority", 2, successor))
     new = _create(worker, direction, _request(successor, wire_id=100))
     drain.complete(41, successor)
     assert old.close()
@@ -184,7 +196,7 @@ def test_reused_request_id_does_not_release_successor_session(direction):
 @pytest.mark.parametrize("direction", ["send", "receive"])
 def test_claim_release_error_after_side_effect_keeps_fence_unknown(direction, monkeypatch):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     drain.enqueue(VERSION, lambda: 41)
     session = _create(worker, direction, _request())
     drain.complete(41, VERSION)
@@ -217,7 +229,7 @@ def test_tagged_session_without_tracking_never_reaches_backend(direction):
 @pytest.mark.parametrize("live", [False, True])
 def test_session_requires_matching_admitted_request(direction, live):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     if live:
         drain.enqueue(replace(VERSION, epoch=1), lambda: 41)
     with pytest.raises(RuntimeError, match="no matching live owner"):
@@ -228,7 +240,7 @@ def test_session_requires_matching_admitted_request(direction, live):
 @pytest.mark.parametrize("direction", ["send", "receive"])
 def test_changed_version_during_construction_fails_closed(direction):
     worker, drain = _worker(), RequestDrainTracker()
-    worker.bind_execution_drain(drain)
+    _bind(worker, drain)
     drain.enqueue(VERSION, lambda: 41)
     request = _request()
 
@@ -268,3 +280,136 @@ def test_binding_cannot_replace_the_tracker():
     worker.bind_execution_drain(drain)
     with pytest.raises(RuntimeError, match="cannot change"):
         worker.bind_execution_drain(RequestDrainTracker())
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("unavailable", ["revoked", "unknown", "closed"])
+def test_unavailable_authority_rejects_before_claim_or_native_setup(direction, unavailable):
+    worker, drain = _worker(), RequestDrainTracker()
+    table = _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    if unavailable == "revoked":
+        table.apply(VersionUpdate("authority", 2, replace(VERSION, epoch=1)))
+    elif unavailable == "unknown":
+        table = WorkerVersionTable("empty")
+        table.drain_tracker = drain
+        worker = _worker()
+        worker.bind_execution_authority(table)
+    else:
+        table.close()
+    with pytest.raises(ExecutionAuthorityError):
+        _create(worker, direction, _request())
+    assert not drain._resources
+    worker._aux_buffer.alloc_slot.assert_not_called()
+    _peer(worker, direction).setup_session.assert_not_called()
+    drain.complete(41, VERSION)
+    assert drain.drained(VERSION)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_drain_tracking_alone_does_not_grant_session_authority(direction):
+    worker, drain = _worker(), RequestDrainTracker()
+    worker.bind_execution_drain(drain)
+    drain.enqueue(VERSION, lambda: 41)
+    with pytest.raises(RuntimeError, match="requires execution authority"):
+        _create(worker, direction, _request())
+    assert not drain._resources
+    _peer(worker, direction).setup_session.assert_not_called()
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_admitted_session_keeps_fence_pending_without_blocking_publication(direction, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    worker, drain = _worker(), RequestDrainTracker()
+    table = _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    registered = threading.Event()
+    release_claim = threading.Event()
+    constructing = threading.Event()
+    release_construction = threading.Event()
+    publication_attempt = threading.Event()
+    acquire = drain.acquire_resource
+
+    def acquire_and_pause(*args, **kwargs):
+        claim = acquire(*args, **kwargs)
+        registered.set()
+        assert release_claim.wait(5)
+        return claim
+
+    def construct(_session):
+        constructing.set()
+        assert release_construction.wait(5)
+
+    def publish():
+        publication_attempt.set()
+        return table.apply(VersionUpdate("authority", 2, replace(VERSION, epoch=1)))
+
+    monkeypatch.setattr(drain, "acquire_resource", acquire_and_pause)
+    _peer(worker, direction).setup_session.side_effect = construct
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        creation = pool.submit(_create, worker, direction, _request())
+        try:
+            assert registered.wait(5)
+            publication = pool.submit(publish)
+            assert publication_attempt.wait(5)
+            assert not publication.done()
+            release_claim.set()
+            assert constructing.wait(5)
+            assert publication.result(5).observed_version.epoch == 1
+            drain.complete(41, VERSION)
+            assert not drain.drained(VERSION)
+        finally:
+            release_claim.set()
+            release_construction.set()
+        session = creation.result(5)
+    assert session.close()
+    assert drain.drained(VERSION)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_replacing_bound_tracker_cannot_move_a_claim_to_another_drain(direction):
+    worker, drain = _worker(), RequestDrainTracker()
+    table = _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    table.drain_tracker = RequestDrainTracker()
+    with pytest.raises(RuntimeError, match="drain tracker changed"):
+        _create(worker, direction, _request())
+    assert not drain._resources and not table.drain_tracker._resources
+    _peer(worker, direction).setup_session.assert_not_called()
+
+
+@pytest.mark.parametrize("missing", ["ownership", "retirement", "tracker", "open"])
+def test_authority_binding_requires_complete_live_ownership(missing):
+    worker = _worker()
+    table = WorkerVersionTable("authority")
+    table.drain_tracker = RequestDrainTracker()
+    if missing == "ownership":
+        worker._config.enforce_physical_ownership = False
+    elif missing == "retirement":
+        worker._retirement_watchdog = None
+    elif missing == "tracker":
+        table.drain_tracker = None
+    else:
+        table.close()
+    with pytest.raises(RuntimeError):
+        worker.bind_execution_authority(table)
+    assert worker._execution_authority is None and worker._execution_drain is None
+
+
+def test_authority_binding_is_fixed_before_session_admission():
+    worker, drain = _worker(), RequestDrainTracker()
+    table = _bind(worker, drain)
+    worker.bind_execution_authority(table)
+    other = WorkerVersionTable("other")
+    other.drain_tracker = drain
+    with pytest.raises(RuntimeError, match="cannot change"):
+        worker.bind_execution_authority(other)
+    fresh = _worker()
+    fresh.bind_execution_drain(RequestDrainTracker())
+    with pytest.raises(RuntimeError, match="different drain"):
+        fresh.bind_execution_authority(table)
+    untagged = _worker()
+    assert _create(untagged, "send", _request(None)).close()
+    with pytest.raises(RuntimeError, match="after session admission"):
+        untagged.bind_execution_authority(table)

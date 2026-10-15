@@ -4066,7 +4066,7 @@ class PyExecutor:
                 table.drain_tracker)
             transceiver = getattr(self, 'kv_cache_transceiver', None)
             if transceiver is not None:
-                transceiver.bind_execution_drain(table.drain_tracker)
+                transceiver.bind_execution_authority(table)
         except Exception as error:
             guard.execution_failed(error)
             raise

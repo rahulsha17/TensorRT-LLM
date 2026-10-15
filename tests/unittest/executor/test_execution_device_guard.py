@@ -127,7 +127,12 @@ def test_authority_installation_binds_transfer_drain_or_fails_closed(
     )
     if binding_failure:
         owner = transfers if binding_failure == "manager" else transceiver
-        owner.bind_execution_drain.side_effect = RuntimeError("bind failed")
+        binding = (
+            owner.bind_execution_drain
+            if binding_failure == "manager"
+            else owner.bind_execution_authority
+        )
+        binding.side_effect = RuntimeError("bind failed")
         with pytest.raises(RuntimeError, match="bind failed"):
             PyExecutor.configure_execution_authority(executor, table)
         assert executor._execution_guard is None
@@ -141,9 +146,9 @@ def test_authority_installation_binds_transfer_drain_or_fails_closed(
     transfers.bind_execution_drain.assert_called_once_with(tracker)
     if transceiver is not None:
         if binding_failure == "manager":
-            transceiver.bind_execution_drain.assert_not_called()
+            transceiver.bind_execution_authority.assert_not_called()
         else:
-            transceiver.bind_execution_drain.assert_called_once_with(tracker)
+            transceiver.bind_execution_authority.assert_called_once_with(table)
 
 
 def test_residency_rpc_preserves_cache_namespace_and_page_tiers(monkeypatch) -> None:

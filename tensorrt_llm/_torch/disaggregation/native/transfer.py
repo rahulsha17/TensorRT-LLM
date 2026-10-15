@@ -97,6 +97,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.execution_fence import RequestDrainTracker, RequestResourceClaim
+from tensorrt_llm.execution_mailbox import WorkerVersionTable
 
 if TYPE_CHECKING:
     from .bounce import Config
@@ -4594,6 +4595,7 @@ class TransferWorker:
         self._config = config
         self._execution_session_lock = threading.Lock()
         self._execution_drain: Optional[RequestDrainTracker] = None
+        self._execution_authority: Optional[WorkerVersionTable] = None
         self._sessions_started = False
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
@@ -4654,6 +4656,32 @@ class TransferWorker:
                 raise RuntimeError("KV execution drain requires physical ownership and retirement")
             self._execution_drain = drain
 
+    def bind_execution_authority(self, table: WorkerVersionTable) -> None:
+        """Bind session admission to the same owner that publishes request epochs."""
+        if not isinstance(table, WorkerVersionTable):
+            raise TypeError("execution authority must be a WorkerVersionTable")
+        _ = table.identity  # Reject an unavailable authority before binding any state.
+        with self._execution_session_lock:
+            if self._execution_authority is table:
+                if self._execution_drain is not table.drain_tracker:
+                    raise RuntimeError("execution authority drain tracker changed")
+                return
+            if self._execution_authority is not None or self._sessions_started:
+                raise RuntimeError("cannot change KV execution authority after session admission")
+            if not isinstance(table.drain_tracker, RequestDrainTracker):
+                raise RuntimeError("execution authority requires drain tracking")
+            if (
+                self._execution_drain is not None
+                and self._execution_drain is not table.drain_tracker
+            ):
+                raise RuntimeError("execution authority has a different drain tracker")
+            if not self._config.enforce_physical_ownership or self._retirement_watchdog is None:
+                raise RuntimeError(
+                    "KV execution authority requires physical ownership and retirement"
+                )
+            self._execution_drain = table.drain_tracker
+            self._execution_authority = table
+
     def _create_session(
         self,
         request: LlmRequest,
@@ -4668,10 +4696,15 @@ class TransferWorker:
             drain = self._execution_drain
             if drain is None:
                 raise RuntimeError("tagged KV session requires execution drain tracking")
+            table = self._execution_authority
+            if table is None:
+                raise RuntimeError("tagged KV session requires execution authority")
+            if table.drain_tracker is not drain:
+                raise RuntimeError("execution authority drain tracker changed")
+            # Publication and claim registration share the table's lock. Session
+            # construction can block, so it runs after that lock is released.
+            claim = table.admit_resource(request.py_request_id, version, f"kv-{direction}-session")
             try:
-                claim = drain.acquire_resource(
-                    request.py_request_id, version, f"kv-{direction}-session"
-                )
                 session = create()
                 if (
                     not session._enforce_physical_ownership

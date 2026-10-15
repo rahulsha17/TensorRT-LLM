@@ -73,6 +73,7 @@ from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.execution_fence import RequestDrainTracker
+from tensorrt_llm.execution_mailbox import WorkerVersionTable
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -462,6 +463,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def bind_execution_drain(self, drain: RequestDrainTracker) -> None:
         """Track each native send/receive session through physical retirement."""
         self._transfer_worker.bind_execution_drain(drain)
+
+    def bind_execution_authority(self, table: WorkerVersionTable) -> None:
+        """Admit tagged sessions under the executor's current epoch and drain."""
+        self._transfer_worker.bind_execution_authority(table)
 
     def shutdown(self) -> None:
         shutdown_lock = getattr(self, "_shutdown_lock", None)

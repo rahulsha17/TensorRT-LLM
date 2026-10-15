@@ -10,6 +10,7 @@ from tensorrt_llm import logger
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.execution_fence import RequestDrainTracker
+from tensorrt_llm.execution_mailbox import WorkerVersionTable
 from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
                                           CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
@@ -288,6 +289,11 @@ class KvCacheTransceiver(ABC):
         """Bind request-version lifetime accounting before transfer admission."""
         raise RuntimeError(
             "this KV transceiver does not support execution drain tracking")
+
+    def bind_execution_authority(self, table: WorkerVersionTable) -> None:
+        """Bind transfer admission to published authority and physical drain."""
+        raise RuntimeError(
+            "this KV transceiver does not support execution authority")
 
     @property
     def pipeline_transfer_enabled(self) -> bool:

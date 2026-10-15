@@ -656,6 +656,16 @@ a successor's claim. Binding requires physical ownership and a retirement
 watchdog and must happen before any session is admitted. Other transceivers
 reject this binding. These internal hooks do not enable disaggregated RETIRE.
 
+Session admission also requires the executor's bound worker authority table.
+The epoch check and resource claim share the publication lock. If publication
+wins, a stale or unknown epoch is rejected before allocation or session setup;
+ordinary rejection does not poison drain. If the claim wins, publication can
+continue while session construction runs. That claim keeps FENCE pending until
+physical cleanup, even if the request is canceled during construction. A pending
+ALIGN/RESUME cannot admit a session. Binding only a drain tracker is insufficient
+for tagged sessions. Transfer messages and per-operation dispatch still need their
+own version validation before the disaggregated path can be enabled.
+
 These claims account for resource lifetime; they do not publish authority or
 validate transferred content. End-to-end disaggregated RETIRE still needs shared
 authority across prefill and decode, version-bound transfer admission and

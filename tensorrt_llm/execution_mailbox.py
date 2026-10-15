@@ -19,7 +19,13 @@ from .execution_alignment import (
     WorkerAlignmentState,
 )
 from .execution_authority import AdvanceReceipt, Revision, ScopeRegistry, ScopeSnapshot
-from .execution_fence import FenceReceipt, FenceRequest, RequestDrainTracker, RevisionFence
+from .execution_fence import (
+    FenceReceipt,
+    FenceRequest,
+    RequestDrainTracker,
+    RequestResourceClaim,
+    RevisionFence,
+)
 from .execution_gate import ExecutionAuthorityError, HostExecution, HostExecutionGate
 from .execution_version import ExecutionVersion
 
@@ -333,6 +339,25 @@ class WorkerVersionTable:
             self._require_open()
             update = self._versions.get((tenant_id, scope_id))
             return None if update is None else update.version
+
+    def admit_resource(
+        self, request_id: int, version: ExecutionVersion, owner: str
+    ) -> RequestResourceClaim:
+        """Claim an existing request's resource before publication can revoke it.
+
+        Only the short host registration holds the authority lock. The caller
+        constructs or publishes the accessor afterward, retaining this claim
+        until physical cleanup finishes even if authority has since advanced.
+        Stale admission is rejected without creating or releasing a claim.
+        """
+        with self.admission(version) as execution:
+            try:
+                self._require_open()
+                if self.drain_tracker is None:
+                    raise RuntimeError("worker does not provide execution drain tracking")
+                return self.drain_tracker.acquire_resource(request_id, version, owner)
+            finally:
+                execution.finish()
 
     def close(self) -> None:
         """Invalidate observations when the worker stops."""

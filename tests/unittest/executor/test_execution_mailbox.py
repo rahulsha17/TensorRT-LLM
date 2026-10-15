@@ -334,3 +334,37 @@ def test_failed_publication_closes_advisory_execution_observation():
     with pytest.raises(RuntimeError, match="device unavailable"):
         table.apply(VersionUpdate("session", 1, VERSION))
     assert table.observe_allowed((VERSION, None)) == (False, True)
+
+
+def test_resource_admission_requires_resume_and_retains_request_identity():
+    from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentRequest
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+    from tensorrt_llm.execution_gate import ExecutionAuthorityError
+
+    table = WorkerVersionTable("session")
+    table.drain_tracker = RequestDrainTracker()
+    successor = replace(VERSION, epoch=8)
+    revision = Revision("edit", VERSION, successor)
+    alignment = AlignmentRequest("session", revision, AlignmentInput((1, 2, 3)))
+    table.apply(VersionUpdate("session", 1, successor, alignment=alignment))
+    table.drain_tracker.enqueue(successor, lambda: 41)
+    with pytest.raises(ExecutionAuthorityError, match="ALIGN and RESUME"):
+        table.admit_resource(41, successor, "kv-send-session")
+    assert not table.drain_tracker._resources
+    assert not table._gate._executions
+
+
+def test_resource_admission_releases_host_gate_handle_without_completing_the_resource():
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    table = WorkerVersionTable("session")
+    table.drain_tracker = RequestDrainTracker()
+    table.apply(VersionUpdate("session", 1, VERSION))
+    table.drain_tracker.enqueue(VERSION, lambda: 41)
+    claim = table.admit_resource(41, VERSION, "kv-receive-session")
+    assert claim.request_id == 41 and claim.version == VERSION
+    assert not table._gate._executions
+    table.drain_tracker.complete(41, VERSION)
+    assert not table.drain_tracker.drained(VERSION)
+    table.drain_tracker.release_resource(claim)
+    assert table.drain_tracker.drained(VERSION)
