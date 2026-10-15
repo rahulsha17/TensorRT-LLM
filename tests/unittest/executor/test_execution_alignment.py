@@ -143,11 +143,147 @@ def test_retry_cannot_change_revised_input(setup, changed):
     assert controller.snapshot("tenant", "scope").current_version == NEW
 
 
-def test_alignment_cannot_be_added_after_advance(setup):
+def test_advance_retry_cannot_add_alignment(setup):
     controller, _, _, _, _, _ = setup
     controller.advance(REVISION)
     with pytest.raises(ValueError, match="revised input"):
         controller.advance(REVISION, alignment=INPUT)
+
+
+@pytest.mark.parametrize("remaining", [0, 2, 3])
+def test_separate_align_reserves_only_what_remains_after_fence(setup, remaining):
+    controller, table, tracker, state, reserve, _ = setup
+    tracker.enqueue(OLD, lambda: 1)
+    advance = controller.advance(REVISION)
+    advance.publication.wait()
+    with state.releasing_owner():
+        reserve.assert_not_called()
+    tracker.complete(1, OLD)
+    advance.fence.wait()
+    with state.resetting_cache():
+        reserve.side_effect = lambda _: Mock(num_tokens=remaining)
+    assert state.snapshot()["held_count"] == 0
+    with pytest.raises(ExecutionAuthorityError, match="pending"):
+        with controller.admission(NEW):
+            pass
+    with pytest.raises(ExecutionAuthorityError):
+        with controller.admission(OLD):
+            pass
+
+    aligned = controller.align(REVISION, INPUT)
+    aligned.publication.wait()
+    assert aligned.advance_receipt == advance.advance_receipt
+    assert aligned.fence is advance.fence
+    assert aligned.publication.update.sequence > advance.publication.update.sequence
+    reserve.assert_not_called()
+    state.process()
+    receipt = aligned.alignment.wait()
+    assert receipt.reusable_prefix_length == remaining
+    with pytest.raises(ExecutionAuthorityError, match="pending"):
+        with table.admission(NEW):
+            pass
+    controller.resume(receipt).wait()
+    with controller.admission(NEW):
+        pass
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None)
+    state.confirm_attachment(NEW, 10, remaining)
+    assert state.snapshot()["held_count"] == 0
+    retry = controller.align(REVISION, INPUT)
+    assert retry.alignment is aligned.alignment
+    assert retry.publication is controller.resume(receipt)
+    state.process()
+    reserve.assert_called_once_with(INPUT)
+    # Historical ADVANCE retries retain their original arguments and never
+    # erase the separately published ALIGN plan.
+    controller.advance(REVISION).publication.wait()
+    assert controller.align(REVISION, INPUT).alignment.wait() == receipt
+    with pytest.raises(ValueError, match="revised input"):
+        controller.advance(REVISION, alignment=INPUT)
+
+
+def test_separate_align_still_waits_for_old_gpu_users(setup):
+    controller, _, tracker, state, _, _ = setup
+    tracker.enqueue(OLD, lambda: 1)
+    controller.advance(REVISION).publication.wait()
+    aligned = controller.align(REVISION, INPUT)
+    aligned.publication.wait()
+    state.process()
+    with pytest.raises(TimeoutError):
+        aligned.alignment.wait(0.02)
+    with pytest.raises(ValueError, match="completed ALIGN"):
+        controller.resume(state.poll(aligned.alignment.request))
+    tracker.complete(1, OLD)
+    controller.resume(aligned.alignment.wait()).wait()
+    with controller.admission(NEW):
+        pass
+
+
+def test_separate_align_requires_accepted_current_revision(setup):
+    controller, _, _, _, reserve, _ = setup
+    with pytest.raises(ValueError, match="accepted"):
+        controller.align(REVISION, INPUT)
+    controller.advance(REVISION).publication.wait()
+    with pytest.raises(ValueError, match="accepted"):
+        controller.align(replace(REVISION, revision_id="unknown"), INPUT)
+    controller.advance(Revision("next", NEW, replace(NEW, epoch=9))).publication.wait()
+    with pytest.raises(ValueError, match="superseded"):
+        controller.align(REVISION, INPUT)
+    reserve.assert_not_called()
+
+
+@pytest.mark.parametrize("immediate", [False, True])
+@pytest.mark.parametrize(
+    "changed",
+    [
+        replace(INPUT, input_token_ids=(1, 2, 9)),
+        replace(INPUT, cache_salt="other"),
+        replace(INPUT, lora_task_id=2),
+        replace(INPUT, min_reuse_tokens=2),
+    ],
+)
+def test_separate_align_cannot_replace_bound_input(setup, immediate, changed):
+    controller, _, _, state, reserve, _ = setup
+    controller.advance(REVISION, alignment=INPUT if immediate else None).publication.wait()
+    aligned = controller.align(REVISION, INPUT)
+    aligned.publication.wait()
+    with pytest.raises(ValueError, match="revised input"):
+        controller.align(REVISION, changed)
+    state.process()
+    assert aligned.alignment.wait().request.revised_input == INPUT
+    reserve.assert_called_once_with(INPUT)
+
+
+def test_separate_align_recovers_lost_ack_without_duplicate_hold(setup):
+    controller, _, _, state, reserve, _ = setup
+    advance = controller.advance(REVISION)
+    advance.publication.wait()
+    advance.fence.wait()
+    publish = controller._transport.publish
+    failed = False
+
+    def lose_ack(update, stop):
+        nonlocal failed
+        receipt = publish(update, stop)
+        if update.alignment is not None and not failed:
+            failed = True
+            raise TimeoutError("lost ALIGN ack")
+        return receipt
+
+    controller._transport.publish = lose_ack
+    first = controller.align(REVISION, INPUT)
+    with pytest.raises(TimeoutError, match="lost ALIGN ack"):
+        first.publication.wait()
+    state.process()
+    receipt = first.alignment.wait()
+    with pytest.raises(ExecutionAuthorityError, match="pending"):
+        with controller.admission(NEW):
+            pass
+    retry = controller.align(REVISION, INPUT)
+    assert retry.publication.update == first.publication.update
+    retry.publication.wait()
+    assert retry.alignment.wait() == receipt
+    controller.resume(receipt).wait()
+    reserve.assert_called_once_with(INPUT)
 
 
 def test_timeout_keeps_hold_and_supersession_releases_it_on_engine(setup):

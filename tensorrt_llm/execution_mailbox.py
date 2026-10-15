@@ -423,7 +423,12 @@ class ExecutionController:
     def advance(
         self, revision: Revision, *, alignment: AlignmentInput | None = None
     ) -> RevisionPublication:
-        """Accept the revision and publish current authority, including on historical retries."""
+        """Accept the revision and publish current authority, including on historical retries.
+
+        Supply alignment here to reserve the matching prefix before releasing
+        the old request. Otherwise, align() can bind the revised input later.
+        Neither form opens successor admission before acknowledged RESUME.
+        """
         with self._lock:
             self._require_open()
             if alignment is not None and not isinstance(alignment, AlignmentInput):
@@ -440,35 +445,75 @@ class ExecutionController:
             current = self._registry.snapshot(expected.tenant_id, expected.scope_id).current_version
             self._gate.revoke_locked(current)
             publication = self._publish_current(current)
-            request = FenceRequest(self._session_id, receipt.revision)
-            fence = self._fences.get(request)
-            if fence is None or (fence._future.done() and fence._future.exception() is not None):
-                fence = RevisionFence(request, Future())
-                self._fences[request] = fence
-                if len(self._pending_fences) >= self._max_pending:
-                    fence._future.set_exception(
-                        RuntimeError("fence backlog is full; retry revision")
-                    )
-                else:
-                    self._pending_fences[request] = fence
-                    self._queue.put(request)
-            aligned = None
-            if alignment is not None:
-                align_request = self._alignment_current[revision.successor_version]
-                aligned = self._alignments.get(align_request)
-                if aligned is None or (
-                    aligned._future.done() and aligned._future.exception() is not None
-                ):
-                    aligned = RevisionAlignment(align_request, Future())
-                    self._alignments[align_request] = aligned
-                    if len(self._pending_alignments) >= self._max_pending:
-                        aligned._future.set_exception(
-                            RuntimeError("ALIGN backlog is full; retry revision")
-                        )
-                    else:
-                        self._pending_alignments[align_request] = aligned
-                        self._queue.put(align_request)
+            fence = self._request_fence(receipt.revision)
+            aligned = (
+                self._request_alignment(self._alignment_current[revision.successor_version])
+                if alignment is not None
+                else None
+            )
             return RevisionPublication(receipt, publication, fence, aligned)
+
+    def align(self, revision: Revision, alignment: AlignmentInput) -> RevisionPublication:
+        """Bind revised input to an already accepted, still-current revision.
+
+        Until this call, ADVANCE without alignment does not reserve any prefix.
+        ALIGN looks up whatever compatible KV remains when the engine processes
+        it. It can therefore return fewer tokens, including zero, than an ALIGN
+        supplied with ADVANCE. Its receipt still requires completed FENCE.
+
+        Wait for publication and alignment, then resume the receipt before
+        submitting the successor. Exact retries keep the same request and hold;
+        changing input, salt, or reuse requirements needs a new revision.
+        """
+        if not isinstance(revision, Revision):
+            raise TypeError("revision must be a Revision")
+        if not isinstance(alignment, AlignmentInput):
+            raise TypeError("alignment must be an AlignmentInput")
+        with self._lock:
+            self._require_open()
+            if revision not in self._alignment_inputs:
+                raise ValueError("ALIGN requires an accepted revision")
+            version = revision.successor_version
+            if not self._registry.is_current(version):
+                raise ValueError("cannot align a superseded revision")
+            request = AlignmentRequest(self._session_id, revision, alignment)
+            previous = self._alignment_current.get(version)
+            if previous is not None and previous != request:
+                raise ValueError("ALIGN retry changed its revised input")
+            self._alignment_current[version] = request
+            return RevisionPublication(
+                AdvanceReceipt(revision),
+                self._publish_current(version),
+                self._request_fence(revision),
+                self._request_alignment(request),
+            )
+
+    def _request_fence(self, revision: Revision) -> RevisionFence:
+        # Callers hold the controller lock.
+        request = FenceRequest(self._session_id, revision)
+        fence = self._fences.get(request)
+        if fence is None or (fence._future.done() and fence._future.exception() is not None):
+            fence = RevisionFence(request, Future())
+            self._fences[request] = fence
+            if len(self._pending_fences) >= self._max_pending:
+                fence._future.set_exception(RuntimeError("fence backlog is full; retry revision"))
+            else:
+                self._pending_fences[request] = fence
+                self._queue.put(request)
+        return fence
+
+    def _request_alignment(self, request: AlignmentRequest) -> RevisionAlignment:
+        # Callers hold the controller lock.
+        aligned = self._alignments.get(request)
+        if aligned is None or (aligned._future.done() and aligned._future.exception() is not None):
+            aligned = RevisionAlignment(request, Future())
+            self._alignments[request] = aligned
+            if len(self._pending_alignments) >= self._max_pending:
+                aligned._future.set_exception(RuntimeError("ALIGN backlog is full; retry revision"))
+            else:
+                self._pending_alignments[request] = aligned
+                self._queue.put(request)
+        return aligned
 
     def resume(self, aligned: AlignmentReceipt) -> VersionPublication:
         """Open successor admission after a live worker recheck of ALIGN and FENCE.
@@ -548,6 +593,7 @@ class ExecutionController:
         if (
             previous is not None
             and previous.update.version == version
+            and previous.update.alignment == self._alignment_current.get(version)
             and previous.update.resume == self._resumes.get(version)
         ):
             if not previous._future.done() or previous._future.exception() is None:

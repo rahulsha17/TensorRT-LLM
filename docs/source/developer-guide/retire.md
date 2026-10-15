@@ -133,6 +133,9 @@ a competing revision, not a retry.
 `AlignmentInput` alongside it to `control.advance`, as shown in step 7 below.
 The controller binds those exact tokens and cache namespace to the revision ID.
 Retries must supply the same input, including whether ALIGN was requested.
+If ADVANCE omitted the input, `control.align(revision, revised_input)` can bind
+it later while the revision is still current. This is a separate operation;
+changing the arguments of an ADVANCE retry remains an error.
 An accepted successor remains pending until RESUME is acknowledged.
 
 The registry is an in-memory object in one process. The runtime must route all
@@ -584,8 +587,8 @@ participate in this protocol.
 
 ## ALIGN (step 7)
 
-The runtime supplies the complete revised token input with ADVANCE. This lets
-the worker reserve useful KV before cancellation frees the old owner's cache.
+Supplying the complete revised token input with ADVANCE lets the worker reserve
+useful KV before cancellation frees the old owner's cache.
 
 ```python
 from tensorrt_llm.execution_alignment import AlignmentInput
@@ -600,6 +603,29 @@ result.fence.wait(timeout=5)
 aligned = result.alignment.wait(timeout=5)
 print(aligned.reusable_prefix_length)
 ```
+
+The runtime can also revoke first and supply the revised input later:
+
+```python
+revision = Revision("edit-123", old, new)
+advance = control.advance(revision)
+advance.publication.wait(timeout=5)
+advance.fence.wait(timeout=5)
+
+# The runtime may wait for a tool or obtain the revised input here.
+# No successor reservation protects the cache during this gap.
+result = control.align(revision, revised_input)
+result.publication.wait(timeout=5)
+aligned = result.alignment.wait(timeout=5)
+control.resume(aligned).wait(timeout=5)
+```
+
+Separate ALIGN searches what remains in the cache at that time. Evicted KV is
+recomputed unless `min_reuse_tokens` requires a hit. It uses the same V1/V2
+reservation, multi-rank prefix agreement and RESUME checks as input supplied
+with ADVANCE. It cannot align an unknown or superseded revision, change input
+on a retry, or admit work before FENCE and acknowledged RESUME. Once supplied,
+the revised input is immutable regardless of which call supplied it.
 
 The worker matches the revised tokens in its existing cache tree, using the
 supplied salt and LoRA identity. Its manager fixes the model and KV layout.

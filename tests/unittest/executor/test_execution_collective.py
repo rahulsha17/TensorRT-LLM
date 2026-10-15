@@ -259,13 +259,21 @@ def test_alignment_waits_for_all_reservations_and_maps_local_ids(cluster):
 
 
 @pytest.mark.parametrize("common", [0, 2, 3])
+@pytest.mark.parametrize("deferred", [False, True])
 def test_common_prefix_is_bound_before_admission_and_holds_survive_until_attachment(
-    cluster, common
+    cluster, common, deferred
 ):
     cluster.holds[-1].num_tokens = common
     cluster.controller.register(OLD).wait()
-    result = cluster.controller.advance(REVISION, alignment=INPUT)
+    result = cluster.controller.advance(REVISION, alignment=None if deferred else INPUT)
     result.publication.wait()
+    if deferred:
+        result.fence.wait()
+        for table in cluster.tables:
+            table.alignment_state.process()
+            assert table.alignment_state.snapshot()["held_count"] == 0
+        result = cluster.controller.align(REVISION, INPUT)
+        result.publication.wait()
     for table in cluster.tables:
         table.alignment_state.process()
     receipt = result.alignment.wait()
