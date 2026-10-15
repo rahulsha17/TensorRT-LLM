@@ -185,7 +185,7 @@ void KvCacheManager::clearReusableBlocks()
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, TokenSpan inputTokens,
     std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly, bool enableRequestStats)
+    std::optional<bool> textOnly, bool enableRequestStats, std::optional<int> maxReuseTokens)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
@@ -199,6 +199,20 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
         expectedPromptLength = static_cast<int>(inputTokens.size());
     }
 
+    if (maxReuseTokens.has_value())
+    {
+        if (*maxReuseTokens < 0)
+        {
+            throw std::invalid_argument("max_reuse_tokens must be nonnegative");
+        }
+        // Backoff tokens are lookup evidence, not reusable KV. Keep that evidence
+        // so bounded matching has the same claim depth as an ordinary lookup.
+        size_t const evidenceLimit = *maxReuseTokens == 0
+            ? 0
+            : static_cast<size_t>(*maxReuseTokens) + static_cast<size_t>(mConfig.reuseMatchBackoff);
+        inputTokens = TokenSpan{inputTokens.data(), std::min(inputTokens.size(), evidenceLimit)};
+    }
+
     // Compute the reuse match once here (shared conceptually with probeReuse) and
     // hand it to the KvCache, rather than having the cache re-walk the radix tree.
     // Mirrors Python KVCacheManager.allocate() passing a ReuseMatch into _KVCache.
@@ -209,7 +223,7 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
     }
 
     return std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::move(id),
-        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats);
+        std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, maxReuseTokens);
 }
 
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(

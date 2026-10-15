@@ -229,7 +229,8 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false,
+        std::optional<int> maxReuseTokens = std::nullopt);
 
     ~KvCache();
 
@@ -738,6 +739,8 @@ private:
     std::optional<CUstream> mCudaStream;
     Status mStatus;
     CommitState mCommitState;
+    // Request-local bound on adopting existing pages, including commit-time rebasing.
+    std::optional<int> const mMaxReuseTokens;
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;

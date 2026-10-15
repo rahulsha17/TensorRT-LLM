@@ -783,6 +783,7 @@ class KVCacheManager:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
+        max_reuse_tokens: int | None = None,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -792,6 +793,12 @@ class KVCacheManager:
         It defaults to the non-empty input length; without either value, the beam
         sharing boundary is zero and the statistics boundary is unset. When set,
         it also marks generation-phase allocation stats.
+
+        ``max_reuse_tokens`` bounds both initial matching and later adoption of
+        existing pages during commit. Zero keeps all computed pages private on
+        collision; None preserves unrestricted rebasing. Fresh blocks may still
+        be published beyond the bound. A collision beyond it stops publication
+        without replacing the request's pages or changing other owners' pages.
         """
         ...
     def probe_reuse(

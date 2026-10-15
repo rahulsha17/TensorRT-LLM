@@ -1430,7 +1430,13 @@ def test_retire_common_prefix_caps_native_v2_claim(limit) -> None:
 
         def create(request_id, lora_id, tokens, **kwargs):
             nonlocal successor
-            successor = core.create_kv_cache(None, tokens, expected_prompt_length=len(prompt))
+            assert kwargs["max_reuse_tokens"] == limit
+            successor = core.create_kv_cache(
+                None,
+                tokens,
+                expected_prompt_length=len(prompt),
+                max_reuse_tokens=kwargs["max_reuse_tokens"],
+            )
             manager.kv_cache_map[request_id] = successor
             return successor
 

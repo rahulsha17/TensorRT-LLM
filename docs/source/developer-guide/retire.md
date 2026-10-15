@@ -994,6 +994,14 @@ the bound. Both reserve only that prefix and cap the successor's actual cache
 lookup at the acquired length, including on a single worker. The suffix is
 recomputed. Other requests keep their own ordinary cache access.
 
+V2 also enforces the bound when committing computed KV. Committing can adopt
+an existing tree entry, so limiting the initial lookup alone is insufficient.
+If a matching block is beyond the bound, V2 keeps the request's recomputed
+pages and stops further publication for that request. New blocks can still be
+published until such a collision. Other owners and tree entries are unchanged.
+This can reduce reuse available to a later revision, but preserves the current
+revision's chosen recomputation boundary.
+
 Use `max_reuse_tokens=0` when the runtime has no acceptable reuse evidence.
 This forces cold successor prefill even if the same namespace contains a full
 match. `None` retains ordinary TRT-LLM reuse semantics; it is not a numerical

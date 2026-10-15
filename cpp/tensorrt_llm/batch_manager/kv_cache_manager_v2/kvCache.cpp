@@ -55,13 +55,14 @@ int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleI
 
 KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
     std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly, bool enableRequestStats)
+    std::optional<bool> textOnly, bool enableRequestStats, std::optional<int> maxReuseTokens)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
     , mStatus(Status::SUSPENDED)
     , mCommitState(CommitState::ALLOWED)
+    , mMaxReuseTokens(maxReuseTokens)
     , mBeamWidth(BeamIndex{1})
     , mCapacity(0)
     , mHistoryLength(0)
@@ -2023,7 +2024,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
         }
         didCommit = true;
     }
-    else if (newBlock->isFull() && mManager->allowSeqRebasing() && isFull)
+    else if (newBlock->isFull() && mManager->allowSeqRebasing() && isFull
+        && (!mMaxReuseTokens.has_value() || end <= *mMaxReuseTokens))
     {
         // Existing block: rebase — reuse existing block's committed pages.
         // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing and is_full` path.
@@ -2108,7 +2110,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     }
     else
     {
-        // Can't commit and can't reuse existing block. Just stop committing.
+        // Keep recomputed pages private when a tree collision cannot be adopted.
+        // A token match beyond the request's reuse bound does not authorize rebasing.
         mCommitState = CommitState::VIRTUAL_STOP;
     }
 

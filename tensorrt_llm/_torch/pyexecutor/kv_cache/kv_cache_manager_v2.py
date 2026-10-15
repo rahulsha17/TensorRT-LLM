@@ -3730,6 +3730,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.lora_task_id,
                     tokens,
                     cache_salt=req.cache_salt,
+                    max_reuse_tokens=getattr(req, "execution_reuse_limit", None),
                     is_dummy=req.is_dummy,
                     enable_request_stats=req.return_perf_metrics,
                     expected_prompt_length=(
@@ -6420,6 +6421,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_dummy: bool = False,
         enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
+        max_reuse_tokens: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
@@ -6454,6 +6456,7 @@ class KVCacheManagerV2(BaseResourceManager):
             id=request_id,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            max_reuse_tokens=max_reuse_tokens,
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
