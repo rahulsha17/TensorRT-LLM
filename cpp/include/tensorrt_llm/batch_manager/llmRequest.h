@@ -1498,12 +1498,14 @@ public:
         }
     }
 
-    // The execution owner must drain writers before freezing a complete prompt
-    // prefix. No later store or release may publish KV beyond this bound.
+    // The execution owner must drain writers before freezing an accepted KV
+    // prefix. The newest sampled token has no KV yet. No later store or release
+    // may publish KV beyond this bound.
     void freezeRetireKvFrontier(SizeType32 frontier)
     {
+        auto const limit = std::max(getPromptLen(), getNumTokens(0) - 1);
         TLLM_CHECK_WITH_INFO(
-            frontier >= 0 && frontier <= getPromptLen(), "RETIRE KV frontier must lie within the prompt");
+            frontier >= 0 && frontier <= limit, "RETIRE KV frontier must exclude the newest generated token");
         TLLM_CHECK_WITH_INFO(!mRetireKvFrontier.has_value() || frontier <= mRetireKvFrontier.value(),
             "RETIRE KV frontier cannot grow after retirement");
         mRetireKvFrontier = frontier;

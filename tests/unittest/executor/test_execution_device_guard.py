@@ -44,7 +44,9 @@ def _request(version=VERSION):
         py_multimodal_data=None,
         py_disaggregated_params=None,
         py_logits_post_processors=None,
+        num_tokens=64,
     )
+    request.get_num_tokens = lambda beam: request.num_tokens
 
     def finish(reason):
         assert reason == FinishReason.CANCELLED
@@ -63,11 +65,12 @@ def guard(monkeypatch):
     result.device = Mock()
     result.device.submission.side_effect = nullcontext
     result._uses = {}
-    result._prefill_frontiers = {}
+    result._kv_frontiers = {}
     result._early_exit_enabled = True
     result._native_kv_guards = False
     result._v1_manager = None
     result._kv_manager = Mock()
+    result._kv_manager.needs_execution_prefix_commit.return_value = False
     monkeypatch.setattr("torch.cuda.Event", Mock)
     return result
 
@@ -254,7 +257,7 @@ def test_native_context_waits_before_accepting_progress(guard, last_chunk):
         assert completed == [guard._uses[id(first)].event]
         assert accepted.context_requests == batch.context_requests
         first.context_current_position = second.context_current_position = 64
-    assert guard._prefill_frontiers[id(first)] == guard._prefill_frontiers[id(second)] == 64
+    assert guard._kv_frontiers[id(first)] == guard._kv_frontiers[id(second)] == 64
     # Both tagged requests share the same completion event; wait once per batch.
     guard.device.wait_event.assert_called_once()
 
@@ -284,7 +287,7 @@ def test_native_context_revision_can_publish_during_completion_wait(guard):
             assert published.is_set()
             assert accepted.context_requests == [live]
             assert old.is_finished
-        assert guard._prefill_frontiers[id(old)] == 0
+        assert guard._kv_frontiers[id(old)] == 0
     finally:
         if publisher.ident is not None:
             publisher.join(timeout=2)
@@ -313,7 +316,7 @@ def test_native_context_unknown_completion_does_not_publish_prefix(guard, failur
     with pytest.raises(error):
         executor._update_v2_context_resources(batch)
     executor.kv_cache_manager.update_context_resources.assert_not_called()
-    assert guard._prefill_frontiers[id(request)] == 0
+    assert guard._kv_frontiers[id(request)] == 0
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -382,7 +385,7 @@ def test_wait_failure_retains_ownership_and_never_closes_cache(guard) -> None:
     with pytest.raises(TimeoutError):
         guard.before_release(request)
     assert id(request) in guard._uses
-    guard._kv_manager.preserve_context_prefix.assert_not_called()
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
     guard._kv_manager.stop_request_committing.assert_not_called()
 
 
@@ -538,7 +541,7 @@ def test_v2_retains_only_accepted_context_after_drain(guard, frontier) -> None:
         assert not accepted.context_requests
     order = []
     guard.device.wait_event.side_effect = lambda event: order.append("drain")
-    guard._kv_manager.preserve_context_prefix.side_effect = lambda req, count: order.append(count)
+    guard._kv_manager.preserve_execution_prefix.side_effect = lambda req, count: order.append(count)
     guard._kv_manager.stop_request_committing.side_effect = lambda req: order.append("freeze")
     guard.before_release(request)
     assert order == ["drain", frontier, "freeze"]
@@ -566,8 +569,8 @@ def test_v2_preserves_complete_blocks_without_publishing_unfinished_tail(
         cache.num_committed_tokens += len(tokens)
 
     cache.commit.side_effect = commit
-    manager.preserve_context_prefix(request, frontier)
-    manager.preserve_context_prefix(request, frontier)
+    manager.preserve_execution_prefix(request, frontier)
+    manager.preserve_execution_prefix(request, frontier)
     assert cache.num_committed_tokens == expected_end
     if expected_end > start:
         cache.commit.assert_called_once_with(list(range(start, expected_end)))
@@ -579,7 +582,7 @@ def test_v2_preserves_complete_blocks_without_publishing_unfinished_tail(
 
 
 @pytest.mark.parametrize(
-    "unavailable", ["disabled", "not_publishable", "dummy", "suspended", "absent"]
+    "unavailable", ["disabled", "not_publishable", "dummy", "suspended", "absent", "stopped"]
 )
 def test_v2_prefix_preservation_does_not_restore_or_publish_unavailable_cache(unavailable) -> None:
     manager = object.__new__(KVCacheManagerV2)
@@ -590,8 +593,9 @@ def test_v2_prefix_preservation_does_not_restore_or_publish_unavailable_cache(un
     request.context_current_position = 32
     request.is_dummy_request = unavailable == "dummy"
     cache = Mock(is_active=unavailable != "suspended", num_committed_tokens=0, capacity=32)
+    cache.is_commit_allowed = unavailable != "stopped"
     manager.kv_cache_map = {} if unavailable == "absent" else {42: cache}
-    manager.preserve_context_prefix(request, 32)
+    manager.preserve_execution_prefix(request, 32)
     cache.commit.assert_not_called()
     cache.resume.assert_not_called()
 
@@ -602,7 +606,7 @@ def test_v2_prefix_preservation_rejects_invalid_frontier(frontier) -> None:
     request = _request()
     request.context_current_position = 48
     with pytest.raises(ValueError, match="completed frontier"):
-        manager.preserve_context_prefix(request, frontier)
+        manager.preserve_execution_prefix(request, frontier)
 
 
 @pytest.mark.parametrize("capacity,source_length", [(16, 64), (64, 16)])
@@ -616,8 +620,8 @@ def test_v2_prefix_preservation_rejects_missing_allocation(capacity, source_leng
     cache = Mock(is_active=True, capacity=capacity, num_committed_tokens=0)
     manager.kv_cache_map = {42: cache}
     manager._reuse_token_source = Mock(return_value=list(range(source_length)))
-    with pytest.raises(RuntimeError, match="retained context allocation"):
-        manager.preserve_context_prefix(request, 32)
+    with pytest.raises(RuntimeError, match="retained KV allocation"):
+        manager.preserve_execution_prefix(request, 32)
     cache.commit.assert_not_called()
 
 
@@ -1068,7 +1072,7 @@ def test_operator_exit_unwinds_and_records_partial_submission(guard):
             guard.table.apply(VersionUpdate("session", 2, NEXT))
             execution_early_exit_point()
     assert guard._uses[id(request)].event is not None
-    assert guard._prefill_frontiers[id(request)] == 0
+    assert guard._kv_frontiers[id(request)] == 0
     execution_early_exit_point()
 
 
@@ -1409,9 +1413,210 @@ def test_normal_v1_completion_keeps_native_generated_prefix_reuse(guard):
     guard._kv_manager = None
     with guard.forward(_batch(request)):
         pass
+    request.num_tokens = 81
+    guard._kv_frontiers[id(request)] = 80
     request.is_finished = True
     request.context_remaining_length = 0
     guard.before_release(request)
     guard.device.wait_event.assert_called_once()
-    request.freeze_retire_kv_frontier.assert_not_called()
-    guard._v1_manager.store_blocks_for_reuse.assert_not_called()
+    request.freeze_retire_kv_frontier.assert_called_once_with(80)
+    guard._v1_manager.store_blocks_for_reuse.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize("before", [64, 79, 80, 81])
+@pytest.mark.parametrize("device_ok,host_ok", [(True, True), (True, False), (False, True)])
+def test_decode_frontier_requires_both_verdicts_and_excludes_sample(
+    guard, before, device_ok, host_ok
+):
+    request = _request()
+    request.num_tokens = before
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    guard._kv_frontiers[id(request)] = 64
+    state = _state(request, allowed=[device_ok])
+    if not host_ok:
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+    with guard.token_commit(state):
+        if not request.is_finished:
+            request.num_tokens += 1
+    assert guard._kv_frontiers[id(request)] == (before if device_ok and host_ok else 64)
+    assert guard._kv_frontiers[id(request)] < request.num_tokens or not (device_ok and host_ok)
+
+
+@pytest.mark.parametrize("delta,remaining", [(2, 0), (-1, 0), (1, 16)])
+def test_unsupported_token_progress_cannot_enlarge_frontier(guard, delta, remaining):
+    request = _request()
+    request.num_tokens = 80
+    request.context_remaining_length = remaining
+    guard._kv_frontiers[id(request)] = 64
+    with pytest.raises(RuntimeError, match="one accepted token"):
+        with guard.token_commit(_state(request, allowed=[True])):
+            request.num_tokens += delta
+    assert guard._kv_frontiers[id(request)] == 64
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+
+
+def test_sampler_exception_does_not_accept_partially_mutated_token_state(guard):
+    request = _request()
+    request.num_tokens = 80
+    request.context_remaining_length = 0
+    guard._kv_frontiers[id(request)] = 64
+    with pytest.raises(ValueError, match="sampler failed"):
+        with guard.token_commit(_state(request, allowed=[True])):
+            request.num_tokens += 1
+            raise ValueError("sampler failed")
+    assert guard._kv_frontiers[id(request)] == 64
+
+
+def test_v2_decode_commit_drains_latest_overlap_reader_without_locking_publisher(guard):
+    request = _request()
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    request.num_tokens = 80
+    with guard.forward(_batch(request)):
+        pass
+    with guard.forward(_batch(request)):
+        pass
+    latest = guard._uses[id(request)].event
+    guard._kv_manager.needs_execution_prefix_commit.return_value = True
+    order = []
+
+    def wait(event):
+        assert event is latest
+        order.append("drain")
+        published = Event()
+
+        def publish():
+            guard.table.apply(VersionUpdate("session", 2, NEXT))
+            published.set()
+
+        worker = Thread(target=publish, daemon=True)
+        worker.start()
+        assert published.wait(2), "GPU wait held the host authority lock"
+        worker.join(2)
+
+    guard.device.wait_event.side_effect = wait
+    guard._kv_manager.preserve_execution_prefix.side_effect = lambda req, end: order.append(end)
+    with guard.token_commit(_state(request, allowed=[True])):
+        request.num_tokens += 1
+    assert order == ["drain", 80]
+    assert guard._kv_frontiers[id(request)] == 80
+    # The next sample cannot turn drained-but-revoked work into accepted KV.
+    with guard.token_commit(_state(request, allowed=[True])):
+        assert request.is_finished
+    assert guard._kv_frontiers[id(request)] == 80
+
+
+@pytest.mark.parametrize("failure", ["missing", "unknown", "wrong_owner", "wait"])
+def test_v2_decode_commit_requires_owned_gpu_completion(guard, failure):
+    request = _request()
+    request.context_remaining_length = 0
+    request.num_tokens = 80
+    with guard.forward(_batch(request)):
+        pass
+    guard._kv_manager.needs_execution_prefix_commit.return_value = True
+    if failure == "missing":
+        guard._uses.clear()
+    elif failure == "unknown":
+        guard._uses[id(request)].event = None
+    elif failure == "wrong_owner":
+        guard._uses[id(request)].request = _request()
+    else:
+        guard.device.wait_event.side_effect = RuntimeError("incomplete")
+    with pytest.raises(RuntimeError):
+        with guard.token_commit(_state(request, allowed=[True])):
+            request.num_tokens += 1
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    guard._kv_manager.stop_request_committing.assert_not_called()
+
+
+@pytest.mark.parametrize("frontier,expected", [(64, 64), (79, 64), (80, 80)])
+def test_v2_decode_prefix_preserves_full_blocks_after_prompt(frontier, expected):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = manager._can_publish_block_reuse = True
+    manager.tokens_per_block = 16
+    request = _request()
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    request.num_tokens = 81
+    request.is_dummy_request = False
+    cache = Mock(is_active=True, is_commit_allowed=True, capacity=96, num_committed_tokens=64)
+    manager.kv_cache_map = {42: cache}
+    manager._reuse_token_source = Mock(return_value=list(range(81)))
+    manager._augment_tokens_for_block_reuse = lambda tokens, req, start, end: tokens[start:end]
+
+    def commit(tokens):
+        cache.num_committed_tokens += len(tokens)
+
+    cache.commit.side_effect = commit
+    manager.preserve_execution_prefix(request, frontier)
+    manager.preserve_execution_prefix(request, frontier)
+    assert cache.num_committed_tokens == expected
+    if expected > 64:
+        cache.commit.assert_called_once_with(list(range(64, expected)))
+    else:
+        cache.commit.assert_not_called()
+    with pytest.raises(ValueError, match="completed frontier"):
+        manager.preserve_execution_prefix(request, 81)
+
+
+@pytest.mark.parametrize("version", [None, VERSION])
+def test_v2_context_end_leaves_only_tagged_request_open_for_decode_commits(version):
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = manager._can_publish_block_reuse = True
+    request = _request(version)
+    request.is_dummy_request = False
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    cache = Mock(num_committed_tokens=64)
+    manager.kv_cache_map = {42: cache}
+    manager.try_commit_blocks(request)
+    assert cache.stop_committing.call_count == int(version is None)
+    cache.commit.assert_not_called()
+
+
+def test_context_publication_does_not_reopen_cache_stopped_by_decode_commit():
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = manager._can_publish_block_reuse = True
+    request = _request()
+    request.is_dummy_request = False
+    request.context_current_position = 65
+    request.context_remaining_length = 0
+    cache = Mock(num_committed_tokens=64, is_commit_allowed=False)
+    manager.kv_cache_map = {42: cache}
+    manager.try_commit_blocks(request)
+    cache.commit.assert_not_called()
+    cache.stop_committing.assert_not_called()
+
+
+def test_v1_retirement_uses_accepted_generated_frontier_after_drain(guard):
+    request = _request()
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    request.num_tokens = 80
+    request.freeze_retire_kv_frontier = Mock()
+    guard._kv_manager = None
+    guard._v1_manager = Mock(tokens_per_block=16, enable_block_reuse=True)
+    with guard.forward(_batch(request)):
+        pass
+    with guard.token_commit(_state(request, allowed=[True])):
+        request.num_tokens += 1
+    with guard.forward(_batch(request)):
+        pass
+    guard.table.apply(VersionUpdate("session", 2, NEXT))
+    with guard.token_commit(_state(request, allowed=[True])):
+        assert request.is_finished
+    guard.before_release(request)
+    guard.device.wait_event.assert_called_once()
+    request.freeze_retire_kv_frontier.assert_called_once_with(80)
+    guard._v1_manager.store_blocks_for_reuse.assert_called_once_with(request)
+
+
+def test_frontier_without_completion_record_cannot_be_released(guard):
+    request = _request()
+    guard._kv_frontiers[id(request)] = 64
+    with pytest.raises(RuntimeError, match="completion is unknown"):
+        guard.before_release(request)
+    assert guard._kv_frontiers[id(request)] == 64
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    guard._kv_manager.stop_request_committing.assert_not_called()

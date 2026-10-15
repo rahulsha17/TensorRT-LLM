@@ -88,7 +88,7 @@ class ExecutionDeviceGuard:
         self._v1_manager = None if executor._is_kv_manager_v2 else executor.kv_cache_manager
         self._alignment_adapter = KVAlignmentAdapter(executor)
         self._uses: dict[int, _RequestUse] = {}
-        self._prefill_frontiers: dict[int, int] = {}
+        self._kv_frontiers: dict[int, int] = {}
         table.bind_device_publisher(self.device)
         table.drain_tracker = RequestDrainTracker()
         table.alignment_state = WorkerAlignmentState(
@@ -222,7 +222,7 @@ class ExecutionDeviceGuard:
                     request.prepopulated_prompt_len,
                 )
         for request in requests:
-            self._prefill_frontiers.setdefault(id(request), request.prepopulated_prompt_len)
+            self._kv_frontiers.setdefault(id(request), request.prepopulated_prompt_len)
         # Include untagged rows: one live neighbor prohibits a whole-batch exit.
         versions = tuple(r.py_execution_version for r in batch.all_requests())
 
@@ -343,11 +343,33 @@ class ExecutionDeviceGuard:
         commit = ticket.wait()
         if len(commit.allowed) != len(state.requests):
             raise RuntimeError("sampling step has no complete device commit verdict")
+        accepted = []
         with self.table.guard_versions(list(ticket.versions)) as host_allowed:
             for request, host_ok, device_ok in zip(state.requests, host_allowed, commit.allowed):
                 if not (host_ok and device_ok):
                     self._cancel(request)
+                elif request.py_execution_version is not None and not request.is_finished:
+                    accepted.append((request, request.get_num_tokens(0)))
             yield
+            for request, before in accepted:
+                after = request.get_num_tokens(0)
+                if after == before:
+                    continue
+                if after != before + 1 or request.context_remaining_length != 0:
+                    raise RuntimeError("RETIRE requires one accepted token after completed context")
+                # The ticket completes after this step's forward. The new token
+                # has no KV yet; its preceding input does. Keep only progress
+                # accepted by both device and host authority.
+                self._kv_frontiers[id(request)] = before
+        # V2 can rebase pages while committing. Drain the latest reader, which
+        # may belong to the next overlapped forward, outside host authority.
+        for request, _ in accepted:
+            frontier = self._kv_frontiers.get(id(request), 0)
+            if self._kv_manager is not None and self._kv_manager.needs_execution_prefix_commit(
+                request, frontier
+            ):
+                self._wait_for_use(request, required=True)
+                self._kv_manager.preserve_execution_prefix(request, frontier)
 
     @contextmanager
     def context_commit(self, batch: ScheduledRequests) -> Iterator[ScheduledRequests]:
@@ -386,27 +408,33 @@ class ExecutionDeviceGuard:
             yield accepted
             for request in accepted.context_requests:
                 if request.py_execution_version is not None and not request.is_finished:
-                    self._prefill_frontiers[id(request)] = request.context_current_position
+                    self._kv_frontiers[id(request)] = max(
+                        self._kv_frontiers.get(id(request), 0), request.context_current_position
+                    )
+
+    def _wait_for_use(self, request: LlmRequest, *, required: bool = False) -> None:
+        use = self._uses.get(id(request))
+        if use is None and not required:
+            return
+        if use is None or use.request is not request or use.event is None:
+            raise RuntimeError("request GPU completion is unknown; refusing KV mutation or release")
+        self.device.wait_event(use.event)
 
     def _settle_prefix(self, request: LlmRequest) -> None:
-        use = self._uses.get(id(request))
-        if use is not None:
-            if use.event is None:
-                raise RuntimeError("request GPU completion is unknown; refusing resource release")
-            self.device.wait_event(use.event)
+        self._wait_for_use(request, required=id(request) in self._kv_frontiers)
         if request.py_execution_version is None:
             return
         if self._v1_manager is not None:
             block_size = self._v1_manager.tokens_per_block
-            frontier = self._prefill_frontiers.get(id(request), 0) // block_size * block_size
+            frontier = self._kv_frontiers.get(id(request), 0) // block_size * block_size
             request.freeze_retire_kv_frontier(frontier)
             if frontier and self._v1_manager.enable_block_reuse:
                 self._v1_manager.store_blocks_for_reuse(request)
         elif self._kv_manager is not None:
             # Retain accepted progress if revocation won the race against the
             # ordinary V2 commit. The latest GPU use has completed above.
-            self._kv_manager.preserve_context_prefix(
-                request, self._prefill_frontiers.get(id(request), 0)
+            self._kv_manager.preserve_execution_prefix(
+                request, self._kv_frontiers.get(id(request), 0)
             )
             self._kv_manager.stop_request_committing(request)
 
@@ -417,29 +445,12 @@ class ExecutionDeviceGuard:
         this request's commit frontier; it keeps the tree and other owners' holds.
         Terminal cleanup reports completion to FENCE after resource release succeeds.
         """
-        version = request.py_execution_version
-        interrupted = (
-            version is not None
-            and request.is_finished
-            and (
-                request.context_remaining_length > 0
-                or not self.table.observe_allowed((version,))[0]
-            )
-        )
-        if interrupted:
+        if request.py_execution_version is not None:
             self._settle_prefix(request)
         else:
-            use = self._uses.get(id(request))
-            if use is not None:
-                if use.event is None:
-                    raise RuntimeError(
-                        "request GPU completion is unknown; refusing resource release"
-                    )
-                self.device.wait_event(use.event)
-            if request.py_execution_version is not None and self._kv_manager is not None:
-                self._kv_manager.stop_request_committing(request)
+            self._wait_for_use(request)
         self._uses.pop(id(request), None)
-        self._prefill_frontiers.pop(id(request), None)
+        self._kv_frontiers.pop(id(request), None)
 
     @staticmethod
     def _cancel(request: LlmRequest) -> None:

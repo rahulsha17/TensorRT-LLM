@@ -708,6 +708,30 @@ frontier. It never derives that frontier from allocated capacity or the current
 unfinished chunk. A suspended cache keeps its already committed prefix without
 being restored just for this step. Other owners keep their existing holds.
 
+Accepted decode steps extend the same frontier beyond the input prompt. After
+the device ticket completes, host authority must still accept the sample before
+its input KV becomes inheritable. The newly sampled token is excluded: its KV
+is written by the next forward. A rejected or failed sample cannot advance the
+frontier. Terminal cleanup bounds V1 publication by this accepted frontier,
+including ordinary completion and cancellation without a successor.
+
+Tagged V2 requests keep committing after prefill. When accepted decode progress
+completes another block, the guard drains the latest GPU reader before publishing
+it; overlap may already have submitted the next forward. The drain does not hold
+host authority. V2 then uses its normal commit/rebase machinery and stops
+committing during terminal cleanup. A stopped or suspended cache is never
+reopened by this path. Untagged requests retain their existing prefill-end
+transition. The extra block-boundary waits can reduce decode overlap and belong
+in the no-revision overhead measurements.
+
+Generated-prefix inheritance requires rebuilt V1 bindings and the V2
+`is_commit_allowed` property from this branch. A Python overlay on the earlier
+wheel is insufficient. Run the generated-frontier host tests, native
+`LlmRequestTest.retiredKvFrontierIncludesWrittenGeneratedInputs`, native
+`KVCacheManagerTest.RetiredDecodePublishesOnlyAcceptedGeneratedPrefix`, and
+`test_retire_native_decode_commit_survives_owner_close` on CUDA before model
+qualification. The implementation is not yet qualified by GPU/model results.
+
 Only a batch whose every real row has lost authority may exit. A live request
 from another scope or an untagged neighbor makes the complete batch continue.
 Output and context-commit gates still reject the obsolete rows. This preserves

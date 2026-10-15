@@ -264,6 +264,10 @@ class _FakeManagerConfig:
 
 
 class _FakeKVCache:
+    @property
+    def is_commit_allowed(self):
+        return not self.stopped_committing
+
     def __init__(self, num_committed_tokens: int) -> None:
         self.num_committed_tokens = num_committed_tokens
         self.committed_tokens: list[int] | None = None
@@ -1370,9 +1374,12 @@ def test_retire_recovers_completed_context_before_stopping_native_cache() -> Non
             start:end
         ]
         request = SimpleNamespace(
-            py_request_id=1, is_dummy_request=False, context_current_position=10
+            py_request_id=1,
+            is_dummy_request=False,
+            context_current_position=10,
+            context_remaining_length=6,
         )
-        manager.preserve_context_prefix(request, 10)
+        manager.preserve_execution_prefix(request, 10)
         manager.stop_request_committing(request)
         assert owner.num_committed_tokens == 8
         assert peer.num_committed_tokens == 4
@@ -1384,6 +1391,75 @@ def test_retire_recovers_completed_context_before_stopping_native_cache() -> Non
         assert core.probe_reuse(ReuseScope(salt=12), prompt) == 0
     finally:
         for cache in (successor, peer, owner):
+            if cache is not None:
+                cache.close()
+        core.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("prompt_length,frontier", [(5, 8), (8, 12)])
+def test_retire_native_decode_commit_survives_owner_close(prompt_length, frontier) -> None:
+    from tensorrt_llm.execution_version import ExecutionVersion
+
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+            layers=[
+                AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4096)])
+            ],
+        )
+    )
+    owner = reservation = successor = None
+    source = list(range(frontier + 1))
+    revised = source + [99]
+    scope = ReuseScope(salt=11)
+    try:
+        owner = core.create_kv_cache(scope, expected_prompt_length=prompt_length)
+        assert owner.resume(CudaStream(torch.cuda.current_stream().cuda_stream))
+        assert owner.resize(len(revised))
+        manager = object.__new__(KVCacheManagerV2)
+        manager.enable_block_reuse = manager._can_publish_block_reuse = True
+        manager.tokens_per_block = 4
+        manager.kv_cache_map = {1: owner}
+        manager._reuse_token_source = lambda request: source
+        manager._augment_tokens_for_block_reuse = lambda tokens, req, start, end: tokens[start:end]
+        request = SimpleNamespace(
+            py_request_id=1,
+            py_execution_version=ExecutionVersion("tenant", "scope", 0),
+            is_dummy_request=False,
+            context_current_position=prompt_length,
+            context_remaining_length=0,
+            get_num_tokens=lambda beam: len(source),
+        )
+        manager.try_commit_blocks(request)
+        assert owner.num_committed_tokens == prompt_length
+        assert owner.is_commit_allowed
+        assert owner.enter_decode()
+        # The guard supplies completion evidence before this adapter is called.
+        torch.cuda.synchronize()
+        manager.preserve_execution_prefix(request, frontier)
+        assert owner.num_committed_tokens == frontier
+        manager.stop_request_committing(request)
+        assert not owner.is_commit_allowed
+        # A repeated call cannot reopen publication, even with more accepted input.
+        source.extend([100, 101, 102, 103])
+        manager.preserve_execution_prefix(request, frontier + 4)
+        assert owner.num_committed_tokens == frontier
+        reservation = core.create_kv_cache(scope, revised)
+        assert reservation.num_committed_tokens == frontier
+        owner.close()
+        owner = None
+        assert not _introspection.all_tree_pages_droppable(core)
+        successor = core.create_kv_cache(scope, revised)
+        assert successor.num_committed_tokens == frontier
+        assert core.probe_reuse(ReuseScope(salt=12), revised) == 0
+        assert core.probe_reuse(scope, revised[:prompt_length] + [200]) <= prompt_length
+        reservation.close()
+        reservation = None
+        assert successor.num_committed_tokens == frontier
+    finally:
+        for cache in (successor, reservation, owner):
             if cache is not None:
                 cache.close()
         core.shutdown()

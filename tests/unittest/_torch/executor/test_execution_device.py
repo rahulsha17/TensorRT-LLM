@@ -108,7 +108,7 @@ def test_context_frontier_requires_gpu_completion_before_host_acceptance(revoked
     guard._native_kv_guards = True
     guard._early_exit_enabled = False
     guard._uses = {}
-    guard._prefill_frontiers = {}
+    guard._kv_frontiers = {}
     request = SimpleNamespace(
         py_execution_version=old,
         py_request_id=42,
@@ -156,7 +156,7 @@ def test_context_frontier_requires_gpu_completion_before_host_acceptance(revoked
             assert accepted.context_requests == ([] if revoked else [request])
             if not revoked:
                 request.context_current_position = 64
-        assert guard._prefill_frontiers[id(request)] == (0 if revoked else 64)
+        assert guard._kv_frontiers[id(request)] == (0 if revoked else 64)
     finally:
         stream.synchronize()
 
@@ -288,7 +288,7 @@ def test_native_sampler_consumes_overlap_batch_containing_canceled_request(logpr
     guard._uses = {}
     guard._kv_manager = None
     guard._v1_manager = None
-    guard._prefill_frontiers = {}
+    guard._kv_frontiers = {}
     sampler = TorchSampler(
         TorchSampler.Args(
             max_seq_len=32,

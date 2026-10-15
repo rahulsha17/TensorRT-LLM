@@ -759,3 +759,19 @@ TEST_F(LlmRequestTest, retiredKvFrontierCannotGrow)
     EXPECT_EQ(request.getRetireKvFrontier().value(), 0);
     EXPECT_ANY_THROW(request.freezeRetireKvFrontier(1));
 }
+
+TEST_F(LlmRequestTest, retiredKvFrontierIncludesWrittenGeneratedInputs)
+{
+    texec::Request execReq(VecTokens{1, 2, 3, 4, 5}, 8);
+    tb::LlmRequest request(77, execReq);
+    request.setContextCurrentPosition(5);
+    request.addNewToken(6, 0);
+    request.addNewToken(7, 0);
+    request.addNewToken(8, 0);
+    EXPECT_ANY_THROW(request.freezeRetireKvFrontier(8));
+    EXPECT_NO_THROW(request.freezeRetireKvFrontier(7));
+    EXPECT_EQ(request.getRetireKvFrontier().value(), 7);
+    // Draining a later step cannot enlarge a retirement decision.
+    request.addNewToken(9, 0);
+    EXPECT_ANY_THROW(request.freezeRetireKvFrontier(8));
+}

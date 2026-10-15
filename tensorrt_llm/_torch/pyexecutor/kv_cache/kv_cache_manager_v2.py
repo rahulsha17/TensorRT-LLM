@@ -5463,7 +5463,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         kv_cache = self.kv_cache_map.get(request.py_request_id)
-        if kv_cache is None:
+        if kv_cache is None or not kv_cache.is_commit_allowed:
             return
 
         commit_end = request.context_current_position
@@ -5477,38 +5477,58 @@ class KVCacheManagerV2(BaseResourceManager):
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
-        if request.context_remaining_length == 0:
+        # Tagged requests publish accepted decode blocks through the execution
+        # guard. Keep this cache open until that owner performs terminal cleanup.
+        if (
+            request.context_remaining_length == 0
+            and getattr(request, "py_execution_version", None) is None
+        ):
             kv_cache.stop_committing()
 
-    def preserve_context_prefix(self, request: LlmRequest, completed_frontier: int) -> None:
-        """Retain complete blocks from an accepted, drained context frontier.
-
-        The execution owner must wait for all submitted GPU uses first. Context
-        progress can be accepted before a revision prevents the ordinary V2
-        publication step. Only the supplied accepted frontier may be recovered;
-        the request's current chunk and allocated capacity are not completion
-        evidence. Suspended caches keep their existing committed prefix.
-        """
-        if type(completed_frontier) is not int or not (
-            0 <= completed_frontier <= request.context_current_position
-        ):
-            raise ValueError("completed frontier must be within accepted context progress")
+    def needs_execution_prefix_commit(self, request: LlmRequest, completed_frontier: int) -> bool:
+        """Whether accepted progress contains another publishable complete block."""
         if not (
             self.enable_block_reuse
             and self._can_publish_block_reuse
             and not request.is_dummy_request
         ):
+            return False
+        cache = self.kv_cache_map.get(request.py_request_id)
+        return (
+            cache is not None
+            and cache.is_active
+            and cache.is_commit_allowed
+            and completed_frontier // self.tokens_per_block * self.tokens_per_block
+            > cache.num_committed_tokens
+        )
+
+    def preserve_execution_prefix(self, request: LlmRequest, completed_frontier: int) -> None:
+        """Retain complete blocks from accepted, drained context or decode work.
+
+        The execution owner must wait for all submitted GPU uses first. Context
+        progress can be accepted before a revision prevents ordinary publication.
+        Decode progress excludes the newest sampled token, whose KV is not yet
+        written. Only the supplied accepted frontier may be recovered; current
+        cursors and allocated capacity are not completion evidence. Suspended
+        caches and caches that stopped committing keep their existing prefix.
+        """
+        limit = request.context_current_position
+        if request.context_remaining_length == 0:
+            limit = max(limit, request.get_num_tokens(0) - 1)
+        if type(completed_frontier) is not int or not (0 <= completed_frontier <= limit):
+            raise ValueError(
+                "completed frontier must be within accepted context or decode progress"
+            )
+        if not self.needs_execution_prefix_commit(request, completed_frontier):
             return
-        kv_cache = self.kv_cache_map.get(request.py_request_id)
-        if kv_cache is None or not kv_cache.is_active:
-            return
+        kv_cache = self.kv_cache_map[request.py_request_id]
         end = completed_frontier // self.tokens_per_block * self.tokens_per_block
         start = kv_cache.num_committed_tokens
         if end <= start:
             return
         source = self._reuse_token_source(request)
         if end > len(source) or end > kv_cache.capacity:
-            raise RuntimeError("completed frontier exceeds the retained context allocation")
+            raise RuntimeError("completed frontier exceeds the retained KV allocation")
         tokens = self._augment_tokens_for_block_reuse(source, request, start=start, end=end)
         kv_cache.commit(tokens)
 

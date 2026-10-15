@@ -11170,3 +11170,33 @@ TEST_F(KVCacheManagerTest, RetiredPrefillPublishesOnlyFrozenCompletePrefix)
         static_cast<void>(manager->removeSequence(2, std::nullopt));
     }
 }
+
+TEST_F(KVCacheManagerTest, RetiredDecodePublishesOnlyAcceptedGeneratedPrefix)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto manager = makeVSWAManager(12, /*enableBlockReuse=*/true, stream);
+    tle::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+    auto prompt = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4});
+    auto old = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, prompt, samplingConfig, kVSWA_IS_STREAMING);
+    // Five prompt tokens allocate two four-token blocks. Generation fills the
+    // second block; the ninth sampled token does not yet have KV.
+    addSequenceForTest(*manager, 0, 5, kVSWA_BEAM_WIDTH, old);
+    old->setContextCurrentPosition(5);
+    for (SizeType32 token = 5; token < 9; ++token)
+    {
+        old->addNewToken(token, 0);
+    }
+    old->freezeRetireKvFrontier(8);
+    manager->storeBlocksForReuse(0, old, /*pinBlocks=*/false);
+    auto revised = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 99});
+    auto successor = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, revised, samplingConfig, kVSWA_IS_STREAMING);
+    addSequenceForTest(*manager, 1, 10, kVSWA_BEAM_WIDTH, successor);
+    EXPECT_EQ(successor->getPrepopulatedPromptLen(), 8);
+    static_cast<void>(manager->removeSequence(1, std::nullopt));
+    old->addNewToken(9, 0);
+    static_cast<void>(manager->removeSequence(0, old));
+    auto later = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, revised, samplingConfig, kVSWA_IS_STREAMING);
+    addSequenceForTest(*manager, 2, 10, kVSWA_BEAM_WIDTH, later);
+    EXPECT_EQ(later->getPrepopulatedPromptLen(), 8);
+    static_cast<void>(manager->removeSequence(2, std::nullopt));
+}

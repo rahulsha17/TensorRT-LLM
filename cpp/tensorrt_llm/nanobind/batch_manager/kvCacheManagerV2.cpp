@@ -1956,6 +1956,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
             nb::arg("is_end") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("is_commit_allowed",
+            [](kv::KvCache const& self) { return self.commitState() == kv::KvCache::CommitState::ALLOWED; })
         .def(
             "get_base_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx)
