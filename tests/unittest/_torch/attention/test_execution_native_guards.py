@@ -24,6 +24,10 @@ PHASES = {
     "decode_long": ([1, 1], [2047, 2047], 0),
     "mixed_short": ([512, 1], [0, 127], 1),
     "mixed_long": ([512, 1], [0, 2047], 1),
+    "verify_two": ([2, 2], [127, 127], 0),
+    "verify_five": ([5, 5], [127, 127], 0),
+    "verify_long": ([9, 9], [2047, 2047], 0),
+    "mixed_verify": ([512, 5], [0, 127], 1),
 }
 
 
@@ -35,20 +39,31 @@ PHASES = {
 @pytest.mark.parametrize(
     "phase,capture",
     [(phase, False) for phase in PHASES]
-    + [(phase, True) for phase in ("decode_short", "decode_long")],
+    + [(phase, True) for phase in ("decode_short", "decode_long", "verify_five", "verify_long")],
 )
 def test_native_attention_preserves_live_rows(
     monkeypatch, use_v2, head_dim, target_row, untagged_neighbor, revoked, phase, capture
 ):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
     original_post_init = TrtllmAttentionMetadata.__post_init__
+    lengths, cached, contexts = PHASES[phase]
 
     def paged_post_init(self):
         original_post_init(self)
         self.use_paged_context_fmha = True
+        if "verify" in phase:
+            draft_len = lengths[-1] - 1
+            self.update_spec_dec_param(
+                batch_size=len(lengths),
+                is_spec_decoding_enabled=True,
+                is_spec_dec_tree=False,
+                is_spec_dec_dynamic_tree=False,
+                max_draft_len=draft_len,
+                max_total_draft_tokens=draft_len,
+                num_contexts=contexts,
+            )
 
     monkeypatch.setattr(TrtllmAttentionMetadata, "__post_init__", paged_post_init)
-    lengths, cached, contexts = PHASES[phase]
     case = BackendCase(
         num_heads=32,
         num_kv_heads=8,
@@ -178,6 +193,8 @@ def test_native_attention_preserves_live_rows(
         "expected_rows",
         "counter_size",
         "empty_table",
+        "spec_tree",
+        "spec_without_enable",
     ],
 )
 def test_native_attention_rejects_invalid_authority_metadata(monkeypatch, invalid):
@@ -216,11 +233,19 @@ def test_native_attention_rejects_invalid_authority_metadata(monkeypatch, invali
             authority["retire_counters"] = authority["retire_counters"][:1]
         elif invalid == "empty_table":
             authority["retire_current_versions"] = authority["retire_current_versions"][:0]
+        elif invalid == "spec_tree":
+            kwargs.update(use_paged_context_fmha=True, is_spec_dec_tree=True)
+        elif invalid == "spec_without_enable":
+            kwargs.update(
+                use_paged_context_fmha=True, use_spec_decoding=True, is_spec_decoding_enabled=False
+            )
         kwargs.update(authority)
         native_attention(**kwargs)
 
     monkeypatch.setattr(thop, "attention", malformed_attention)
-    with pytest.raises(RuntimeError, match="RETIRE authority|RETIRE attention"):
+    with pytest.raises(
+        RuntimeError, match="RETIRE authority|RETIRE attention|RETIRE native guards"
+    ):
         run_backend(
             case, "TRTLLM", generate_inputs(case, seed=31), kv_dtype=torch.bfloat16, kv_layout="HND"
         )

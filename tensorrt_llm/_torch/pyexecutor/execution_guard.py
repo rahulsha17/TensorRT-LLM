@@ -26,6 +26,7 @@ from .execution_early_exit import (
     execution_trace_enabled,
     trace_execution,
 )
+from .execution_speculation import is_private_ngram
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .sampler import SampleStateTorch, TorchSampler
@@ -57,12 +58,26 @@ class ExecutionDeviceGuard:
     @staticmethod
     def validate_executor(executor: "PyExecutor", *, tensor_parallel: bool = False) -> None:
         engine = executor.model_engine
+        private_ngram = is_private_ngram(getattr(engine, "spec_config", None))
+        if private_ngram:
+            from ..speculative.ngram import NGramDrafter
+
+            private_ngram = (
+                type(executor.drafter) is NGramDrafter
+                and executor.drafter.spec_resource_manager.is_public_pool is False
+                and getattr(executor, "draft_model_engine", None) is None
+                and getattr(executor.sampler, "_force_num_accepted_tokens", 0) == 0
+                and executor.disable_overlap_scheduler
+            )
         unsupported = {
             "multiple ranks without coordination": executor.dist.world_size != 1
             and not tensor_parallel,
             "beam search": executor.max_beam_width != 1,
             "non-TorchSampler": type(executor.sampler) is not TorchSampler,
-            "speculative decoding": executor.drafter is not None or engine.is_spec_decode,
+            "speculative decoding other than private n-gram verification": (
+                executor.drafter is not None or engine.is_spec_decode
+            )
+            and not private_ngram,
             "missing KV manager": executor.kv_cache_manager is None,
             "KV transfers": executor.kv_cache_transceiver is not None,
             "KV connectors": executor.kv_connector_manager is not None,
@@ -95,6 +110,11 @@ class ExecutionDeviceGuard:
             raise ValueError("TRTLLM_RETIRE_EARLY_EXIT must be 0 or 1")
         self._early_exit_enabled = early_exit == "1"
         self.validate_executor(executor, tensor_parallel=rank_consensus is not None)
+        self._speculative_tokens_per_step = (
+            executor.model_engine.original_max_draft_len + 1
+            if is_private_ngram(getattr(executor.model_engine, "spec_config", None))
+            else 1
+        )
         if rank_consensus is not None:
             rank_consensus.validate_membership(
                 table.session_id, executor.dist.rank, tuple(range(executor.dist.world_size))
@@ -301,6 +321,14 @@ class ExecutionDeviceGuard:
                         request.context_chunk_size if request.is_context_init_state else 0,
                         request.state.name,
                         request.get_token(0, token_count - 1) if token_count else None,
+                        tuple(
+                            request.get_token(0, position)
+                            for position in range(
+                                max(0, token_count - self._speculative_tokens_per_step), token_count
+                            )
+                        )
+                        if getattr(self, "_speculative_tokens_per_step", 1) > 1
+                        else (),
                     )
                 )
             rows = tuple(snapshot)
@@ -564,22 +592,41 @@ class ExecutionDeviceGuard:
                     if not allowed_row:
                         self._cancel(request)
                     elif request.py_execution_version is not None and not request.is_finished:
-                        accepted.append((request, request.get_num_tokens(0)))
-                yield
-                for request, before in accepted:
+                        drafts = tuple(request.py_draft_tokens or ())
+                        if len(drafts) >= getattr(self, "_speculative_tokens_per_step", 1):
+                            raise RuntimeError("draft proposal exceeds the configured RETIRE step")
+                        accepted.append((request, request.get_num_tokens(0), drafts))
+                try:
+                    yield
+                finally:
+                    # Speculative verification can enqueue penalty-state writes
+                    # during host acceptance, after the earlier sampling event.
+                    if accepted and getattr(self, "_speculative_tokens_per_step", 1) > 1:
+                        self._record_uses([request for request, _, _ in accepted])
+                for request, before, drafts in accepted:
                     after = request.get_num_tokens(0)
                     if after == before:
                         continue
-                    if after != before + 1 or request.context_remaining_length != 0:
+                    count = after - before
+                    if not 1 <= count <= len(drafts) + 1 or request.context_remaining_length != 0:
                         raise RuntimeError(
-                            "RETIRE requires one accepted token after completed context"
+                            "RETIRE requires one accepted token per verified position after completed context"
                         )
+                    if drafts:
+                        matched = count - 1
+                        if request.py_num_accepted_draft_tokens != matched or any(
+                            request.get_token(0, before + offset) != drafts[offset]
+                            for offset in range(matched)
+                        ):
+                            raise RuntimeError(
+                                "accepted tokens do not match the verified draft prefix"
+                            )
                     # The new sample has no KV yet; its accepted input does.
-                    self._kv_frontiers[id(request)] = before
+                    self._kv_frontiers[id(request)] = after - 1
         # V2 rebasing drains the latest reader outside host authority. All ranks
         # finish preservation, or report failure, before another model step.
         with self._completing_step("token_prefix_done", requests):
-            for request, _ in accepted:
+            for request, _, _ in accepted:
                 frontier = self._kv_frontiers.get(id(request), 0)
                 if self._kv_manager is not None and self._kv_manager.needs_execution_prefix_commit(
                     request, frontier

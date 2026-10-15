@@ -75,7 +75,8 @@ def test_startup_opt_in_does_not_touch_cuda_when_disabled(monkeypatch):
 
 @pytest.mark.parametrize("tp", [1, 2, 4])
 @pytest.mark.parametrize("fault", [None, "pipeline", "attention_dp"])
-def test_startup_binding_accepts_only_lockstep_tp(monkeypatch, tp, fault):
+@pytest.mark.parametrize("speculation", [None, "private_ngram", "public_ngram", "eagle"])
+def test_startup_binding_accepts_only_lockstep_tp(monkeypatch, tp, fault, speculation):
     from tensorrt_llm._torch.pyexecutor import execution_attention as binding_module
 
     monkeypatch.setenv("TRTLLM_RETIRE_NATIVE_GUARDS", "1")
@@ -90,7 +91,13 @@ def test_startup_binding_accepts_only_lockstep_tp(monkeypatch, tp, fault):
             dtype=torch.bfloat16,
             attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
             max_beam_width=1,
-            is_spec_decode=False,
+            is_spec_decode=speculation is not None,
+            spec_config=SimpleNamespace(
+                decoding_type="Eagle" if speculation == "eagle" else "NGram",
+                is_public_pool=speculation == "public_ngram",
+            )
+            if speculation
+            else None,
             is_encode_only=False,
             is_multimodal=False,
             enable_attention_dp=fault == "attention_dp",
@@ -98,7 +105,7 @@ def test_startup_binding_accepts_only_lockstep_tp(monkeypatch, tp, fault):
         mapping=SimpleNamespace(world_size=tp * (2 if fault == "pipeline" else 1), tp_size=tp),
         sparse_attention_config=None,
     )
-    if fault:
+    if fault or speculation in ("public_ngram", "eagle"):
         with pytest.raises(NotImplementedError, match="TP only"):
             ExecutionAttentionBinding.from_runner(runner)
         constructor.assert_not_called()

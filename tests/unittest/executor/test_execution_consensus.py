@@ -85,7 +85,18 @@ def test_one_rank_revocation_rejects_same_row_everywhere(size, phase):
 
 
 @pytest.mark.parametrize(
-    "mismatch", ["session", "phase", "request", "version", "position", "order", "empty", "token"]
+    "mismatch",
+    [
+        "session",
+        "phase",
+        "request",
+        "version",
+        "position",
+        "order",
+        "empty",
+        "token",
+        "verified_suffix",
+    ],
 )
 def test_asymmetric_steps_fail_on_every_rank(mismatch):
     group = GatherGroup(2)
@@ -108,6 +119,9 @@ def test_asymmetric_steps_fail_on_every_rank(mismatch):
         other = (replace(ROW, context_position=64), rows[1])
     elif mismatch == "token":
         other = (replace(ROW, last_token_id=8), rows[1])
+    elif mismatch == "verified_suffix":
+        rows = (replace(ROW, verification_suffix=(1, 2, 7)), rows[1])
+        other = (replace(ROW, verification_suffix=(1, 3, 7)), rows[1])
     elif mismatch == "order":
         other = tuple(reversed(rows))
     elif mismatch == "empty":

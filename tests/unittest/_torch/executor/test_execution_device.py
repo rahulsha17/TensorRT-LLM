@@ -54,6 +54,48 @@ def test_token_commit_rejects_stale_rows_without_changing_candidate_scratch(comp
     assert successor.tokens_device[0, 2, 0].item() == 33
 
 
+@pytest.mark.parametrize("steps", [2, 5, 9])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("captured", [False, True])
+def test_multi_token_commit_has_one_authority_verdict_for_every_step(steps, dtype, captured):
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "speculative", 7)
+    current = replace(old, epoch=8)
+    neighbor = replace(old, scope_id="neighbor")
+    authority.publish(old)
+    authority.publish(neighbor)
+    source = torch.arange(steps * 4, dtype=dtype, device=authority.device).reshape(steps, 4, 1)
+    candidates = torch.empty_like(source)
+    graph = torch.cuda.CUDAGraph() if captured else None
+    if graph is not None:
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            candidates.copy_(source)
+    for version, live in ((old, True), (current, False)):
+        authority.publish(version)
+        if graph is not None:
+            graph.replay()
+        else:
+            candidates.copy_(source)
+        ticket = authority.enqueue_token_commit([old, neighbor, None], [2, 0, 3], candidates, False)
+        committed = ticket.wait()
+        assert committed.allowed == [live, True, True]
+        expected = torch.zeros_like(source)
+        expected[:, [0, 3], :] = source[:, [0, 3], :]
+        if live:
+            expected[:, 2, :] = source[:, 2, :]
+        assert torch.equal(committed.tokens_device, expected)
+        assert torch.equal(committed.tokens_host, expected.cpu())
+        assert torch.equal(candidates, source)
+
+
+def test_multi_token_commit_cannot_use_compact_single_step_layout():
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    candidates = torch.zeros((3, 4, 1), dtype=torch.int32, device=authority.device)
+    with pytest.raises(ValueError, match="exactly one step"):
+        authority.enqueue_token_commit([None], [2], candidates, True)
+
+
 def test_unknown_scopes_and_capacity_fail_instead_of_aliasing_epoch_zero() -> None:
     authority = DeviceExecutionAuthority(torch.cuda.current_device(), capacity=1)
     version = ExecutionVersion("tenant", "scope", 0)

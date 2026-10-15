@@ -1618,6 +1618,115 @@ def test_sampler_exception_does_not_accept_partially_mutated_token_state(guard):
     assert guard._kv_frontiers[id(request)] == 64
 
 
+@pytest.mark.parametrize("matched", [0, 1, 3, 4])
+@pytest.mark.parametrize("revoked", [False, True])
+def test_ngram_frontier_excludes_rejected_drafts_and_bonus_sample(guard, matched, revoked):
+    guard._speculative_tokens_per_step = 5
+    request = _request()
+    request.num_tokens = 80
+    request.context_remaining_length = 0
+    request.py_draft_tokens = [101, 102, 103, 104]
+    request.get_token = lambda beam, position: ([7] * 80 + [101, 102, 103, 104, 999])[position]
+    guard._kv_frontiers[id(request)] = 64
+    if revoked:
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+    with guard.token_commit(_state(request, allowed=[True])):
+        if not request.is_finished:
+            request.py_num_accepted_draft_tokens = matched
+            request.num_tokens += matched + 1
+    assert guard._kv_frontiers[id(request)] == (64 if revoked else 80 + matched)
+    if not revoked:
+        assert guard._uses[id(request)].request is request
+        guard._uses[id(request)].event.record.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "fault", ["wrong_token", "wrong_count", "too_many", "sampler_error", "event_error"]
+)
+def test_ngram_verification_failure_cannot_preserve_candidate_kv(guard, fault, monkeypatch):
+    guard._speculative_tokens_per_step = 5
+    request = _request()
+    request.num_tokens = 80
+    request.context_remaining_length = 0
+    request.py_draft_tokens = [101, 102, 103, 104]
+    request.get_token = (
+        lambda beam, position: 999 if fault == "wrong_token" else 101 + position - 80
+    )
+    guard._kv_frontiers[id(request)] = 64
+    if fault == "event_error":
+        monkeypatch.setattr("torch.cuda.Event", Mock(side_effect=RuntimeError("event failed")))
+    with pytest.raises(RuntimeError):
+        with guard.token_commit(_state(request, allowed=[True])):
+            request.py_num_accepted_draft_tokens = 3 if fault == "wrong_count" else 2
+            request.num_tokens += 6 if fault == "too_many" else 3
+            if fault == "sampler_error":
+                raise RuntimeError("verification failed")
+    assert guard._kv_frontiers[id(request)] == 64
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    if fault == "event_error":
+        assert guard._uses[id(request)].event is None
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "public_pool", "draft_engine", "forced_acceptance", "overlap"]
+)
+def test_only_private_ngram_without_draft_model_can_enable_retire(fault):
+    from tensorrt_llm._torch.speculative.ngram import NGramDrafter
+
+    executor = _executor()
+    executor.disable_overlap_scheduler = fault != "overlap"
+    executor.draft_model_engine = object() if fault == "draft_engine" else None
+    executor.model_engine.is_spec_decode = True
+    executor.model_engine.spec_config = SimpleNamespace(
+        decoding_type="NGram", is_public_pool=fault == "public_pool"
+    )
+    executor.drafter = object.__new__(NGramDrafter)
+    executor.drafter.spec_resource_manager = SimpleNamespace(is_public_pool=fault == "public_pool")
+    executor.sampler._force_num_accepted_tokens = 1 if fault == "forced_acceptance" else 0
+    if fault is None:
+        ExecutionDeviceGuard.validate_executor(executor)
+    else:
+        with pytest.raises(NotImplementedError, match="speculative"):
+            ExecutionDeviceGuard.validate_executor(executor)
+
+
+@pytest.mark.parametrize("matched", [0, 1, 4])
+@pytest.mark.parametrize("stop_after", [None, 1, 2, 4])
+def test_ngram_frontier_with_real_verification_and_early_finish(guard, matched, stop_after):
+    from tensorrt_llm._torch.pyexecutor.sampler.two_model_spec_dec import TwoModelSpecDecHandler
+
+    guard._speculative_tokens_per_step = 5
+    request = _request()
+    request.context_remaining_length = 0
+    request.py_draft_tokens = [101, 102, 103, 104]
+    tokens = [7] * 80
+    request.get_num_tokens = lambda beam: len(tokens)
+    request.get_token = lambda beam, position: tokens[position]
+    request.add_new_token = lambda token, beam: tokens.append(token)
+    samples = [101, 102, 103, 104, 999]
+    samples[matched] = 999
+
+    def finish(*args, **kwargs):
+        if stop_after is not None and len(tokens) - 80 == stop_after:
+            request.is_finished = True
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            return True
+        return False
+
+    sampler = SimpleNamespace(_force_num_accepted_tokens=0, finish_if_reason=finish)
+    handler = TwoModelSpecDecHandler(sampler)
+    with guard.token_commit(_state(request, allowed=[True])):
+        request.py_num_accepted_draft_tokens = handler._process_draft_tokens_greedy(
+            request,
+            new_tokens=[[[token]] * 3 for token in samples],
+            finish_reasons=[],
+        )
+    count = min(matched + 1, stop_after or 5)
+    assert len(tokens) == 80 + count
+    assert guard._kv_frontiers[id(request)] == 80 + count - 1
+    assert tokens[80:] == samples[:count]
+
+
 def test_v2_decode_commit_drains_latest_overlap_reader_without_locking_publisher(guard):
     request = _request()
     request.context_current_position = 64

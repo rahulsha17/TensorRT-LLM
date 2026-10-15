@@ -42,7 +42,18 @@ def _check_versions(table, slots, expected, allowed, COUNT: tl.constexpr, BLOCK:
 
 
 @triton.jit
-def _commit_tokens(table, slots, expected, sequence_slots, candidates, committed, allowed):
+def _commit_tokens(
+    table,
+    slots,
+    expected,
+    sequence_slots,
+    candidates,
+    committed,
+    allowed,
+    STEPS: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     row = tl.program_id(0)
     slot = tl.load(slots + row)
     epoch = tl.load(expected + row)
@@ -52,10 +63,12 @@ def _commit_tokens(table, slots, expected, sequence_slots, candidates, committed
         authorized = current == epoch
     tl.store(allowed + row, authorized)
     if authorized:
-        # Single-step, single-beam tensors are contiguous and indexed by slot.
+        # One authority read admits the entire single-beam verification row.
         sequence_slot = tl.load(sequence_slots + row)
-        token = tl.load(candidates + sequence_slot)
-        tl.store(committed + sequence_slot, token)
+        step = tl.arange(0, BLOCK)
+        offset = step * NUM_SLOTS + sequence_slot
+        token = tl.load(candidates + offset, step < STEPS, other=0)
+        tl.store(committed + offset, token, step < STEPS)
 
 
 def _epoch_word(epoch: int) -> int:
@@ -384,20 +397,21 @@ class DeviceExecutionAuthority:
         or successor state, and may contain values for revoked requests.
 
         ``candidates`` must be a contiguous integer CUDA tensor of shape
-        ``[1, num_sequence_slots, 1]``. The returned host tokens have shape
-        ``[num_requests]`` for compact sampling or the candidate shape otherwise.
+        ``[num_steps, num_sequence_slots, 1]``. Every step in a request has one
+        authority verdict. Compact sampling requires a single step and returns
+        ``[num_requests]``; otherwise the host tokens retain the candidate shape.
         """
         if len(versions) != len(sequence_slots) or not versions:
             raise ValueError("token commit requires one version and sequence slot per request")
         if (
             candidates.ndim != 3
-            or candidates.shape[0] != 1
+            or candidates.shape[0] < 1
             or candidates.shape[2] != 1
             or not candidates.is_contiguous()
         ):
-            raise ValueError(
-                "device token guard requires contiguous single-step, single-beam tokens"
-            )
+            raise ValueError("device token guard requires contiguous nonempty single-beam tokens")
+        if compact and candidates.shape[0] != 1:
+            raise ValueError("compact token commit requires exactly one step")
         if candidates.device != self.device:
             raise ValueError("candidate tokens are on a different device")
         if candidates.dtype not in (torch.int32, torch.int64):
@@ -427,6 +441,9 @@ class DeviceExecutionAuthority:
                     candidates,
                     committed,
                     allowed,
+                    candidates.shape[0],
+                    candidates.shape[1],
+                    triton.next_power_of_2(candidates.shape[0]),
                     num_warps=1,
                 )
                 tokens = committed[0, sequence_slots_device, 0] if compact else committed

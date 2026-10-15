@@ -10,6 +10,7 @@ import torch
 
 from ...execution_version import ExecutionVersion
 from .execution_device import DeviceAttentionRows, DeviceExecutionAuthority
+from .execution_speculation import is_private_ngram
 
 if TYPE_CHECKING:
     from ..attention.backends.trtllm import TrtllmAttentionMetadata
@@ -71,6 +72,7 @@ class ExecutionAttentionBinding:
             or config.attention_backend.Metadata is not TrtllmAttentionMetadata
             or config.max_beam_width != 1
             or config.is_spec_decode
+            and not is_private_ngram(config.spec_config)
             or config.is_encode_only
             or config.is_multimodal
             or runner.mapping.world_size != runner.mapping.tp_size
@@ -79,7 +81,7 @@ class ExecutionAttentionBinding:
         ):
             raise NotImplementedError(
                 "RETIRE native attention binding requires SM90 BF16 TRTLLM decoder attention "
-                "with TP only, without beams, attention DP, speculation or sparse attention"
+                "with TP only, without beams, attention DP, sparse attention or speculation other than private n-gram"
             )
         if os.environ.get("TLLM_FMHA_LIBS") != "fallback":
             raise ValueError("RETIRE native guards require TLLM_FMHA_LIBS=fallback before startup")

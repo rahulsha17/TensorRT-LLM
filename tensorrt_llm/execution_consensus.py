@@ -21,6 +21,7 @@ class ExecutionRow:
     context_chunk_size: int
     state: str
     last_token_id: int | None = None
+    verification_suffix: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,11 @@ class ExecutionStepConsensus:
                     row.token_count > 0
                     and (type(row.last_token_id) is not int or row.last_token_id < 0)
                 )
+                or not isinstance(row.verification_suffix, tuple)
+                or len(row.verification_suffix) > row.token_count
+                or any(type(token) is not int or token < 0 for token in row.verification_suffix)
+                or bool(row.verification_suffix)
+                and row.verification_suffix[-1] != row.last_token_id
             ):
                 raise ValueError("invalid execution row or authority verdict")
             if row.request_id in identities:

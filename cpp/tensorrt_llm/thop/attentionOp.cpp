@@ -1342,7 +1342,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
                 && (quant_mode == 0 || quant_mode == tensorrt_llm::common::QuantMode::w4a16Mxfp4().value())
                 && (head_size == 64 || head_size == 128) && beam_width == 1 && !is_mla_enable && !is_cross
                 && use_kv_cache && use_paged_context_fmha && !is_spec_dec_tree && !use_sage_attn
-                && !is_spec_decoding_enabled && !use_spec_decoding && !softmax_stats_tensor.has_value()
+                && (!use_spec_decoding || is_spec_decoding_enabled) && !softmax_stats_tensor.has_value()
                 && !helix_position_offsets.has_value(),
             "RETIRE native guards require BF16 paged head-size-64/128 attention without auxiliary outputs; "
             "quant_mode=",

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional
 
 from ordered_set import OrderedSet
@@ -76,10 +79,14 @@ class NGramPoolManager(BaseResourceManager):
         # Remove the pairs if the request is completed in private pool mode.
         for request in scheduled_batch.all_requests():
             if request.state == LlmRequestState.GENERATION_COMPLETE:
-                request_id = request.request_id
-                if request_id in self.pool:
-                    self.pool.pop(request_id)
-                    self.start_index.pop(request_id)
+                self.free_resources(request)
+
+    def free_resources(self, request: LlmRequest) -> None:
+        """Drop request-owned state even when cancellation bypasses a model batch."""
+        request_id = request.request_id
+        self.start_index.pop(request_id, None)
+        if not self.is_public_pool:
+            self.pool.pop(request_id, None)
 
     def get_draft_tokens(
         self,
