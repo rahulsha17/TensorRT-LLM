@@ -135,12 +135,10 @@ class RpcExecutorMixin:
             self._results[request.id] = result
             try:
                 with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-                    if execution is None:
-                        self.rpc_client.submit(request).remote(need_response=False)
-                    else:
-                        # Queue transport work without waiting under authority.
-                        # A delayed send is rechecked by worker admission.
-                        sent = self.rpc_client.submit(request).remote_future(need_response=False)
+                    # Queue transport work without waiting under authority or
+                    # the failure lock, including untagged neighboring work.
+                    # Tagged delayed sends are rechecked by worker admission.
+                    sent = self.rpc_client.submit(request).remote_future(need_response=False)
             except Exception:
                 self._results.pop(request.id, None)
                 raise

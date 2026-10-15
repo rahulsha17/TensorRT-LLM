@@ -177,7 +177,7 @@ def test_early_worker_reply_finds_result_registered_before_send(frontend):
         assert 41 in owner._results
         owner.handle_responses([ErrorResponse(41, "worker reply", 9)])
 
-    owner.rpc_client.submit.return_value.remote.side_effect = immediate_reply
+    owner.rpc_client.submit.return_value.remote_future.side_effect = immediate_reply
     result = owner.submit(request(None))
     assert result.queue.get_nowait().error_msg == "worker reply"
     assert result._execution is None and owner._results == {}
@@ -291,7 +291,7 @@ def test_failure_serializes_with_submission_and_drops_late_response(frontend):
         sending.set()
         assert release.wait(2)
 
-    owner.rpc_client.submit.return_value.remote.side_effect = send
+    owner.rpc_client.submit.return_value.remote_future.side_effect = send
     with ThreadPoolExecutor(2) as pool:
         submitting = pool.submit(owner.submit, request(None))
         assert sending.wait(1)
@@ -316,6 +316,22 @@ def test_normal_stream_shutdown_does_not_mark_executor_failed(frontend):
     owner.rpc_client.fetch_responses_loop_async.return_value.remote_streaming.side_effect = stream
     asyncio.run(owner._fetch_responses_loop_async())
     owner._set_fatal_error.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [None, OLD])
+def test_pending_transport_send_cannot_block_frontend_failure(frontend, version):
+    owner, _ = frontend
+    owner.get_execution_controller().register(OLD).wait()
+    result = owner.submit(request(version))
+    sent = owner.rpc_client.submit.return_value.remote_future.return_value
+    assert not sent.done()
+    owner.rpc_client.submit.return_value.remote.assert_not_called()
+    assert owner._fail_rpc_executor(OSError("worker died during send"))
+    with pytest.raises((EngineDeadError, ExecutionAuthorityError)):
+        result._result_step(0.1)
+    assert not sent.done()
+    sent.set_exception(OSError("late send error"))
+    assert not owner._results
 
 
 @pytest.mark.parametrize("revoked", [False, True])
