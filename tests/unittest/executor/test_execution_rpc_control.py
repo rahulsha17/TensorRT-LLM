@@ -4,10 +4,10 @@
 
 import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import closing
-from dataclasses import replace
+from contextlib import closing, contextmanager
+from dataclasses import dataclass, replace
 from queue import Queue
-from threading import Event
+from threading import Event, Lock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -20,7 +20,10 @@ from tensorrt_llm.execution_version import ExecutionVersion
 from tensorrt_llm.executor.execution_control import ExecutionControlMixin
 from tensorrt_llm.executor.execution_mailbox import ExecutionMailboxServer
 from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.rpc import RPCClient, RPCServer
+from tensorrt_llm.executor.rpc.rpc_common import get_unique_ipc_addr
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
+from tensorrt_llm.executor.rpc_worker_mixin import RpcWorkerMixin
 from tensorrt_llm.executor.utils import EngineDeadError, ErrorResponse
 
 pytestmark = pytest.mark.cpu_only
@@ -52,10 +55,18 @@ class Frontend(RpcExecutorMixin, ExecutionControlMixin):
         self._shutdown_execution_control()
 
 
+@dataclass
+class _Request:
+    execution_version: ExecutionVersion | None
+    id: int | None = None
+    disaggregated_params: None = None
+
+    def set_id(self, identity):
+        self.id = identity
+
+
 def request(version=OLD):
-    value = SimpleNamespace(id=None, execution_version=version, disaggregated_params=None)
-    value.set_id = lambda identity: setattr(value, "id", identity)
-    return value
+    return _Request(version)
 
 
 @pytest.fixture
@@ -76,10 +87,126 @@ def frontend(monkeypatch):
     table = WorkerVersionTable(owner._execution_session_id)
     server = ExecutionMailboxServer(table)
     owner.rpc_client.start_execution_mailbox.return_value.remote.return_value = server.address
-    owner.rpc_client.submit.return_value.remote_future.return_value = Future()
+    owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value = Future()
     yield owner, table
     owner._shutdown_execution_control()
     server.close()
+
+
+@contextmanager
+def rpc_worker(submit):
+    class Worker(RpcWorkerMixin):
+        def submit(self, req):
+            return submit(req)
+
+    server = RPCServer(Worker())
+    server.bind(get_unique_ipc_addr())
+    server.start()
+    try:
+        with RPCClient(server.address, hmac_key=server.hmac_key) as client:
+            acknowledgements = []
+            original = client._call_future
+
+            def capture_ack(*args, **kwargs):
+                assert kwargs["__rpc_params"].need_response
+                future = original(*args, **kwargs)
+                acknowledgements.append(future)
+                return future
+
+            client._call_future = capture_ack
+            yield client, acknowledgements
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize("version", [None, OLD])
+def test_worker_admission_error_reaches_frontend_over_real_rpc(frontend, version):
+    owner, _ = frontend
+    owner.get_execution_controller().register(OLD).wait()
+
+    def reject(req):
+        assert req.id == 41 and req.execution_version == version
+        raise ValueError("worker admission rejected")
+
+    with rpc_worker(reject) as (client, acknowledgements):
+        owner.rpc_client = client
+        result = owner.submit(request(version))
+        error = result.queue.get(timeout=5)
+        assert isinstance(error, ErrorResponse)
+        assert "worker admission rejected" in error.error_msg
+        assert "Worker traceback:" in error.error_msg
+        assert acknowledgements[0].done()
+        # Queue delivery precedes terminal cleanup under this lock.
+        with owner._execution_control_lock:
+            assert owner._results == {}
+            if result._execution is not None:
+                assert result._execution._wake is None
+
+
+@pytest.mark.parametrize("version", [None, OLD])
+def test_admission_ack_is_serializable_and_does_not_complete_request(frontend, version):
+    owner, _ = frontend
+    owner.get_execution_controller().register(OLD).wait()
+    worker_handle = Lock()  # A worker-local result must never be sent over RPC.
+    with rpc_worker(lambda req: worker_handle) as (client, acknowledgements):
+        owner.rpc_client = client
+        result = owner.submit(request(version))
+        assert acknowledgements[0].result(5) is None
+        assert result.queue.empty()
+        assert owner._results[41] is result
+        if result._execution is not None:
+            assert result._execution._wake is not None
+        owner.handle_responses([ErrorResponse(41, "ordinary terminal response", 9)])
+        assert result.queue.get(timeout=5).error_msg == "ordinary terminal response"
+
+
+def test_delayed_real_rpc_admission_does_not_block_revision(frontend):
+    owner, table = frontend
+    control = owner.get_execution_controller()
+    control.register(OLD).wait()
+    entered, release = Event(), Event()
+
+    def admit(req):
+        entered.set()
+        assert release.wait(5)
+        with table.admission(req.execution_version):
+            raise AssertionError("stale request must not be admitted")
+
+    with rpc_worker(admit) as (client, acknowledgements):
+        owner.rpc_client = client
+        try:
+            result = owner.submit(request())
+            assert entered.wait(5)
+            control.advance(REVISION).publication.wait()
+            assert not acknowledgements[0].done()
+            assert isinstance(result.queue.get(timeout=5), ExecutionAuthorityError)
+        finally:
+            release.set()
+        finished = Event()
+        acknowledgements[0].add_done_callback(lambda _: finished.set())
+        assert finished.wait(5)
+        assert acknowledgements[0].exception() is not None
+        assert owner._results == {}
+        assert result.queue.empty()
+
+
+@pytest.mark.parametrize("version", [None, OLD])
+def test_late_admission_error_does_not_reach_replacement_result(frontend, version):
+    owner, _ = frontend
+    owner.get_execution_controller().register(OLD).wait()
+    old_result = owner.submit(request(version))
+    old_ack = owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value
+    owner.handle_responses([ErrorResponse(41, "request ended", 9)])
+    assert old_result.queue.get_nowait().error_msg == "request ended"
+
+    owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value = Future()
+    replacement = owner.submit(request(version))
+    old_ack.set_exception(ValueError("late admission error"))
+    assert old_result.queue.empty()
+    assert replacement.queue.empty()
+    assert owner._results[41] is replacement
+    if replacement._execution is not None:
+        assert replacement._execution._wake is not None
 
 
 def test_rpc_bootstrap_is_lazy_and_uses_dedicated_authenticated_mailbox(frontend):
@@ -129,7 +256,7 @@ def test_missing_authority_rejects_tagged_rpc_before_sending(frontend):
     owner, _ = frontend
     with pytest.raises(ExecutionAuthorityError, match="register"):
         owner.submit(request())
-    owner.rpc_client.submit.assert_not_called()
+    owner.rpc_client.submit_for_rpc.assert_not_called()
     assert owner._results == {}
 
 
@@ -139,9 +266,9 @@ def test_pending_rpc_send_does_not_hold_authority_or_prevent_revoke(frontend):
         control = owner.get_execution_controller()
         control.register(OLD).wait()
         result = owner.submit(request())
-        sent = owner.rpc_client.submit.return_value.remote_future.return_value
+        sent = owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value
         assert not sent.done()
-        owner.rpc_client.submit.return_value.remote.assert_not_called()
+        owner.rpc_client.submit_for_rpc.return_value.remote.assert_not_called()
         control.advance(REVISION).publication.wait()
         with pytest.raises(ExecutionAuthorityError):
             result._result_step(0.1)
@@ -156,7 +283,7 @@ def test_immediate_async_send_failure_runs_callback_outside_authority(frontend):
         control.register(OLD).wait()
         failed = Future()
         failed.set_exception(OSError("send failed"))
-        owner.rpc_client.submit.return_value.remote_future.return_value = failed
+        owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value = failed
         handle = owner.handle_responses
 
         def check_unlocked(responses):
@@ -176,7 +303,7 @@ def test_cancelled_transport_future_reports_terminal_failure(frontend):
         owner, _ = frontend
         owner.get_execution_controller().register(OLD).wait()
         result = owner.submit(request())
-        owner.rpc_client.submit.return_value.remote_future.return_value.cancel()
+        owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value.cancel()
         error = result.queue.get_nowait()
         assert isinstance(error, ErrorResponse) and "cancelled" in error.error_msg
         assert owner._results == {}
@@ -189,7 +316,7 @@ def test_early_worker_reply_finds_result_registered_before_send(frontend):
         assert 41 in owner._results
         owner.handle_responses([ErrorResponse(41, "worker reply", 9)])
 
-    owner.rpc_client.submit.return_value.remote_future.side_effect = immediate_reply
+    owner.rpc_client.submit_for_rpc.return_value.remote_future.side_effect = immediate_reply
     result = owner.submit(request(None))
     assert result.queue.get_nowait().error_msg == "worker reply"
     assert result._execution is None and owner._results == {}
@@ -200,7 +327,7 @@ def test_synchronous_send_rejection_removes_result_and_host_hold(frontend):
         owner, _ = frontend
         control = owner.get_execution_controller()
         control.register(OLD).wait()
-        owner.rpc_client.submit.return_value.remote_future.side_effect = RuntimeError(
+        owner.rpc_client.submit_for_rpc.return_value.remote_future.side_effect = RuntimeError(
             "send rejected"
         )
         with pytest.raises(RuntimeError, match="send rejected"):
@@ -308,7 +435,7 @@ def test_failure_serializes_with_submission_and_drops_late_response(frontend):
         sending.set()
         assert release.wait(2)
 
-    owner.rpc_client.submit.return_value.remote_future.side_effect = send
+    owner.rpc_client.submit_for_rpc.return_value.remote_future.side_effect = send
     with ThreadPoolExecutor(2) as pool:
         submitting = pool.submit(owner.submit, request(None))
         assert sending.wait(1)
@@ -340,9 +467,9 @@ def test_pending_transport_send_cannot_block_frontend_failure(frontend, version)
     owner, _ = frontend
     owner.get_execution_controller().register(OLD).wait()
     result = owner.submit(request(version))
-    sent = owner.rpc_client.submit.return_value.remote_future.return_value
+    sent = owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value
     assert not sent.done()
-    owner.rpc_client.submit.return_value.remote.assert_not_called()
+    owner.rpc_client.submit_for_rpc.return_value.remote.assert_not_called()
     assert owner._fail_rpc_executor(OSError("worker died during send"))
     with pytest.raises((EngineDeadError, ExecutionAuthorityError)):
         result._result_step(0.1)

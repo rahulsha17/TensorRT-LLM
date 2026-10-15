@@ -138,7 +138,7 @@ class RpcExecutorMixin:
                     # Queue transport work without waiting under authority or
                     # the failure lock, including untagged neighboring work.
                     # Tagged delayed sends are rechecked by worker admission.
-                    sent = self.rpc_client.submit(request).remote_future(need_response=False)
+                    sent = self.rpc_client.submit_for_rpc(request).remote_future(need_response=True)
             except Exception:
                 self._results.pop(request.id, None)
                 raise
@@ -146,8 +146,14 @@ class RpcExecutorMixin:
 
             def ingress_done(future: Future) -> None:
                 error = "RPC submission was cancelled" if future.cancelled() else future.exception()
-                if error is not None and self._results.get(request.id) is result:
-                    self.handle_responses([ErrorResponse(request.id, str(error), -1)])
+                if error is not None:
+                    message = str(error)
+                    worker_traceback = getattr(error, "traceback", None)
+                    if worker_traceback:
+                        message += f"\nWorker traceback:\n{worker_traceback}"
+                    with self._execution_control_lock:
+                        if self._results.get(request.id) is result:
+                            self.handle_responses([ErrorResponse(request.id, message, -1)])
 
             # A completed future may invoke its callback immediately. Register
             # outside admission because terminal handling also takes authority.

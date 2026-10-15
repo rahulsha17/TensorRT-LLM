@@ -208,11 +208,15 @@ controller. Untagged generation calls keep their existing behavior. Tagged work
 requires explicit registration and a successful initial publication; missing
 authority fails instead of silently running without checks.
 
-RPC and Ray register result routing before sending a request. Tagged sends run
+RPC and Ray register result routing before sending a request. Submission runs
 asynchronously so a congested ingress cannot hold the authority lock and delay
-ADVANCE. The worker rechecks authority when the request arrives. Transport
-failures reach the result, and responses pass the frontend gate before entering
-the consumer queue. Shutdown closes authority before tearing down workers.
+ADVANCE. The worker rechecks authority when the request arrives, then replies
+with an admission acknowledgement. Admission errors, including the worker
+traceback, and transport failures reach the result. A successful acknowledgement
+does not finish the request or establish FENCE; tokens use the response stream
+and pass the frontend authority gate before entering the consumer queue. A late
+admission error cannot affect a replacement result. Shutdown closes authority
+before tearing down workers.
 
 `CollectivePublicationTransport` provides the control-plane aggregation needed
 for multi-rank integration. The executor supplies the complete expected set of

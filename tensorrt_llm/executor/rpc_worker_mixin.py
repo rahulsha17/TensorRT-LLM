@@ -223,6 +223,15 @@ class RpcWorkerMixin:
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
 
+    def submit_for_rpc(self, request: GenerationRequest) -> None:
+        """Acknowledge admission without serializing the worker's result handle.
+
+        The RPC reply carries enqueue errors to the frontend. Generated tokens
+        still use the response stream; successful admission does not prove
+        execution completion, FENCE, or ownership of reusable KV.
+        """
+        self.submit(request)
+
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
         """Fetch responses from the response queue (blocking)."""
         logger_debug(f"[worker] RpcWorker {self.rank} is fetching responses", color="yellow")
