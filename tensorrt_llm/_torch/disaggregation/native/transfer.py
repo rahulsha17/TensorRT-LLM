@@ -72,6 +72,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
+from tensorrt_llm._torch.disaggregation.native.execution_content import TransferPrefixIdentity
 from tensorrt_llm._torch.disaggregation.native.execution_wire import (
     _ENVELOPE as _EXECUTION_ENVELOPE,
 )
@@ -4655,6 +4656,8 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    # Runtime-owned immutable model/cache semantics, shared by compatible peers.
+    execution_cache_context_id: Optional[str] = None
 
 
 _SessionT = TypeVar("_SessionT", TxSession, RxSession)
@@ -4667,6 +4670,7 @@ class TransferWorker:
         self._execution_drain: Optional[RequestDrainTracker] = None
         self._execution_authority: Optional[WorkerVersionTable] = None
         self._execution_wire = ExecutionTransferWire()
+        self._execution_cache_context_id = config.execution_cache_context_id
         self._sessions_started = False
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
@@ -4754,6 +4758,30 @@ class TransferWorker:
             self._execution_drain = table.drain_tracker
             self._execution_authority = table
 
+    def _prefix_identity(self, request: LlmRequest) -> TransferPrefixIdentity:
+        """Snapshot the input whose KV this session may exchange, excluding samples."""
+        if (
+            request.py_beam_width != 1
+            or request.py_multimodal_data is not None
+            or request.prompt_embedding_table is not None
+        ):
+            raise ValueError("versioned KV prefix identity requires single-beam text input")
+        length = request.prompt_len
+        tokens = tuple(request.get_tokens(0))
+        if type(length) is not int or not 0 < length <= len(tokens):
+            raise ValueError("KV transfer prompt is incomplete or has an invalid length")
+        positions = request.py_position_ids
+        if positions is not None:
+            if len(positions) < length:
+                raise ValueError("KV transfer prompt positions are incomplete")
+            positions = tuple(positions[:length])
+        return TransferPrefixIdentity.from_tokens(
+            self._execution_cache_context_id,
+            tokens[:length],
+            position_ids=positions,
+            lora_task_id=request.lora_task_id,
+        )
+
     def _create_session(
         self,
         request: LlmRequest,
@@ -4783,11 +4811,12 @@ class TransferWorker:
                 raise RuntimeError("tagged KV session requires execution authority")
             if table.drain_tracker is not drain:
                 raise RuntimeError("execution authority drain tracker changed")
+            prefix = self._prefix_identity(request)
             # Publication and claim registration share the table's lock. Session
             # construction can block, so it runs after that lock is released.
             claim = table.admit_resource(request.py_request_id, version, f"kv-{direction}-session")
             try:
-                wire.register_local(transfer_id, direction, version, cache_salt)
+                wire.register_local(transfer_id, direction, version, cache_salt, prefix)
             except Exception:
                 # No constructor or native publication has run. This exact
                 # claim can be retired without releasing any existing session.
@@ -4806,6 +4835,7 @@ class TransferWorker:
                     or session.request_id != claim.request_id
                     or request.py_request_id != claim.request_id
                     or request.py_execution_version != version
+                    or self._prefix_identity(request) != prefix
                 ):
                     raise RuntimeError("KV session execution ownership changed during admission")
                 session._cleanup.bind_claim(drain, claim)

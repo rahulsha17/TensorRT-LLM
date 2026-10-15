@@ -12,6 +12,7 @@ import msgpack
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native import transfer
+from tensorrt_llm._torch.disaggregation.native.execution_content import TransferPrefixIdentity
 from tensorrt_llm._torch.disaggregation.native.execution_wire import (
     KV_RESULT_PREFIX,
     ExecutionTransferWire,
@@ -24,7 +25,8 @@ from tensorrt_llm.execution_version import ExecutionVersion
 
 pytestmark = pytest.mark.cpu_only
 VERSION = ExecutionVersion("tenant", "scope", 7)
-IDENTITY = TransferExecutionIdentity("authority", VERSION, 99, "cache")
+CONTENT = TransferPrefixIdentity.from_tokens("model-cache-v1", (1, 2, 3))
+IDENTITY = TransferExecutionIdentity("authority", VERSION, 99, "cache", CONTENT)
 
 
 def _body(kind: bytes, rid: int = 99) -> list[bytes]:
@@ -56,7 +58,7 @@ def _wire(
     wire = ExecutionTransferWire()
     wire.bind(table)
     if register:
-        wire.register_local(99, "receive", version, salt)
+        wire.register_local(99, "receive", version, salt, CONTENT if version is not None else None)
     return wire, table
 
 
@@ -87,7 +89,7 @@ def test_matching_old_evidence_remains_attributable_after_authority_ends(kind, s
         assert table.current_version("tenant", "scope") == successor
     # Matching identity is not permission to reuse the exchange for a successor.
     with pytest.raises(TransferIdentityError):
-        wire.register_local(99, "receive", successor, "cache")
+        wire.register_local(99, "receive", successor, "cache", CONTENT)
 
 
 @pytest.mark.parametrize(
@@ -99,6 +101,11 @@ def test_matching_old_evidence_remains_attributable_after_authority_ends(kind, s
         replace(IDENTITY, version=replace(VERSION, epoch=8)),
         replace(IDENTITY, transfer_id=100),
         replace(IDENTITY, cache_salt=None),
+        replace(IDENTITY, prefix=replace(CONTENT, cache_context_id="another-model")),
+        replace(IDENTITY, prefix=replace(CONTENT, num_tokens=2)),
+        replace(IDENTITY, prefix=replace(CONTENT, token_digest=b"a" * 32)),
+        replace(IDENTITY, prefix=replace(CONTENT, position_digest=b"a" * 32)),
+        replace(IDENTITY, prefix=replace(CONTENT, lora_task_id=7)),
     ],
 )
 @pytest.mark.parametrize("kind", KINDS)
@@ -122,7 +129,13 @@ def test_tagged_exchange_rejects_stripped_envelope(kind):
 def test_tagged_and_untagged_sessions_cannot_alias(first_tagged):
     wire, _ = _wire(version=VERSION if first_tagged else None)
     with pytest.raises(TransferIdentityError):
-        wire.register_local(99, "send", None if first_tagged else VERSION, "cache")
+        wire.register_local(
+            99,
+            "send",
+            None if first_tagged else VERSION,
+            "cache",
+            None if first_tagged else CONTENT,
+        )
 
 
 @pytest.mark.parametrize("kind", [MessageType.REQUEST_DATA, MessageType.CANCEL_SESSION])
@@ -133,8 +146,8 @@ def test_gen_first_peer_binding_precedes_and_constrains_local_session(kind):
     assert local.decode(incoming) == _body(kind)
     assert local.decode(incoming) == _body(kind)
     with pytest.raises(TransferIdentityError):
-        local.register_local(99, "send", replace(VERSION, epoch=8), "cache")
-    local.register_local(99, "send", VERSION, "cache")
+        local.register_local(99, "send", replace(VERSION, epoch=8), "cache", CONTENT)
+    local.register_local(99, "send", VERSION, "cache", CONTENT)
     assert peer.decode(local.encode(_body(MessageType.SESSION_QUIESCED))) == _body(
         MessageType.SESSION_QUIESCED
     )
@@ -153,11 +166,11 @@ def test_unsolicited_completion_cannot_create_exchange(kind, tagged):
 
 def test_local_admission_cannot_reuse_id_even_with_same_identity():
     wire, table = _wire()
-    wire.register_local(99, "send", VERSION, "cache")
+    wire.register_local(99, "send", VERSION, "cache", CONTENT)
     table.close()
     for direction in ("send", "receive"):
         with pytest.raises(TransferIdentityError, match="reused"):
-            wire.register_local(99, direction, VERSION, "cache")
+            wire.register_local(99, direction, VERSION, "cache", CONTENT)
 
 
 @pytest.mark.parametrize("action", ["send", "receive", "local"])
@@ -190,7 +203,7 @@ def test_unbound_endpoint_rejects_versioned_peer():
     with pytest.raises(TransferIdentityError):
         wire.decode(peer.encode(_body(MessageType.REQUEST_DATA)))
     with pytest.raises(TransferIdentityError):
-        wire.register_local(99, "send", VERSION, "cache")
+        wire.register_local(99, "send", VERSION, "cache", CONTENT)
 
 
 @pytest.mark.parametrize("epoch", [0, (1 << 64) - 1])
@@ -204,16 +217,16 @@ def test_uint64_epoch_round_trip(epoch):
     [
         [],
         [1],
-        [True, "authority", "tenant", "scope", 7, 99, None],
-        [2, "authority", "tenant", "scope", 7, 99, None],
-        [1, "", "tenant", "scope", 7, 99, None],
-        [1, "authority", "", "scope", 7, 99, None],
-        [1, "authority", "tenant", "scope", True, 99, None],
-        [1, "authority", "tenant", "scope", -1, 99, None],
-        [1, "authority", "tenant", "scope", 7, True, None],
-        [1, "authority", "tenant", "scope", 7, -1, None],
-        [1, "authority", "tenant", "scope", 7, 1 << 63, None],
-        [1, "authority", "tenant", "scope", 7, 99, 4],
+        [True, "authority", "tenant", "scope", 7, 99, None, CONTENT.to_values()],
+        [3, "authority", "tenant", "scope", 7, 99, None, CONTENT.to_values()],
+        [2, "", "tenant", "scope", 7, 99, None, CONTENT.to_values()],
+        [2, "authority", "", "scope", 7, 99, None, CONTENT.to_values()],
+        [2, "authority", "tenant", "scope", True, 99, None, CONTENT.to_values()],
+        [2, "authority", "tenant", "scope", -1, 99, None, CONTENT.to_values()],
+        [2, "authority", "tenant", "scope", 7, True, None, CONTENT.to_values()],
+        [2, "authority", "tenant", "scope", 7, -1, None, CONTENT.to_values()],
+        [2, "authority", "tenant", "scope", 7, 1 << 63, None, CONTENT.to_values()],
+        [2, "authority", "tenant", "scope", 7, 99, 4, CONTENT.to_values()],
     ],
 )
 def test_identity_schema_is_strict(values):
@@ -230,8 +243,8 @@ def test_malformed_identity_rejected(data):
 def test_oversized_identity_rejected_before_local_binding():
     wire, _ = _wire(register=False)
     with pytest.raises(TransferIdentityError, match="wire limit"):
-        wire.register_local(99, "send", VERSION, "x" * 65536)
-    wire.register_local(99, "send", VERSION, "cache")
+        wire.register_local(99, "send", VERSION, "x" * 65536, CONTENT)
+    wire.register_local(99, "send", VERSION, "cache", CONTENT)
 
 
 @pytest.mark.parametrize(
@@ -280,7 +293,7 @@ def test_racing_peer_and_local_registration_choose_one_identity():
             if peer_first:
                 wire.decode(incoming)
             else:
-                wire.register_local(99, "send", VERSION, "local")
+                wire.register_local(99, "send", VERSION, "local", CONTENT)
             return True
         except TransferIdentityError:
             return False

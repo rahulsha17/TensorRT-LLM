@@ -783,11 +783,31 @@ ALIGN/RESUME cannot admit a session. Binding only a drain tracker is insufficien
 for tagged sessions.
 
 The native Python transfer worker also binds each exchange to an immutable wire
-identity: authority session, tenant, scope, epoch, transfer ID and cache salt.
+identity: authority session, tenant, scope, epoch, transfer ID, cache salt and
+expected prefix identity.
 Requests, KV and auxiliary results, cancellation and quiescence messages carry
 that identity. A listener rejects a mismatched or stripped identity before
 dispatch. Peer requests may arrive before the local session; later local admission
 must match the peer's binding. Both endpoints must support the envelope.
+
+The prefix identity records the prompt length, token and position digests, LoRA
+task ID and an immutable model/cache context ID. It excludes newly sampled tokens
+beyond `prompt_len`. Tagged sessions currently require single-beam text input.
+The worker snapshots this identity before session construction and checks it
+again before returning the session. A mismatch with the peer prevents admission;
+a change during construction keeps resource ownership until physical cleanup.
+
+The runtime must provide `TransferWorkerConfig.execution_cache_context_id`, shared
+only by workers with compatible model weights, positional semantics, adapter
+identities and KV numerical format. A mutable model name or worker address is not
+sufficient. This is an internal configuration contract; runtime wiring is still
+required. Tagged sessions without it fail before acquiring a session claim.
+Existing peer checks still validate physical layouts. Untagged transfers keep
+their existing behavior. Identity schema 2 carries the prefix inside the existing
+envelope framing; old tagged schema 1 messages are rejected without downgrade.
+
+These digests describe expected inputs. They do not checksum GPU memory, establish
+HBM residence, prove that a copy finished, or authorize RESUME.
 
 Matching old completion and cancellation messages remain usable after revocation
 or authority shutdown. They identify the old transfer and can help it drain;
@@ -814,10 +834,13 @@ FENCE waits for physical drain and successful session cleanup, including when
 rejection happened before any destination was published.
 
 These claims account for resource lifetime; they do not publish authority or
-validate transferred content. End-to-end disaggregated RETIRE still needs shared
-authority across prefill and decode, integration of these admission hooks and
-placement-aware prefix validation. Physical retirement must also be qualified for
-each supported layout and transport. Device guards continue to reject transfer and
+prove the contents of transferred memory. End-to-end disaggregated RETIRE still
+needs runtime wiring of shared authority and cache context across prefill and
+decode, source KV holds and destination prefix validation. ALIGN may need a copy
+before RESUME, so it also needs permission for that specific transfer without
+granting permission to generate. The current operation checks require RESUME and
+do not provide that permission. Physical retirement must be qualified for each
+supported layout and transport. Device guards continue to reject transfer and
 connector configurations until those paths are integrated and qualified.
 
 ## ALIGN (step 7)

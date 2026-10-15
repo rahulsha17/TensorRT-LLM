@@ -332,6 +332,7 @@ def test_worker_explicitly_selects_session_deadline(
         max_draft_len=0,
         instance_name="deadline-test",
         device_id=0,
+        execution_cache_context_id=None,
     )
     worker = transfer_mod.TransferWorker(config)
     watchdog = worker._retirement_watchdog

@@ -13,6 +13,7 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native import transfer
+from tensorrt_llm._torch.disaggregation.native.execution_content import TransferPrefixIdentity
 from tensorrt_llm._torch.disaggregation.native.execution_wire import (
     ExecutionTransferWire,
     TransferIdentityError,
@@ -35,7 +36,9 @@ def _authority(direction):
     table.apply(VersionUpdate("authority", 1, VERSION))
     wire = ExecutionTransferWire()
     wire.bind(table)
-    wire.register_local(99, direction, VERSION, "cache")
+    wire.register_local(
+        99, direction, VERSION, "cache", TransferPrefixIdentity.from_tokens("model", (1, 2))
+    )
     return wire, table
 
 

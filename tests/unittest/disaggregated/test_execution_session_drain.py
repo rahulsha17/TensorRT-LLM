@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.native.execution_content import TransferPrefixIdentity
 from tensorrt_llm._torch.disaggregation.native.execution_wire import (
     ExecutionTransferWire,
     TransferIdentityError,
@@ -31,6 +32,7 @@ def _worker():
     worker._execution_drain = None
     worker._execution_authority = None
     worker._execution_wire = ExecutionTransferWire()
+    worker._execution_cache_context_id = "model-cache-v1"
     worker._sessions_started = False
     worker._config = TransferWorkerConfig(
         kv_cache_manager=Mock(),
@@ -61,6 +63,12 @@ def _request(version=VERSION, wire_id=99):
         py_execution_version=version,
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=wire_id),
         prompt_len=32,
+        get_tokens=lambda beam: list(range(32)),
+        lora_task_id=None,
+        py_beam_width=1,
+        py_multimodal_data=None,
+        prompt_embedding_table=None,
+        py_position_ids=None,
     )
 
 
@@ -257,6 +265,98 @@ def test_changed_version_during_construction_fails_closed(direction):
         _create(worker, direction, request)
     with pytest.raises(RuntimeError, match="drain is unknown"):
         drain.drained(VERSION)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("change", ["tokens", "positions", "length", "lora"])
+def test_changed_prefix_during_construction_retains_the_claim(direction, change):
+    worker, drain = _worker(), RequestDrainTracker()
+    _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    request = _request()
+
+    def mutate(_session):
+        if change == "tokens":
+            request.get_tokens = lambda beam: [99] * 32
+        elif change == "positions":
+            request.py_position_ids = list(range(1, 33))
+        elif change == "length":
+            request.prompt_len = 16
+        else:
+            request.lora_task_id = 7
+
+    _peer(worker, direction).setup_session.side_effect = mutate
+    with pytest.raises(RuntimeError, match="ownership changed"):
+        _create(worker, direction, request)
+    assert drain._resources
+    with pytest.raises(RuntimeError, match="drain is unknown"):
+        drain.drained(VERSION)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize(
+    "invalid", ["context", "short_input", "positions", "multimodal", "embeddings", "beam"]
+)
+def test_invalid_prefix_never_exposes_a_session(direction, invalid):
+    worker, drain = _worker(), RequestDrainTracker()
+    _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    request = _request()
+    if invalid == "context":
+        worker._execution_cache_context_id = None
+    elif invalid == "short_input":
+        request.get_tokens = lambda beam: [1]
+    elif invalid == "positions":
+        request.py_position_ids = [0]
+    elif invalid == "multimodal":
+        request.py_multimodal_data = {}
+    elif invalid == "embeddings":
+        request.prompt_embedding_table = object()
+    else:
+        request.py_beam_width = 2
+    with pytest.raises(ValueError):
+        _create(worker, direction, request)
+    assert not drain._resources
+    _peer(worker, direction).setup_session.assert_not_called()
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_peer_prefix_mismatch_releases_only_unpublished_session_claim(direction):
+    worker, drain = _worker(), RequestDrainTracker()
+    _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    # The other endpoint has bound the exchange to different token contents.
+    worker._execution_wire.register_local(
+        99,
+        "receive" if direction == "send" else "send",
+        VERSION,
+        None,
+        TransferPrefixIdentity.from_tokens("model-cache-v1", (99,) * 32),
+    )
+    with pytest.raises(TransferIdentityError, match="bound to another execution"):
+        _create(worker, direction, _request())
+    _peer(worker, direction).setup_session.assert_not_called()
+    assert not drain._resources
+    assert not drain.drained(VERSION)
+    drain.complete(41, VERSION)
+    assert drain.drained(VERSION)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_transfer_prefix_excludes_unwritten_sample_and_binds_positions(direction):
+    worker, drain = _worker(), RequestDrainTracker()
+    _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    request = _request()
+    request.get_tokens = lambda beam: list(range(32)) + [900]
+    request.py_position_ids = list(range(10, 42))
+    request.lora_task_id = 7
+    session = _create(worker, direction, request)
+    identity = worker._execution_wire._exchanges[99].identity
+    assert identity.prefix == TransferPrefixIdentity.from_tokens(
+        "model-cache-v1", tuple(range(32)), position_ids=tuple(range(10, 42)), lora_task_id=7
+    )
+    assert session.close()
 
 
 @pytest.mark.parametrize("direction", ["send", "receive"])

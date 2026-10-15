@@ -15,6 +15,7 @@ from typing import Literal
 
 import msgpack
 
+from tensorrt_llm._torch.disaggregation.native.execution_content import TransferPrefixIdentity
 from tensorrt_llm.execution_mailbox import WorkerVersionTable
 from tensorrt_llm.execution_version import ExecutionVersion
 
@@ -86,6 +87,7 @@ class TransferExecutionIdentity:
     version: ExecutionVersion
     transfer_id: int
     cache_salt: str | None
+    prefix: TransferPrefixIdentity
 
     def __post_init__(self) -> None:
         if not isinstance(self.authority_session, str) or not self.authority_session:
@@ -95,17 +97,20 @@ class TransferExecutionIdentity:
         _check_transfer_id(self.transfer_id)
         if self.cache_salt is not None and not isinstance(self.cache_salt, str):
             raise TransferIdentityError("cache salt must be a string or None")
+        if not isinstance(self.prefix, TransferPrefixIdentity):
+            raise TransferIdentityError("tagged transfer requires a prefix identity")
 
     def pack(self) -> bytes:
         result = msgpack.packb(
             [
-                1,
+                2,
                 self.authority_session,
                 self.version.tenant_id,
                 self.version.scope_id,
                 self.version.epoch,
                 self.transfer_id,
                 self.cache_salt,
+                self.prefix.to_values(),
             ],
             use_bin_type=True,
         )
@@ -121,13 +126,19 @@ class TransferExecutionIdentity:
             values = msgpack.unpackb(data, raw=False)
             if (
                 not isinstance(values, list)
-                or len(values) != 7
+                or len(values) != 8
                 or type(values[0]) is not int
-                or values[0] != 1
+                or values[0] != 2
             ):
                 raise TransferIdentityError("unsupported transfer identity schema")
-            _, owner, tenant, scope, epoch, transfer_id, salt = values
-            return cls(owner, ExecutionVersion(tenant, scope, epoch), transfer_id, salt)
+            _, owner, tenant, scope, epoch, transfer_id, salt, prefix = values
+            return cls(
+                owner,
+                ExecutionVersion(tenant, scope, epoch),
+                transfer_id,
+                salt,
+                TransferPrefixIdentity.from_values(prefix),
+            )
         except (ValueError, TypeError, OverflowError) as error:
             raise TransferIdentityError("invalid transfer execution identity") from error
 
@@ -181,9 +192,14 @@ class ExecutionTransferWire:
         direction: Literal["send", "receive"],
         version: ExecutionVersion | None,
         cache_salt: str | None,
+        prefix: TransferPrefixIdentity | None = None,
     ) -> None:
         if direction not in ("send", "receive"):
             raise TransferIdentityError("invalid transfer direction")
+        if version is None and prefix is not None:
+            raise TransferIdentityError("unversioned transfer cannot discard a prefix identity")
+        if version is not None and not isinstance(prefix, TransferPrefixIdentity):
+            raise TransferIdentityError("tagged transfer requires a prefix identity")
         with self._lock:
             self._traffic_started = True
             if self._table is None:
@@ -196,7 +212,7 @@ class ExecutionTransferWire:
                 None
                 if version is None
                 else TransferExecutionIdentity(
-                    self._authority_session, version, transfer_id, cache_salt
+                    self._authority_session, version, transfer_id, cache_salt, prefix
                 )
             )
             if identity is not None:
