@@ -16,7 +16,7 @@
  */
 
 #pragma once
-#include "../../../../xqa/retireAuthority.h"
+#include "tensorrt_llm/kernels/retireAuthority.h"
 #include <fmha/gmem_tile_o_packed.h>
 #include <fmha/hopper/fragment.h>
 

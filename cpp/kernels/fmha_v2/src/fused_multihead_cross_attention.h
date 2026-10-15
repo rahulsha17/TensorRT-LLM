@@ -16,7 +16,7 @@
  */
 
 #pragma once
-#include "../../../tensorrt_llm/kernels/retireAuthority.h"
+#include "tensorrt_llm/kernels/retireAuthority.h"
 
 #include <cuda.h>
 #include <fused_multihead_attention.h>

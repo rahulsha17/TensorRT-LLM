@@ -3,6 +3,8 @@
 """CPU-only regressions for out-of-tree wheel source staging."""
 
 import importlib.util
+import shutil
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -122,3 +124,32 @@ for name in ('fmha_cubin.h', 'fmha_cubin.cpp', 'test_sm90.cu'):
     assert build_wheel._fmha_generation_stamp(kernels).is_file()
     if out_of_tree:
         assert not (generator / "generated").exists()
+
+
+@pytest.mark.parametrize(
+    "relative_header",
+    [
+        "fused_multihead_attention.h",
+        "fused_multihead_cross_attention.h",
+        "fmha/hopper/gmem_tile_o_packed.h",
+    ],
+)
+def test_fmha_authority_include_compiles_outside_checkout(tmp_path: Path, relative_header: str):
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("requires a C++ compiler")
+    cpp = Path(__file__).resolve().parents[3] / "cpp"
+    original = cpp / "kernels/fmha_v2/src" / relative_header
+    includes = [
+        line
+        for line in original.read_text().splitlines()
+        if line.startswith("#include") and "retireAuthority.h" in line
+    ]
+    assert len(includes) == 1
+    copied = tmp_path / "fmha_v2-work/src" / relative_header
+    copied.parent.mkdir(parents=True)
+    copied = copied.with_suffix(".cc")
+    copied.write_text(includes[0] + "\nstatic_assert(sizeof(retire::Authority) > 0);\n")
+    subprocess.run(
+        [compiler, "-std=c++17", "-fsyntax-only", "-I", str(cpp), str(copied)], check=True
+    )
