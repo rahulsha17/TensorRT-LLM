@@ -402,6 +402,7 @@ def generate_fmha_cu(project_dir, venv_python, gen_root=None):
         "SCHEDULING_MODE": "1",
         "ENABLE_SM100": "1",
         "ENABLE_SM120": "1",
+        "TRTLLM_FMHA_CPP_ROOT": str((project_dir / "cpp").resolve()),
         "GENERATE_CU_TRTLLM": "true"
     })
 

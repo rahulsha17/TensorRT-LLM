@@ -4039,6 +4039,11 @@ def generate_files(specs_names):
         os.mkdir('bin')
     cmd = 'nvcc -I src -Xcompiler -Wno-enum-compare --std=c++20 -o bin/print_traits.exe generated/print_kernel_traits.cu'.split(
     )
+    # The generator may run from a scratch copy outside the source tree.
+    cpp_root = os.environ.get(
+        'TRTLLM_FMHA_CPP_ROOT',
+        os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+    cmd.extend(['-I', cpp_root])
     if 'CUDA_PATH' in os.environ:
         cmd[0] = os.environ['CUDA_PATH'] + '/bin/' + cmd[0]
     print('Running command "{}" to build "bin/print_traits.exe":'.format(
@@ -4047,6 +4052,8 @@ def generate_files(specs_names):
                                stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE)
     output, error = process.communicate()
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, cmd, output)
     print('Running "bin/print_traits.exe":')
     process = subprocess.Popen('bin/print_traits.exe',
                                stdin=subprocess.PIPE,

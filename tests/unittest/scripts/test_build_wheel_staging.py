@@ -89,3 +89,36 @@ def test_stage_python_package_without_optional_files(
     build_wheel.stage_python_package(project, staging)
 
     assert {path.name for path in staging.iterdir()} == set(trees)
+
+
+@pytest.mark.parametrize("out_of_tree", [False, True])
+def test_fmha_generation_resolves_shared_headers(
+    build_wheel: ModuleType, tmp_path: Path, out_of_tree: bool
+) -> None:
+    project = tmp_path / "checkout with spaces"
+    generator = project / "cpp/kernels/fmha_v2"
+    generator.mkdir(parents=True)
+    header = project / "cpp/tensorrt_llm/kernels/retireAuthority.h"
+    header.parent.mkdir(parents=True)
+    header.write_text("// canonical authority header\n")
+    (generator / "setup.py").write_text(
+        """import os
+from pathlib import Path
+root = Path(os.environ['TRTLLM_FMHA_CPP_ROOT'])
+assert root.is_absolute()
+header = root / 'tensorrt_llm/kernels/retireAuthority.h'
+assert header.read_text() == '// canonical authority header\\n'
+out = Path('generated')
+out.mkdir()
+for name in ('fmha_cubin.h', 'fmha_cubin.cpp', 'test_sm90.cu'):
+    (out / name).write_text('// generated\\n')
+"""
+    )
+    gen_root = tmp_path / "build" / "fmha-gen" if out_of_tree else None
+    build_wheel.generate_fmha_cu(project, None, gen_root)
+    kernels, cubins = build_wheel.get_fmha_gen_dirs(project, gen_root)
+    assert (kernels / "test_sm90.cu").read_text() == "// generated\n"
+    assert (cubins / "fmha_cubin.h").is_file()
+    assert build_wheel._fmha_generation_stamp(kernels).is_file()
+    if out_of_tree:
+        assert not (generator / "generated").exists()
