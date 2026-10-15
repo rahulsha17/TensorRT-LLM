@@ -667,6 +667,45 @@ def _executor():
     )
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_tp_guard_binds_exact_membership_and_only_source_wakes(monkeypatch, rank):
+    executor = _executor()
+    executor.dist = SimpleNamespace(world_size=2, tp_size=2, pp_size=1, cp_size=1, rank=rank)
+    executor.enable_attention_dp = False
+    executor._is_kv_manager_v2 = True
+    executor.executor_request_queue = Mock()
+    executor.model_engine.execution_attention = SimpleNamespace(authority=Mock())
+    table = WorkerVersionTable("session")
+    consensus = ExecutionStepConsensus("session", rank, (0, 1), Mock())
+    guard = ExecutionDeviceGuard(executor, table, consensus)
+    assert guard.is_distributed
+    table.alignment_state._wake()
+    assert executor.executor_request_queue.wake_alignment.call_count == int(rank == 0)
+
+
+@pytest.mark.parametrize(
+    "fault", ["pp", "cp", "adp", "no_coordinator", "session", "rank", "membership"]
+)
+def test_tp_guard_rejects_incomplete_topology_before_binding(fault):
+    executor = _executor()
+    executor.dist = SimpleNamespace(world_size=2, tp_size=2, pp_size=1, cp_size=1, rank=0)
+    executor.enable_attention_dp = fault == "adp"
+    if fault == "pp":
+        executor.dist.pp_size = 2
+    if fault == "cp":
+        executor.dist.cp_size = 2
+    table = WorkerVersionTable("session")
+    consensus = ExecutionStepConsensus(
+        "other" if fault == "session" else "session",
+        1 if fault == "rank" else 0,
+        (0, 1, 2) if fault == "membership" else (0, 1),
+        Mock(),
+    )
+    with pytest.raises((NotImplementedError, ValueError)):
+        ExecutionDeviceGuard(executor, table, None if fault == "no_coordinator" else consensus)
+    assert table.drain_tracker is None
+
+
 @pytest.mark.parametrize("early_exit", [None, "0", "1"])
 def test_controller_adopts_authority_already_captured_by_attention(monkeypatch, early_exit):
     monkeypatch.delenv("TRTLLM_RETIRE_EARLY_EXIT", raising=False)

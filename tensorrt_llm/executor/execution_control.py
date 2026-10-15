@@ -25,6 +25,8 @@ class ExecutionControlMixin:
     def _init_execution_control(self) -> None:
         self._execution_control_lock = RLock()
         self._execution_control_closed = False
+        self._execution_control_error: Exception | None = None
+        self._execution_submit_started = False
         self._execution_session_id = uuid4().hex
         self._execution_controller: ExecutionController | None = None
         self._execution_version_table: WorkerVersionTable | None = None
@@ -45,6 +47,10 @@ class ExecutionControlMixin:
             return self._execution_controller
 
     def _require_execution_control_open(self) -> None:
+        if self._execution_control_error is not None:
+            raise RuntimeError(
+                "execution bootstrap failed; restart required"
+            ) from self._execution_control_error
         if self._execution_control_closed or self.doing_shutdown:
             raise RuntimeError("executor execution control is closed")
 
@@ -54,15 +60,17 @@ class ExecutionControlMixin:
     def _execution_admission(
         self, version: ExecutionVersion | None
     ) -> AbstractContextManager[HostExecution | None]:
-        if version is None:
-            return nullcontext(None)
         with self._execution_control_lock:
             self._require_execution_control_open()
+            if version is None:
+                self._execution_submit_started = True
+                return nullcontext(None)
             owner = self._execution_controller or self._execution_version_table
-        if owner is None:
-            raise ExecutionAuthorityError(
-                "register execution authority before submitting tagged work"
-            )
+            if owner is None:
+                raise ExecutionAuthorityError(
+                    "register execution authority before submitting tagged work"
+                )
+            self._execution_submit_started = True
         return owner.admission(version)
 
     @staticmethod

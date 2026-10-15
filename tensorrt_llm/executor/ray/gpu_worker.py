@@ -35,6 +35,10 @@ from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
 from ...sampling_params import BatchedLogitsProcessor
 from ..base_worker import BaseWorker
+from ..execution_bootstrap import (ExecutionBootstrapInfo,
+                                   ExecutionBootstrapReady,
+                                   inspect_execution_worker,
+                                   start_execution_worker)
 from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
@@ -266,6 +270,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         rpc_addr: Optional[str] = None,
         hmac_key: bytes = b"",
     ) -> None:
+        self._execution_host_collective = None
         global logger
         from tensorrt_llm.logger import logger
 
@@ -294,6 +299,14 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         if self.global_rank == 0 and self.postproc_config.enabled:
             self.init_postproc_workers()
         self.start_rpc_server()
+
+    def inspect_execution_bootstrap(self, session_id: str,
+                                    world_size: int) -> ExecutionBootstrapInfo:
+        return inspect_execution_worker(self, session_id, world_size)
+
+    def start_execution_bootstrap(self, session_id: str,
+                                  world_size: int) -> ExecutionBootstrapReady:
+        return start_execution_worker(self, session_id, world_size)
 
     def setup_engine(self):
         if torch.distributed.is_initialized(
@@ -350,7 +363,15 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         pass
 
     def shutdown(self):
-        self._shutdown_execution_control()
+        collective = getattr(self, '_execution_host_collective', None)
+        if collective is None:
+            self._shutdown_execution_control()
+        else:
+            # Stop ingress now, but keep the table usable for the coordinated
+            # engine stop. Closing it first would turn normal shutdown into a
+            # failed vote while peers still execute the loop's final boundary.
+            with self._execution_control_lock:
+                self._execution_control_closed = True
         if self.doing_shutdown:
             return
         else:
@@ -378,6 +399,10 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if self.engine is not None:
             self.engine.shutdown()
+            if collective is not None:
+                self._shutdown_execution_control()
+                collective.close()
+                self._execution_host_collective = None
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"

@@ -6,6 +6,7 @@ import copy
 import gc
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -70,6 +71,41 @@ def test_startup_opt_in_does_not_touch_cuda_when_disabled(monkeypatch):
     monkeypatch.setenv("TRTLLM_RETIRE_NATIVE_GUARDS", "yes")
     with pytest.raises(ValueError, match="must be 0 or 1"):
         ExecutionAttentionBinding.from_runner(None)
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+@pytest.mark.parametrize("fault", [None, "pipeline", "attention_dp"])
+def test_startup_binding_accepts_only_lockstep_tp(monkeypatch, tp, fault):
+    from tensorrt_llm._torch.pyexecutor import execution_attention as binding_module
+
+    monkeypatch.setenv("TRTLLM_RETIRE_NATIVE_GUARDS", "1")
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    authority = Mock()
+    constructor = Mock(return_value=authority)
+    monkeypatch.setattr(binding_module, "DeviceExecutionAuthority", constructor)
+    runner = SimpleNamespace(
+        _config=SimpleNamespace(
+            dtype=torch.bfloat16,
+            attention_backend=SimpleNamespace(Metadata=TrtllmAttentionMetadata),
+            max_beam_width=1,
+            is_spec_decode=False,
+            is_encode_only=False,
+            is_multimodal=False,
+            enable_attention_dp=fault == "attention_dp",
+        ),
+        mapping=SimpleNamespace(world_size=tp * (2 if fault == "pipeline" else 1), tp_size=tp),
+        sparse_attention_config=None,
+    )
+    if fault:
+        with pytest.raises(NotImplementedError, match="TP only"):
+            ExecutionAttentionBinding.from_runner(runner)
+        constructor.assert_not_called()
+    else:
+        binding = ExecutionAttentionBinding.from_runner(runner)
+        assert binding.authority is authority
+        constructor.assert_called_once_with(0)
 
 
 @CUDA

@@ -34,6 +34,72 @@ ALIGN = AlignmentRequest("session", REVISION, INPUT)
 FENCE = FenceRequest("session", REVISION)
 
 
+def test_source_wake_runs_only_after_every_peer_records_alignment_and_reclaim():
+    participants = (ExecutionParticipant(0, 0), ExecutionParticipant(1, 0))
+    tables = [WorkerVersionTable("session") for _ in participants]
+    holds = [Mock(num_tokens=3) for _ in participants]
+    wakes = []
+
+    def wake_all():
+        # Model the fastest possible scheduler: process the broadcast at once.
+        versions = [
+            table.alignment_state._current[(OLD.tenant_id, OLD.scope_id)] for table in tables
+        ]
+        assert versions[0] == versions[1]
+        wakes.append(versions[0])
+        for table in tables:
+            table.alignment_state.process()
+
+    for rank, (table, hold) in enumerate(zip(tables, holds)):
+        table.drain_tracker = RequestDrainTracker()
+        table.alignment_state = WorkerAlignmentState(
+            lambda revised, hold=hold: hold, wake_all if rank == 0 else lambda: None
+        )
+    transport = CollectivePublicationTransport(
+        participants,
+        {p: LocalPublicationTransport(t) for p, t in zip(participants, tables)},
+        publication_source=participants[0],
+    )
+    controller = ExecutionController("session", transport)
+    try:
+        controller.register(OLD).wait()
+        result = controller.advance(REVISION, alignment=INPUT)
+        result.publication.wait()
+        receipt = result.alignment.wait()
+        assert receipt.reusable_prefix_length == 3
+        controller.resume(receipt).wait()
+        newer = replace(NEW, epoch=NEW.epoch + 1)
+        controller.advance(Revision("abandon", NEW, newer)).publication.wait()
+        assert wakes[-1] == newer
+        for hold in holds:
+            hold.close.assert_called_once()
+    finally:
+        controller.close()
+
+
+def test_source_is_still_revoked_after_peer_publication_fails():
+    participants = (ExecutionParticipant(0, 0), ExecutionParticipant(1, 0))
+    calls = []
+    update = VersionUpdate("session", 1, NEW)
+
+    def source(value, stop):
+        calls.append("source")
+        return PublicationReceipt(value, value.version)
+
+    def peer(value, stop):
+        calls.append("peer")
+        raise TimeoutError("lost peer")
+
+    transport = CollectivePublicationTransport(
+        participants,
+        {participants[0]: Mock(publish=source), participants[1]: Mock(publish=peer)},
+        publication_source=participants[0],
+    )
+    with pytest.raises(RuntimeError, match="publication failed"):
+        transport.publish(update, Event())
+    assert calls == ["peer", "source"]
+
+
 @pytest.fixture(params=[(2, 1, 1, False), (2, 2, 1, False), (2, 1, 2, False), (2, 1, 1, True)])
 def cluster(request):
     tp, pp, kv, ipc = request.param

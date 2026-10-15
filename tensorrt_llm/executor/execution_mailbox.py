@@ -5,6 +5,7 @@
 import math
 from concurrent.futures import Future
 from dataclasses import dataclass
+from ipaddress import ip_address
 from queue import Empty
 from threading import Event, Thread
 from time import monotonic
@@ -119,9 +120,17 @@ class ExecutionMailboxServer:
 
     Args:
         table: Host version table owned by this worker lifetime.
+        bind_host: Concrete IPv4 worker address for Ray peers on another node.
+            Omit to use the existing loopback endpoint.
     """
 
-    def __init__(self, table: WorkerVersionTable) -> None:
+    def __init__(self, table: WorkerVersionTable, *, bind_host: str | None = None) -> None:
+        self._bind_address = None
+        if bind_host is not None:
+            host = ip_address(bind_host)
+            if host.version != 4 or host.is_unspecified or host.is_multicast:
+                raise ValueError("execution mailbox requires a concrete worker address")
+            self._bind_address = (f"tcp://{host}:*", None)
         self._table = table
         self._stop = Event()
         self._ready: Future[tuple[str, bytes]] = Future()
@@ -150,7 +159,7 @@ class ExecutionMailboxServer:
     def _run(self) -> None:
         queue = None
         try:
-            queue = IpcQueue(is_server=True, name="retire_mailbox")
+            queue = IpcQueue(self._bind_address, is_server=True, name="retire_mailbox")
             queue.socket.setsockopt(zmq.LINGER, 0)
             queue.socket.setsockopt(zmq.SNDHWM, 256)
             self._ready.set_result(queue.address)

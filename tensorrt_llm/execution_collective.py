@@ -45,6 +45,8 @@ class CollectivePublicationTransport:
             independently of which workers answer. Membership cannot shrink.
         transports: One authenticated endpoint per participant, in the same
             executor lifetime. Bootstrap must bind endpoints to distinct workers.
+        publication_source: Worker that broadcasts scheduler wakes. Publish to
+            it last so every peer has recorded ALIGN/reclamation before the wake.
 
     The controller's publisher thread owns this transport and all children.
     Child operations must have bounded waits and honor stop. Failure on one
@@ -65,6 +67,8 @@ class CollectivePublicationTransport:
         self,
         participants: tuple[ExecutionParticipant, ...],
         transports: Mapping[ExecutionParticipant, PublicationTransport],
+        *,
+        publication_source: ExecutionParticipant | None = None,
     ) -> None:
         if not isinstance(participants, tuple) or not participants:
             raise ValueError("participants must be a nonempty tuple")
@@ -76,6 +80,9 @@ class CollectivePublicationTransport:
             raise ValueError("transports must cover exactly the required participants")
         if len({id(t) for t in transports.values()}) != len(participants):
             raise ValueError("each participant requires a distinct transport")
+        if publication_source is not None and publication_source not in participants:
+            raise ValueError("publication source must be a required participant")
+        self._publication_source = publication_source
         self._participants = tuple(sorted(participants))
         self._transports = tuple(transports[p] for p in self._participants)
         self._alignments: dict[tuple[str, str], _CollectiveAlignment] = {}
@@ -91,15 +98,22 @@ class CollectivePublicationTransport:
             raise RuntimeError("execution collective is closed")
 
     def _call_all(
-        self, operation: str, call: Callable[[PublicationTransport], _T], stop: Event
+        self,
+        operation: str,
+        call: Callable[[PublicationTransport], _T],
+        stop: Event,
+        *,
+        last: ExecutionParticipant | None = None,
     ) -> list[_T]:
-        results = []
+        results = {}
         failures = []
-        for participant, transport in zip(self._participants, self._transports):
+        endpoints = list(zip(self._participants, self._transports))
+        endpoints.sort(key=lambda item: item[0] == last)
+        for participant, transport in endpoints:
             if stop.is_set():
                 raise RuntimeError("execution collective stopped before all acknowledgements")
             try:
-                results.append(call(transport))
+                results[participant] = call(transport)
             except Exception as error:
                 # Endpoint failure must not prevent other workers from seeing a
                 # revocation or hide a later worker's failed drain behind None.
@@ -109,7 +123,7 @@ class CollectivePublicationTransport:
             raise RuntimeError(f"{operation} failed for participants {failed}") from failures[0][1]
         if stop.is_set():
             raise RuntimeError("execution collective stopped before acknowledgement")
-        return results
+        return [results[p] for p in self._participants]
 
     def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
         """Publish to every worker; RESUME cannot complete on a partial acknowledgement."""
@@ -141,7 +155,9 @@ class CollectivePublicationTransport:
                 raise RuntimeError("worker superseded RESUME")
             return receipt
 
-        receipts = self._call_all("publication", publish_one, stop)
+        # The source broadcasts the scheduler wake. Peers must arm ALIGN or
+        # reclamation before that wake can reach their engine threads.
+        receipts = self._call_all("publication", publish_one, stop, last=self._publication_source)
         observed = min((r.observed_version for r in receipts), key=lambda v: v.epoch)
         return PublicationReceipt(update, observed)
 

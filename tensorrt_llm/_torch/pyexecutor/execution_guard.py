@@ -45,19 +45,21 @@ class _RequestUse:
 
 
 class ExecutionDeviceGuard:
-    """One-rank eager/compiled/graph execution, with V1 or V2 and overlap.
+    """Eager/compiled/graph execution, with V1 or V2 and overlap.
 
     The model (including sampling inside its graph) produces candidates. The
     device commit runs outside capture and reads live authority on every replay.
     Submitted forwards may finish after revocation; this is not kernel preemption
     or permission to hand their KV to a successor.
+    Multiple TP ranks require a coordinator installed while all engines pause.
     """
 
     @staticmethod
-    def validate_executor(executor: "PyExecutor") -> None:
+    def validate_executor(executor: "PyExecutor", *, tensor_parallel: bool = False) -> None:
         engine = executor.model_engine
         unsupported = {
-            "multiple ranks": executor.dist.world_size != 1,
+            "multiple ranks without coordination": executor.dist.world_size != 1
+            and not tensor_parallel,
             "beam search": executor.max_beam_width != 1,
             "non-TorchSampler": type(executor.sampler) is not TorchSampler,
             "speculative decoding": executor.drafter is not None or engine.is_spec_decode,
@@ -70,22 +72,37 @@ class ExecutionDeviceGuard:
             or getattr(executor.kv_cache_manager, "is_linear_attention", False),
             "variable sliding windows": getattr(executor.kv_cache_manager, "is_vswa", False),
         }
+        if tensor_parallel:
+            unsupported["non-lockstep tensor parallel topology"] = (
+                executor.dist.world_size < 2
+                or executor.dist.tp_size != executor.dist.world_size
+                or executor.dist.pp_size != 1
+                or executor.dist.cp_size != 1
+                or executor.enable_attention_dp
+            )
         rejected = [name for name, enabled in unsupported.items() if enabled]
         if rejected:
             raise NotImplementedError("RETIRE device guards do not support: " + ", ".join(rejected))
 
-    def __init__(self, executor: "PyExecutor", table: WorkerVersionTable) -> None:
+    def __init__(
+        self,
+        executor: "PyExecutor",
+        table: WorkerVersionTable,
+        rank_consensus: ExecutionStepConsensus | None = None,
+    ) -> None:
         early_exit = os.environ.get("TRTLLM_RETIRE_EARLY_EXIT", "1")
         if early_exit not in ("0", "1"):
             raise ValueError("TRTLLM_RETIRE_EARLY_EXIT must be 0 or 1")
         self._early_exit_enabled = early_exit == "1"
-        self.validate_executor(executor)
+        self.validate_executor(executor, tensor_parallel=rank_consensus is not None)
+        if rank_consensus is not None:
+            rank_consensus.validate_membership(
+                table.session_id, executor.dist.rank, tuple(range(executor.dist.world_size))
+            )
         if not executor._is_kv_manager_v2 and not hasattr(LlmRequest, "freeze_retire_kv_frontier"):
             raise RuntimeError("RETIRE V1 prefill inheritance requires rebuilt native bindings")
         self.table = table
-        # Installed only by a bootstrap that coordinates all model ranks.
-        # Executor topology validation still excludes multi-rank execution.
-        self._rank_consensus: ExecutionStepConsensus | None = None
+        self._rank_consensus = rank_consensus
         self._admission_source = executor.dist.rank == 0
         attention_binding = getattr(executor.model_engine, "execution_attention", None)
         self._native_kv_guards = attention_binding is not None
@@ -103,7 +120,9 @@ class ExecutionDeviceGuard:
         table.drain_tracker = RequestDrainTracker()
         table.alignment_state = WorkerAlignmentState(
             self._alignment_adapter.reserve,
-            executor.executor_request_queue.wake_alignment,
+            executor.executor_request_queue.wake_alignment
+            if self._admission_source
+            else lambda: None,
             prepare=self._prepare_prefix,
         )
 

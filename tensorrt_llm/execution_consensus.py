@@ -84,6 +84,13 @@ class ExecutionStepConsensus:
         if self._failure is None:
             self._failure = error
 
+    def validate_membership(self, session_id: str, rank: int, ranks: tuple[int, ...]) -> None:
+        """Bind a coordinator only to the worker and session it was created for."""
+        if self._failure is not None:
+            raise RuntimeError("execution consensus failed; restart required") from self._failure
+        if (session_id, rank, frozenset(ranks)) != (self._session_id, self._rank, self._ranks):
+            raise ValueError("execution coordinator does not match worker membership")
+
     @staticmethod
     def _validate_rows(rows: tuple[ExecutionRow, ...], allowed: tuple[bool, ...]) -> None:
         if (

@@ -194,11 +194,12 @@ Runtime -> executor controller -> ScopeRegistry accepts epoch 8
                        publication handle <-----+ acknowledgement
 ```
 
-The execution guard requires one frontend and one PyTorch rank. The direct
+The execution guard requires one frontend and the PyTorch backend. The direct
 `GenerationExecutorWorker` and classic IPC `GenerationExecutorProxy` have model
 coverage. The RPC and Ray paths now use the same worker mailbox and frontend
-authority gates; their model qualification is still pending. Attached frontends
-and multi-rank configurations reject controller creation. Publication starts
+authority gates; their model qualification is still pending. Ray additionally
+connects lockstep tensor-parallel workers through the bootstrap below. Attached
+frontends, PP, CP, attention DP and multi-rank MPI/RPC remain unsupported. Publication starts
 only when the runtime explicitly requests the
 controller. Untagged generation calls keep their existing behavior. Tagged work
 requires explicit registration and a successful initial publication; missing
@@ -233,7 +234,7 @@ an acknowledgement timeout does not release memory. A later revision or worker
 teardown reclaims abandoned holds through the existing worker lifecycle.
 
 This transport is tested with local tables and authenticated IPC mailboxes. It
-is connected to the single-worker RPC/Ray bootstrap, and does not coordinate model
+is connected to RPC/Ray bootstrap, and does not itself coordinate model
 collectives or per-layer exit. Multi-rank executor support remains disabled
 until those paths can keep all ranks in the same collective schedule. Closing
 the transport only closes channels; it does not certify drain or native cleanup.
@@ -278,13 +279,35 @@ is attached. The existing executor crash watchdog is armed before invalidating
 authority and drain evidence, then normal cleanup runs. Cleanup does not turn
 a failed distributed execution into a successful FENCE.
 
-These hooks are tested with bounded host collectives and controlled device
-completion. Distributed bootstrap does not attach them yet, so they do not
-enable TP/PP. Before enabling that topology, bootstrap must pause every worker
-at the same scheduler boundary, block admission during installation, and provide
-a bounded host-only collective. Common ALIGN frontiers also need negotiation.
-Pipeline stages do not
-enter every boundary together; they require separate ordering.
+Ray TP bootstrap now attaches these hooks before the first request, including
+untagged requests. It first checks every worker without changing engine state.
+Then rank 0 broadcasts a control request. All engine threads park at that same
+scheduler boundary, with device work drained. The worker RPC threads create a
+separate CPU Gloo group and install local guards and authenticated mailboxes.
+Every worker must acknowledge readiness before any engine resumes. Frontend
+admission stays blocked throughout setup. A partial setup or timeout invalidates
+the frontend and kills the entire actor set; ordinary inference cannot continue
+on a partly configured group.
+
+```text
+Frontend: block admission -> check every worker -> start all bootstrap RPCs
+Workers:  park engines -> create Gloo group -> install guards -> agree ready
+Frontend: verify identities/endpoints -> create controller -> allow admission
+Runtime:  publish to peers -> publish to rank 0 -> broadcast scheduler wake
+```
+
+Preflight RPCs have a 30-second deadline; bootstrap has a 90-second deadline.
+Engine votes use a separate, bounded 300-second host collective, allowing for
+uneven compilation time. Worker mailboxes bind concrete IPv4 addresses. Rank 0
+receives publications last, so peers arm ALIGN or reclamation before its wake
+reaches them. Only rank 0 enqueues these wakes. The host group closes after the
+engine shuts down.
+
+Two/four-process CPU Gloo tests exercise agreement, mismatched phases and a
+missing peer. Simulated-worker tests cover partial installation and admission
+races. Real Ray TP model qualification is still required. ALIGN currently
+requires equal reserved lengths across ranks; common-frontier negotiation remains
+unfinished. Pipeline stages require separate ordering and remain rejected.
 
 Updates carry the full execution version, a publication sequence, and an
 executor-session identity. Epochs retain their full 64-bit range. Worker tables
@@ -359,7 +382,8 @@ old revision does not bypass this restriction.
 ## GPU authority and token commit (step 5)
 
 Creating the controller installs device guards on the worker. The implemented
-scope is one GPU with single-beam `TorchSampler`:
+scope uses single-beam `TorchSampler`, on one GPU or Ray TP with coordinated
+bootstrap. Ray TP model qualification is pending:
 
 | Part | Execution paths covered |
 | --- | --- |
@@ -369,7 +393,7 @@ scope is one GPU with single-beam `TorchSampler`:
 | 5D | CUDA graph replay, `torch.compile`, and sampling inside the model graph |
 
 These options can be combined where TRT-LLM itself supports the combination.
-Controller setup still rejects multiple ranks, speculative decoding,
+Controller setup still rejects unsupported distributed topologies, speculative decoding,
 transfers/connectors, encoder-decoder models, guided decoding, recurrent KV,
 and variable sliding windows. Request validation rejects multimodal input,
 disaggregated requests, draft tokens, and logits callbacks. Those modes need
@@ -673,7 +697,7 @@ This check runs at the common forward boundary, outside model capture. Eager,
 compiled, CUDA graph, and overlap execution use the same handoff logic; RESUME
 does not remove the host or device fences, including for in-graph sampling.
 Native GPU runs are still required to validate these combinations end to end.
-The existing one-rank, text-only, single-beam restrictions still apply; this
+The text-only, single-beam and supported-topology restrictions still apply; this
 does not add disaggregated transfer, speculative decoding, or multimodal support.
 
 RECLAIM releases the extra ALIGN hold after successful attachment, as described
@@ -911,7 +935,8 @@ performance comparisons. Untagged batches, decode-only batches and the path
 without native predicates keep their existing scheduling behavior.
 
 This opt-in requires the matching native build. It currently targets the
-single-rank SM90 BF16 decoder path above, with V1 or V2 KV. Enabling it does
+SM90 BF16 decoder path above, with V1 or V2 KV and single-rank or coordinated TP
+execution. TP model qualification remains pending. Enabling it does
 not remove the executor's unsupported-feature checks. Native operator tests,
 binding tests and real-model eager/overlap/compiled/graph qualification must
 pass before claiming end-to-end operator suppression or performance gains.

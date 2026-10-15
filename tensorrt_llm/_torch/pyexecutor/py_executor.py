@@ -126,6 +126,7 @@ from .scheduler.adp_router import ADPRouter, count_retiring_requests
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
+    from ...execution_consensus import ExecutionStepConsensus
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
     from .execution_guard import ExecutionDeviceGuard
 
@@ -4042,16 +4043,22 @@ class PyExecutor:
         any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
         return all_ranks_fetched and any_rank_terminal_no_fit
 
-    def configure_execution_authority(self, table: WorkerVersionTable) -> None:
+    def configure_execution_authority(
+            self,
+            table: WorkerVersionTable,
+            rank_consensus: Optional["ExecutionStepConsensus"] = None) -> None:
         """Install RETIRE guards before any tagged request can be admitted."""
         from .execution_guard import ExecutionDeviceGuard
 
         if self._execution_guard is not None:
-            if self._execution_guard.table is not table:
+            if (self._execution_guard.table is not table
+                    or self._execution_guard._rank_consensus
+                    is not rank_consensus):
                 raise RuntimeError(
                     "executor already has an execution authority")
             return
-        self._execution_guard = ExecutionDeviceGuard(self, table)
+        self._execution_guard = ExecutionDeviceGuard(self, table,
+                                                     rank_consensus)
 
     def _prepare_and_schedule_batch(self):
         self._release_unused_connector_reservations()

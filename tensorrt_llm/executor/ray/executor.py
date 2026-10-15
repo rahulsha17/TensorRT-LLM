@@ -36,7 +36,9 @@ except ImportError:
 from tensorrt_llm.executor.ray.utils import unwrap_ray_errors
 from tensorrt_llm.logger import logger
 
+from ...execution_mailbox import ExecutionController
 from ...llmapi.utils import logger_debug
+from ..execution_bootstrap import create_execution_cohort
 from ..executor import GenerationExecutor
 from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
@@ -274,6 +276,24 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         """Get startup metrics from rank 0."""
         metrics = self.collective_rpc("get_startup_metrics", target_ranks=0)
         return metrics[0] if metrics and isinstance(metrics[0], dict) else {}
+
+    def _create_execution_controller(self) -> ExecutionController:
+        if self.world_size == 1:
+            return super()._create_execution_controller()
+        return create_execution_cohort(self, self._execution_bootstrap_rpc,
+                                       self._abort_execution_bootstrap)
+
+    def _execution_bootstrap_rpc(self, method: str, args: tuple,
+                                 timeout: float) -> list:
+        refs = self.collective_rpc(method, args=args, non_block=True)
+        return ray.get(refs, timeout=timeout)
+
+    def _abort_execution_bootstrap(self) -> None:
+        for worker in self.workers:
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception as error:
+                logger.warning(f"Error killing failed RETIRE worker: {error}")
 
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """

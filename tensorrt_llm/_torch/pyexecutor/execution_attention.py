@@ -73,12 +73,13 @@ class ExecutionAttentionBinding:
             or config.is_spec_decode
             or config.is_encode_only
             or config.is_multimodal
-            or runner.mapping.world_size != 1
+            or runner.mapping.world_size != runner.mapping.tp_size
+            or config.enable_attention_dp
             or runner.sparse_attention_config is not None
         ):
             raise NotImplementedError(
-                "RETIRE native attention binding requires single-rank SM90 BF16 "
-                "TRTLLM decoder attention without beams, speculation or sparse attention"
+                "RETIRE native attention binding requires SM90 BF16 TRTLLM decoder attention "
+                "with TP only, without beams, attention DP, speculation or sparse attention"
             )
         if os.environ.get("TLLM_FMHA_LIBS") != "fallback":
             raise ValueError("RETIRE native guards require TLLM_FMHA_LIBS=fallback before startup")
