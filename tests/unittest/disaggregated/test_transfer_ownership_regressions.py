@@ -38,10 +38,13 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     Receiver,
     RxSession,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import TransferOwner
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import (
+    AsyncTransferManager,
+    TransferOwner,
+)
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, ResourceManagerType
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
@@ -1456,6 +1459,7 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
         py_request_id=rid,
         py_disaggregated_params=params,
         py_kv_send_session_retired=False,
+        py_execution_version=None,
         state=LlmRequestState.CONTEXT_INIT,
         set_kv_cache_transfer_start=lambda _timestamp: None,
     )
@@ -1479,6 +1483,11 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     transceiver._create_cache_extent = Mock()
     transceiver._finalize_send = Mock()
 
+    kv_cache_manager = Mock()
+    transfers = AsyncTransferManager(
+        SimpleNamespace(resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+    )
+    transfers.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
     transceiver.respond_and_send_async(request)
 
     session = transceiver._send_sessions[rid]
@@ -1490,22 +1499,21 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     transceiver._create_cache_extent.assert_not_called()
     transceiver._finalize_send.assert_not_called()
 
-    transfers = {rid: request}
-    end_transfer = Mock(side_effect=lambda req: transfers.pop(req.py_request_id) is req)
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = transceiver
-    executor.async_transfer_manager = SimpleNamespace(
-        requests_in_transfer=lambda: transfers,
-        end_transfer=end_transfer,
-    )
+    executor.async_transfer_manager = transfers
     executor.active_requests = [request]
     # The reap's trailing rank-local error check is not under test here.
     executor.disagg._check_transfer_errors = Mock()
 
     executor.disagg.reap_context_sends(0)
 
-    assert transfers == {}
-    end_transfer.assert_called_once_with(request)
+    assert transfers.requests_in_transfer() == {}
+    assert not transfers.has_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    kv_cache_manager.store_blocks_for_reuse.assert_called_once_with(request, True)
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(
+        kv_cache_manager.store_blocks_for_reuse.return_value
+    )
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert request.py_kv_send_session_retired
     assert transceiver._send_sessions == {}
@@ -1538,6 +1546,7 @@ def test_bridge_rejection_releases_only_without_physical_owner(
         is_child=False,
         parent_request_id=None,
         py_request_id=rid,
+        py_execution_version=None,
         py_kv_transfer_start_time=None,
         state=LlmRequestState.CONTEXT_INIT,
     )
@@ -1550,29 +1559,33 @@ def test_bridge_rejection_releases_only_without_physical_owner(
         has_inflight_transfer=lambda _req: has_inflight,
         kv_transfer_timeout_ms=1000,
     )
-    async_transfer_manager = SimpleNamespace(
-        start_transfer=Mock(),
-        end_transfer=Mock(return_value=True),
+    kv_cache_manager = Mock(spec=["store_blocks_for_reuse", "unpin_blocks_by_id"])
+    async_transfer_manager = AsyncTransferManager(
+        SimpleNamespace(resource_managers={ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
     )
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = transceiver
-    executor.kv_cache_manager = Mock(spec=[])
+    executor.kv_cache_manager = kv_cache_manager
     executor.async_transfer_manager = async_transfer_manager
     executor.active_requests = [request]
     executor.canceled_req_ids = []
 
     executor.disagg.send_completed_context([request])
 
-    async_transfer_manager.start_transfer.assert_called_once_with(
-        request, owner=TransferOwner.TRANSCEIVER
+    kv_cache_manager.store_blocks_for_reuse.assert_called_once_with(request, True)
+    assert (
+        async_transfer_manager.has_transfer(request, owner=TransferOwner.TRANSCEIVER)
+        is not releases_claim
     )
     if releases_claim:
-        async_transfer_manager.end_transfer.assert_called_once_with(
-            request, owner=TransferOwner.TRANSCEIVER
+        assert async_transfer_manager.requests_in_transfer() == {}
+        kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(
+            kv_cache_manager.store_blocks_for_reuse.return_value
         )
         assert request.py_kv_transfer_start_time is None
     else:
-        async_transfer_manager.end_transfer.assert_not_called()
+        assert async_transfer_manager.requests_in_transfer() == {rid: request}
+        kv_cache_manager.unpin_blocks_by_id.assert_not_called()
         assert request.py_kv_transfer_start_time is not None
 
 

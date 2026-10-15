@@ -342,8 +342,13 @@ def test_worker_bootstrap_parks_all_ranks_before_installing(monkeypatch, size, f
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_ray_shutdown_keeps_authority_and_collective_until_engine_stops(failure):
-    from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
+def test_ray_shutdown_keeps_authority_and_collective_until_engine_stops(failure, monkeypatch):
+    from tensorrt_llm.executor.ray import gpu_worker
+    from tensorrt_llm.logger import logger
+
+    # RayGPUWorker initializes this inside its constructor to avoid serializing
+    # the TensorRT logger. The worker below bypasses that constructor.
+    monkeypatch.setattr(gpu_worker, "logger", logger, raising=False)
 
     events = []
 
@@ -369,10 +374,10 @@ def test_ray_shutdown_keeps_authority_and_collective_until_engine_stops(failure)
     )
     if failure:
         with pytest.raises(RuntimeError, match="still using"):
-            RayGPUWorker.shutdown(worker)
+            gpu_worker.RayGPUWorker.shutdown(worker)
         assert events == ["engine stopped"]
         assert worker._execution_host_collective is not None
     else:
-        RayGPUWorker.shutdown(worker)
+        gpu_worker.RayGPUWorker.shutdown(worker)
         assert events == ["engine stopped", "authority closed", "collective closed"]
         assert worker._execution_host_collective is None and worker.engine is None
