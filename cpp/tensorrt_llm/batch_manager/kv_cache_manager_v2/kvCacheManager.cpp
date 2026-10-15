@@ -210,7 +210,9 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
         size_t const evidenceLimit = *maxReuseTokens == 0
             ? 0
             : static_cast<size_t>(*maxReuseTokens) + static_cast<size_t>(mConfig.reuseMatchBackoff);
-        inputTokens = TokenSpan{inputTokens.data(), std::min(inputTokens.size(), evidenceLimit)};
+        auto const numEvidenceTokens
+            = static_cast<int>(std::min(static_cast<size_t>(inputTokens.size()), evidenceLimit));
+        inputTokens = TokenSpan{inputTokens.data(), numEvidenceTokens};
     }
 
     // Compute the reuse match once here (shared conceptually with probeReuse) and
