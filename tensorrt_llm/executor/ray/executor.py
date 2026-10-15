@@ -39,6 +39,7 @@ from tensorrt_llm.logger import logger
 from ...execution_mailbox import ExecutionController
 from ...llmapi.utils import logger_debug
 from ..execution_bootstrap import create_execution_cohort
+from ..execution_watchdog import ExecutionCohortWatchdog
 from ..executor import GenerationExecutor
 from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
@@ -66,6 +67,7 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                          is_llm_executor)
 
         self.has_start_local_cluser = False
+        self._execution_watchdog = None
         runtime_env = {
             "env_vars": {
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"
@@ -280,8 +282,25 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
     def _create_execution_controller(self) -> ExecutionController:
         if self.world_size == 1:
             return super()._create_execution_controller()
-        return create_execution_cohort(self, self._execution_bootstrap_rpc,
-                                       self._abort_execution_bootstrap)
+        controller = create_execution_cohort(self,
+                                             self._execution_bootstrap_rpc,
+                                             self._abort_execution_bootstrap)
+        try:
+            self._execution_watchdog = ExecutionCohortWatchdog(
+                self._execution_session_id,
+                self.world_size, lambda: self._execution_bootstrap_rpc(
+                    "check_execution_health",
+                    (self._execution_session_id, ), 30.0),
+                self._fail_rpc_executor)
+            self._execution_watchdog.start()
+        except Exception as error:
+            self._execution_control_error = error
+            try:
+                controller.close()
+            finally:
+                self._abort_execution_bootstrap()
+            raise
+        return controller
 
     def _execution_bootstrap_rpc(self, method: str, args: tuple,
                                  timeout: float) -> list:
@@ -289,11 +308,20 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         return ray.get(refs, timeout=timeout)
 
     def _abort_execution_bootstrap(self) -> None:
-        for worker in self.workers:
+        for worker in self.workers or ():
             try:
                 ray.kill(worker, no_restart=True)
             except Exception as error:
                 logger.warning(f"Error killing failed RETIRE worker: {error}")
+
+    def _fail_rpc_executor(self, error: Exception) -> bool:
+        failed = super()._fail_rpc_executor(error)
+        if failed:
+            watchdog = getattr(self, '_execution_watchdog', None)
+            if watchdog is not None:
+                watchdog.stop()
+            self._abort_execution_bootstrap()
+        return failed
 
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """
@@ -348,7 +376,14 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             result.abort()
 
     def shutdown(self):
-        self._shutdown_execution_control()
+        watchdog = getattr(self, '_execution_watchdog', None)
+        if watchdog is not None:
+            watchdog.stop()
+        try:
+            self._shutdown_execution_control()
+        except Exception as error:
+            logger.warning(
+                f"Error closing execution authority during shutdown: {error}")
         if hasattr(self, '_shutdown_event') and self._shutdown_event.is_set():
             return
         if hasattr(self, '_shutdown_event'):

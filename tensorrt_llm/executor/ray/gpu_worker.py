@@ -39,6 +39,7 @@ from ..execution_bootstrap import (ExecutionBootstrapInfo,
                                    ExecutionBootstrapReady,
                                    inspect_execution_worker,
                                    start_execution_worker)
+from ..execution_watchdog import check_execution_worker
 from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
@@ -307,6 +308,9 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
     def start_execution_bootstrap(self, session_id: str,
                                   world_size: int) -> ExecutionBootstrapReady:
         return start_execution_worker(self, session_id, world_size)
+
+    def check_execution_health(self, session_id: str) -> tuple[str, int]:
+        return check_execution_worker(self, session_id)
 
     def setup_engine(self):
         if torch.distributed.is_initialized(

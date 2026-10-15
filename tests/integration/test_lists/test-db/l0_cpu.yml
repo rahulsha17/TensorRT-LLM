@@ -150,6 +150,7 @@ l0_cpu:
   - unittest/executor/test_execution_collective.py
   - unittest/executor/test_execution_consensus.py
   - unittest/executor/test_execution_bootstrap.py
+  - unittest/executor/test_execution_watchdog.py
   - unittest/executor/test_execution_bootstrap_gloo.py
   - unittest/executor/test_execution_reuse_limit.py
   - unittest/executor/test_execution_admission.py

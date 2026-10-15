@@ -49,7 +49,7 @@ class ExecutionControlMixin:
     def _require_execution_control_open(self) -> None:
         if self._execution_control_error is not None:
             raise RuntimeError(
-                "execution bootstrap failed; restart required"
+                "executor execution control failed; restart required"
             ) from self._execution_control_error
         if self._execution_control_closed or self.doing_shutdown:
             raise RuntimeError("executor execution control is closed")

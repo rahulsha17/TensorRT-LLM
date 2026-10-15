@@ -303,6 +303,17 @@ receives publications last, so peers arm ALIGN or reclamation before its wake
 reaches them. Only rank 0 enqueues these wakes. The host group closes after the
 engine shuts down.
 
+After bootstrap, the frontend checks every Ray worker once per second with a
+30-second RPC deadline. A dead actor, failed engine thread, wrong session or
+missing reply closes frontend authority and asks Ray to kill every actor without
+restarting it. Pending requests receive terminal errors, and late responses and
+new submissions are rejected. RPC response-stream errors and unexpected stream
+termination also fail pending requests. Normal shutdown stops health polling
+before stopping the engines. These checks use host state only: a healthy reply
+is not a FENCE acknowledgement or evidence that GPU access has ended. Failure
+does not authorize KV reuse from the failed cohort; recovery requires a fresh
+executor. Actual GPU fault qualification remains required.
+
 Two/four-process CPU Gloo tests exercise agreement, mismatched phases and a
 missing peer. Simulated-worker tests cover partial installation and admission
 races. Real Ray TP model qualification is still required. ALIGN chooses the

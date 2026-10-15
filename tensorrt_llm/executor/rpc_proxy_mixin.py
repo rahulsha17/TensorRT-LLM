@@ -20,7 +20,7 @@ from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import get_unique_ipc_addr
-from .utils import ErrorResponse, is_llm_response
+from .utils import EngineDeadError, ErrorResponse, is_llm_response
 
 
 class RpcExecutorMixin:
@@ -101,6 +101,8 @@ class RpcExecutorMixin:
                 self.main_loop.run_until_complete(self.main_loop_task_obj)
             except asyncio.CancelledError:
                 pass  # Task cancellation is expected during shutdown
+            except Exception as error:
+                self._fail_rpc_executor(error)
             finally:
                 self.main_loop.close()
 
@@ -125,7 +127,10 @@ class RpcExecutorMixin:
             logprob_params=logprob_params,
         )
         sent = None
-        with self._execution_admission(request.execution_version) as execution:
+        with (
+            self._execution_control_lock,
+            self._execution_admission(request.execution_version) as execution,
+        ):
             self._bind_execution_result(result, execution)
             self._results[request.id] = result
             try:
@@ -150,6 +155,31 @@ class RpcExecutorMixin:
             # outside admission because terminal handling also takes authority.
             sent.add_done_callback(ingress_done)
         return result
+
+    def _fail_rpc_executor(self, error: Exception) -> bool:
+        """Close admission and wake consumers when their response producer fails.
+
+        This can run on a reader or watchdog thread. It must not call shutdown,
+        which joins the reader, or wait for a failed GPU worker to cooperate.
+        """
+        with self._execution_control_lock:
+            if self._execution_control_closed or self._execution_control_error is not None:
+                return False
+            self._execution_control_error = error
+            self._set_fatal_error(error)
+            pending = list(self._results.values())
+            self._results.clear()
+        try:
+            self._shutdown_execution_control()
+        except Exception as close_error:
+            logger.warning(f"Error closing failed execution authority: {close_error}")
+        finally:
+            for result in pending:
+                try:
+                    result.queue.put(EngineDeadError(error))
+                except Exception as queue_error:
+                    logger.warning(f"Error waking failed RPC request: {queue_error}")
+        return True
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
         async_queues = []
@@ -188,17 +218,20 @@ class RpcExecutorMixin:
                     if result._execution is not None:
                         result._execution.finish()
 
-        # Handle the case where responses might not be a list of lists
-        if responses and not isinstance(responses[0], list):
-            # If responses is a flat list, wrap it
-            responses = [responses]
+        with self._execution_control_lock:
+            if self._execution_control_error is not None or self._execution_control_closed:
+                return
+            # Handle the case where responses might not be a list of lists
+            if responses and not isinstance(responses[0], list):
+                # If responses is a flat list, wrap it
+                responses = [responses]
 
-        for res in responses:
-            global_tracer().log_instant("RPC.get")
-            process_res(res)
+            for res in responses:
+                global_tracer().log_instant("RPC.get")
+                process_res(res)
 
-        if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+            if async_queues:
+                _SyncQueue.notify_many(event_loop, async_queues)
 
     async def _generic_fetch_loop_async(
         self, fetch_method_name: str, handler_method: Callable, method_name: str
@@ -216,11 +249,14 @@ class RpcExecutorMixin:
                 if self._shutdown_event.is_set():
                     return
                 handler_method(data)
+            if not self._shutdown_event.is_set():
+                raise RuntimeError(f"{method_name} stream ended while the executor was running")
         except asyncio.CancelledError:
             logger.debug(f"{method_name} task cancelled")
         except Exception as e:
             logger.error(f"Error in {method_name}: {e}")
-            raise
+            if not self._shutdown_event.is_set():
+                self._fail_rpc_executor(e)
 
     async def _fetch_responses_loop_async(self):
         await self._generic_fetch_loop_async(

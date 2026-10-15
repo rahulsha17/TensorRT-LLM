@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """RPC frontend authority and result routing without inference or a Ray cluster."""
 
-from concurrent.futures import Future
+import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from queue import Queue
 from threading import Event
@@ -19,7 +20,7 @@ from tensorrt_llm.executor.execution_control import ExecutionControlMixin
 from tensorrt_llm.executor.execution_mailbox import ExecutionMailboxServer
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
-from tensorrt_llm.executor.utils import ErrorResponse
+from tensorrt_llm.executor.utils import EngineDeadError, ErrorResponse
 
 pytestmark = pytest.mark.cpu_only
 OLD = ExecutionVersion("tenant", "scope", 7)
@@ -43,6 +44,7 @@ class Frontend(RpcExecutorMixin, ExecutionControlMixin):
         }
         self._get_logprob_params = Mock(return_value=None)
         self._handle_background_error = Mock()
+        self._set_fatal_error = Mock()
         self._get_next_client_id = Mock(return_value=41)
 
 
@@ -226,6 +228,94 @@ def test_shutdown_revokes_pending_rpc_result(frontend):
     assert isinstance(result.queue.get_nowait(), ExecutionAuthorityError)
     with pytest.raises(RuntimeError, match="closed"):
         owner.get_execution_controller()
+
+
+@pytest.mark.parametrize("version", [None, OLD])
+@pytest.mark.parametrize("failure", ["exception", "eof"])
+def test_response_stream_loss_wakes_consumer_and_closes_admission(frontend, version, failure):
+    owner, _ = frontend
+    owner.get_execution_controller().register(OLD).wait()
+    result = owner.submit(request(version))
+    entered = Event()
+
+    def consume():
+        entered.set()
+        with pytest.raises((EngineDeadError, ExecutionAuthorityError)):
+            result._result_step(2)
+
+    async def stream():
+        if failure == "exception":
+            raise OSError("producer gone")
+        if False:
+            yield None
+
+    owner.rpc_client.fetch_responses_loop_async.return_value.remote_streaming.side_effect = stream
+    with ThreadPoolExecutor(1) as pool:
+        waiting = pool.submit(consume)
+        assert entered.wait(1)
+        asyncio.run(owner._fetch_responses_loop_async())
+        waiting.result(3)
+    assert owner._execution_control_closed
+    owner._set_fatal_error.assert_called_once()
+    assert owner._results == {}
+    for next_version in (None, OLD):
+        with pytest.raises(RuntimeError, match="restart required"):
+            owner.submit(request(next_version))
+    with pytest.raises(RuntimeError, match="closed"):
+        owner._execution_controller.register(replace(OLD, scope_id="late"))
+
+
+def test_rpc_failure_continues_after_controller_close_raises(frontend, monkeypatch):
+    owner, _ = frontend
+    result = owner.submit(request(None))
+    original = OSError("worker died")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            owner, "_shutdown_execution_control", Mock(side_effect=RuntimeError("close stuck"))
+        )
+        assert owner._fail_rpc_executor(original)
+        assert not owner._fail_rpc_executor(RuntimeError("second error"))
+    owner._set_fatal_error.assert_called_once_with(original)
+    with pytest.raises(EngineDeadError):
+        result._result_step(0.1)
+    with pytest.raises(RuntimeError, match="restart required"):
+        owner.submit(request(None))
+
+
+def test_failure_serializes_with_submission_and_drops_late_response(frontend):
+    owner, _ = frontend
+    sending = Event()
+    release = Event()
+
+    def send(**kwargs):
+        sending.set()
+        assert release.wait(2)
+
+    owner.rpc_client.submit.return_value.remote.side_effect = send
+    with ThreadPoolExecutor(2) as pool:
+        submitting = pool.submit(owner.submit, request(None))
+        assert sending.wait(1)
+        failing = pool.submit(owner._fail_rpc_executor, OSError("worker died"))
+        release.set()
+        result = submitting.result(2)
+        assert failing.result(2)
+    owner.handle_responses([ErrorResponse(41, "late reply", 9)])
+    with pytest.raises(EngineDeadError):
+        result._result_step(0.1)
+    assert result.queue.empty()
+
+
+def test_normal_stream_shutdown_does_not_mark_executor_failed(frontend):
+    owner, _ = frontend
+    owner._shutdown_event.set()
+
+    async def stream():
+        if False:
+            yield None
+
+    owner.rpc_client.fetch_responses_loop_async.return_value.remote_streaming.side_effect = stream
+    asyncio.run(owner._fetch_responses_loop_async())
+    owner._set_fatal_error.assert_not_called()
 
 
 @pytest.mark.parametrize("revoked", [False, True])
