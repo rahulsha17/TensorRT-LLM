@@ -200,6 +200,7 @@ void initBindings(nb::module_& m)
         .def_prop_rw(
             "context_current_position", &GenLlmReq::getContextCurrentPosition, &GenLlmReq::setContextCurrentPosition)
         .def_prop_ro("prepopulated_prompt_len", &GenLlmReq::getPrepopulatedPromptLen)
+        .def_prop_rw("execution_reuse_limit", &GenLlmReq::getExecutionReuseLimit, &GenLlmReq::setExecutionReuseLimit)
         .def("set_prepopulated_prompt_len", &GenLlmReq::setPrepopulatedPromptLen, nb::arg("prepopulated_prompt_len"),
             nb::arg("kv_tokens_per_block"))
         .def_prop_rw(

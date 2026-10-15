@@ -8541,6 +8541,57 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalContextTokenAfterReuse)
     EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
 }
 
+TEST_F(KVCacheManagerTest, ExecutionReuseLimitCapsAllocationAndCapacityWithoutSharingRecomputedSuffix)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto const tokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    auto constexpr promptLen = 13;
+    auto constexpr blockSize = 4;
+    auto const window = theOnlyWindowSize(*mgr);
+    seedAndRelease(*mgr, 0, tokens);
+    auto holder = std::make_shared<LlmRequest>(1, 2, tokens, tle::SamplingConfig{1}, false);
+    mgr->addSequenceBatch({{{1, promptLen, 1}}}, {std::ref(*holder)});
+    ASSERT_EQ(holder->getPrepopulatedPromptLen(), 12);
+    auto const holderBlocks = mgr->getSequence(1).getCacheBlockIds(window).at(0);
+    auto const fullSummary = mgr->analyzePrefixReuse(holder->getUniqueTokens(0), *holder);
+    ASSERT_EQ(fullSummary.reusableBlocksAllocated, 3);
+
+    for (SizeType32 limit : {0, 4, 8, 12})
+    {
+        auto const id = static_cast<LlmRequest::RequestIdType>(2 + limit);
+        auto request = std::make_shared<LlmRequest>(id, 2, tokens, tle::SamplingConfig{1}, false);
+        request->setExecutionReuseLimit(limit);
+        auto const summary = mgr->analyzePrefixReuse(request->getUniqueTokens(0), *request);
+        EXPECT_EQ(summary.reusableBlocksAll, limit / blockSize);
+        // Even an estimate cached before the limit was installed cannot over-credit reuse.
+        EXPECT_EQ(mgr->getNeededBlocksOneStep(*request, false, window, fullSummary), 4 - limit / blockSize);
+        EXPECT_EQ(request->getEstimatedReusableTokens(), limit);
+        EXPECT_EQ(mgr->getRemainingBlocksToCompletion(*request, window, fullSummary), 4 - limit / blockSize);
+        EXPECT_EQ(request->getEstimatedReusableTokens(), limit);
+        mgr->addSequenceBatch({{{id, promptLen, 1}}}, {std::ref(*request)});
+        EXPECT_EQ(request->getPrepopulatedPromptLen(), limit);
+        EXPECT_EQ(request->getContextCurrentPosition(), limit);
+        auto const blocks = mgr->getSequence(id).getCacheBlockIds(window).at(0);
+        ASSERT_EQ(blocks.size(), holderBlocks.size());
+        for (size_t i = 0; i < blocks.size(); ++i)
+        {
+            if (i < static_cast<size_t>(limit / blockSize))
+            {
+                EXPECT_EQ(blocks[i], holderBlocks[i]);
+            }
+            else
+            {
+                EXPECT_NE(blocks[i], holderBlocks[i]);
+            }
+        }
+        request->setIsDummyRequest(true);
+        mgr->removeSequence(id, request);
+    }
+    holder->setIsDummyRequest(true);
+    mgr->removeSequence(1, holder);
+}
+
 TEST_F(KVCacheManagerTest, AddSequenceBatchPreservesDraftTokensOnFinalContextAfterReuse)
 {
     auto const stream = std::make_shared<tr::CudaStream>();

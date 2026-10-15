@@ -760,6 +760,32 @@ TEST_F(LlmRequestTest, retiredKvFrontierCannotGrow)
     EXPECT_ANY_THROW(request.freezeRetireKvFrontier(1));
 }
 
+TEST_F(LlmRequestTest, executionReuseLimitIsImmutableIncludingZero)
+{
+    for (SizeType32 limit : {0, 2, 4})
+    {
+        texec::Request execReq(VecTokens{1, 2, 3, 4, 5}, 4);
+        tb::LlmRequest request(77, execReq);
+        EXPECT_FALSE(request.getExecutionReuseLimit().has_value());
+        EXPECT_ANY_THROW(request.setExecutionReuseLimit(-1));
+        EXPECT_ANY_THROW(request.setExecutionReuseLimit(5));
+        request.setExecutionReuseLimit(limit);
+        EXPECT_EQ(request.getExecutionReuseLimit().value(), limit);
+        EXPECT_NO_THROW(request.setExecutionReuseLimit(limit));
+        EXPECT_ANY_THROW(request.setExecutionReuseLimit(std::nullopt));
+        EXPECT_ANY_THROW(request.setExecutionReuseLimit(limit == 0 ? 1 : 0));
+    }
+}
+
+TEST_F(LlmRequestTest, executionReuseLimitMustPrecedeAllocation)
+{
+    texec::Request execReq(VecTokens{1, 2, 3, 4, 5}, 4);
+    tb::LlmRequest request(77, execReq);
+    request.setPrepopulatedPromptLen(4, 4);
+    EXPECT_ANY_THROW(request.setExecutionReuseLimit(2));
+    EXPECT_FALSE(request.getExecutionReuseLimit().has_value());
+}
+
 TEST_F(LlmRequestTest, retiredKvFrontierIncludesWrittenGeneratedInputs)
 {
     texec::Request execReq(VecTokens{1, 2, 3, 4, 5}, 8);

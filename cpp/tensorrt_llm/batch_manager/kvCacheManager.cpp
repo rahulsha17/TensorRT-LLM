@@ -1432,8 +1432,8 @@ PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     PrefixReuseSummary summary;
 
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
-    auto reuseMatches = findReusableBlockMatches(
-        blockKeys, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false, std::numeric_limits<SizeType32>::max());
+    auto reuseMatches = findReusableBlockMatches(blockKeys, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/false,
+        llmRequest.getExecutionReuseLimit().value_or(std::numeric_limits<SizeType32>::max()));
 
     for (auto const& match : reuseMatches.matches)
     {
@@ -1624,8 +1624,9 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
     result.numSharedContextBlocks
         = (beamWidth > 1 && !isShareLastContextBlock) ? numContextBlocks - 1 : numContextBlocks;
     result.shareLastContextBlockAmongBeams = result.numSharedContextBlocks == numContextBlocks;
-    auto reuseMatches = findReusableBlockMatches(
-        result.blockKeys, mEnablePartialReuse, mCopyOnPartialReuse, sequence.getCurrentPrepopulatedPromptLen());
+    auto reuseMatches = findReusableBlockMatches(result.blockKeys, mEnablePartialReuse, mCopyOnPartialReuse,
+        std::min(sequence.getCurrentPrepopulatedPromptLen(),
+            llmRequest.getExecutionReuseLimit().value_or(std::numeric_limits<SizeType32>::max())));
     result.totalMatchedTokens = reuseMatches.totalMatchedTokens;
 
     for (int bi = 0; bi < result.numSharedContextBlocks && bi < static_cast<int>(reuseMatches.matches.size()); ++bi)
@@ -3445,7 +3446,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             // When the prompt lands exactly on a block boundary, counting reusable full blocks from
             // all unique tokens can over-credit one extra shared block.
             TLLM_CHECK_WITH_INFO(promptInputLen > 0, "Unexpected: promptInputLen == 0");
-            auto const maxRecoverableSharedBlocks = (promptInputLen - 1) / getTokensPerBlock();
+            auto const maxRecoverableSharedBlocks
+                = std::min(promptInputLen - 1, req.getExecutionReuseLimit().value_or(promptInputLen - 1))
+                / getTokensPerBlock();
             // Block (capacity) budget: only allocated reuse reduces free-pool demand. A free-but-cached
             // block still pulls one block from the free pool when reused, so crediting it here would
             // double-count the eviction policy's free count and over-admit requests. Only subtract from
@@ -3572,7 +3575,9 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         // must not be double-counted against the capacity estimate.
         // Cap at (promptLen-1)/tpb to avoid over-counting when the prompt is exactly
         // block-aligned (last full block has not been committed to the tree yet).
-        SizeType32 const maxRecoverableBlocks = (req.mPromptLen - 1) / getTokensPerBlock();
+        SizeType32 const maxRecoverableBlocks
+            = std::min(req.mPromptLen - 1, req.getExecutionReuseLimit().value_or(req.mPromptLen - 1))
+            / getTokensPerBlock();
         numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
         // Token budget: count all reusable blocks (free or allocated). Cached tokens need
         // not be recomputed regardless of whether their blocks currently have active refs.

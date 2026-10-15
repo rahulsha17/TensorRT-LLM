@@ -229,27 +229,66 @@ def test_alignment_waits_for_all_reservations_and_maps_local_ids(cluster):
         assert table.poll_alignment(ALIGN) == expected
 
 
-def test_different_prefix_lengths_never_open_successor_admission(cluster):
-    cluster.holds[-1].num_tokens = 2
+@pytest.mark.parametrize("common", [0, 2, 3])
+def test_common_prefix_is_bound_before_admission_and_holds_survive_until_attachment(
+    cluster, common
+):
+    cluster.holds[-1].num_tokens = common
     cluster.controller.register(OLD).wait()
     result = cluster.controller.advance(REVISION, alignment=INPUT)
     result.publication.wait()
     for table in cluster.tables:
         table.alignment_state.process()
-    with pytest.raises(RuntimeError, match="different prefix lengths"):
+    receipt = result.alignment.wait()
+    assert receipt.reusable_prefix_length == common
+    with pytest.raises(ExecutionAuthorityError, match="pending"):
+        with cluster.controller.admission(NEW):
+            pass
+    cluster.controller.resume(receipt).wait()
+    with cluster.controller.admission(NEW):
+        pass
+    for table, hold in zip(cluster.tables, cluster.holds):
+        state = table.alignment_state
+        assert table.poll_alignment(ALIGN).reusable_prefix_length == hold.num_tokens
+        assert state.claim(NEW, 101, INPUT.input_token_ids, INPUT.cache_salt, None) == common
+        hold.close.assert_not_called()
+        for wrong in {common - 1, common + 1}:
+            with pytest.raises(RuntimeError, match="agreed KV prefix"):
+                state.confirm_attachment(NEW, 101, wrong)
+        hold.close.assert_not_called()
+        state.confirm_attachment(NEW, 101, common)
+        hold.settle.assert_called_once()
+        hold.close.assert_called_once()
+
+
+def test_common_prefix_cannot_bypass_runtime_minimum(cluster):
+    cluster.holds[-1].num_tokens = 2
+    required = replace(INPUT, min_reuse_tokens=3)
+    cluster.controller.register(OLD).wait()
+    result = cluster.controller.advance(REVISION, alignment=required)
+    result.publication.wait()
+    for table in cluster.tables:
+        table.alignment_state.process()
+    with pytest.raises(RuntimeError, match="ALIGN"):
         result.alignment.wait()
     with pytest.raises(ExecutionAuthorityError, match="pending"):
         with cluster.controller.admission(NEW):
             pass
-    # Retaining ownership on an error is safe. A later advance must reclaim it.
-    newer = replace(NEW, epoch=NEW.epoch + 1)
-    cluster.controller.advance(Revision("abandon", NEW, newer)).publication.wait()
-    for table, hold in zip(cluster.tables, cluster.holds):
-        table.alignment_state.process()
-        hold.close.assert_called_once()
+
+
+def test_parent_collective_limit_cannot_be_expanded_by_child(cluster):
+    _, receipt = prepare(cluster)
+    update = VersionUpdate("session", 3, NEW, ALIGN, receipt, 1)
+    assert cluster.transport.publish(update, Event()).update == update
+    for table in cluster.tables:
+        assert (
+            table.alignment_state.claim(NEW, 101, INPUT.input_token_ids, INPUT.cache_salt, None)
+            == 1
+        )
 
 
 def test_partial_resume_does_not_open_frontend_and_retry_keeps_holds(cluster):
+    cluster.holds[-1].num_tokens = 2
     _, receipt = prepare(cluster)
     cluster.children[-1].publish.side_effect = TimeoutError("lost acknowledgement")
     with pytest.raises(RuntimeError, match="publication failed"):
@@ -262,6 +301,8 @@ def test_partial_resume_does_not_open_frontend_and_retry_keeps_holds(cluster):
     cluster.controller.resume(receipt).wait()
     for hold in cluster.holds:
         hold.close.assert_not_called()
+    for table in cluster.tables:
+        assert table.alignment_state.snapshot()["records"][0]["resume_prefix_length"] == 2
     with cluster.controller.admission(NEW):
         pass
 

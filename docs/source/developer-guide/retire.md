@@ -225,8 +225,8 @@ controller -> transport -+-> TP/PP worker 1 -> local observation/drain/hold
              +-> acknowledge only after every required worker answers
 ```
 
-Publication and FENCE require every participant. ALIGN also requires the same
-reserved prefix length on every worker; incompatible lengths fail before RESUME.
+Publication and FENCE require every participant. ALIGN chooses the shortest
+reserved prefix and RESUME binds that common lookup limit on every worker.
 The transport retains each worker's reservation ID and translates the aggregate
 receipt back to those exact local receipts on RESUME. The frontend stays closed
 if only some workers acknowledge. A retry rechecks every local reservation;
@@ -235,8 +235,8 @@ teardown reclaims abandoned holds through the existing worker lifecycle.
 
 This transport is tested with local tables and authenticated IPC mailboxes. It
 is connected to RPC/Ray bootstrap, and does not itself coordinate model
-collectives or per-layer exit. Multi-rank executor support remains disabled
-until those paths can keep all ranks in the same collective schedule. Closing
+collectives or per-layer exit. Ray TP attaches the engine coordination described
+below; other distributed topologies remain unsupported. Closing
 the transport only closes channels; it does not certify drain or native cleanup.
 
 `ExecutionStepConsensus` supplies the next part of that integration: an engine
@@ -305,9 +305,19 @@ engine shuts down.
 
 Two/four-process CPU Gloo tests exercise agreement, mismatched phases and a
 missing peer. Simulated-worker tests cover partial installation and admission
-races. Real Ray TP model qualification is still required. ALIGN currently
-requires equal reserved lengths across ranks; common-frontier negotiation remains
-unfinished. Pipeline stages require separate ordering and remain rejected.
+races. Real Ray TP model qualification is still required. ALIGN chooses the
+shortest prefix covered by every worker's reservation. RESUME sends that length
+alongside each worker's original receipt and opens frontend admission only after
+all workers acknowledge it. Pipeline stages require separate ordering and remain
+rejected.
+
+For example, if two workers hold 128 and 256 compatible tokens, both successors
+start at token 128. The native V1 match and capacity estimates and the V2 cache
+lookup honor the same request-bound limit. This limits allocation itself; it
+does not rewind a cursor into shared blocks. The first forward requires exactly
+the agreed count before releasing either original hold. A zero common prefix
+means both workers recompute. A runtime minimum above the available prefix fails
+ALIGN. Lost acknowledgements can be retried, but cannot change the chosen length.
 
 Updates carry the full execution version, a publication sequence, and an
 executor-session identity. Epochs retain their full 64-bit range. Worker tables

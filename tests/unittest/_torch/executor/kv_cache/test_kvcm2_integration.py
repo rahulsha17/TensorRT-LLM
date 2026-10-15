@@ -941,6 +941,7 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
         multimodal_lengths=None,
     )
     manager._reuse_token_source = lambda _: prompt
+    request.execution_reuse_limit = None
     assert list(manager._context_reuse_tokens(request)) == prompt
     assert list(manager._context_reuse_tokens(request, reuse_limit=64)) == prompt
     assert list(manager._context_reuse_tokens(request, reuse_limit=63)) == prompt[:64]
@@ -1397,6 +1398,56 @@ def test_retire_recovers_completed_context_before_stopping_native_cache() -> Non
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("limit", [0, 4, 7, 8])
+def test_retire_common_prefix_caps_native_v2_claim(limit) -> None:
+    torch.empty(1, device="cuda")
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+            layers=[
+                AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4096)])
+            ],
+            enable_partial_reuse=True,
+        )
+    )
+    owner = successor = None
+    prompt = list(range(13))
+    try:
+        owner = core.create_kv_cache(None, expected_prompt_length=len(prompt))
+        assert owner.resume(CudaStream(torch.cuda.current_stream().cuda_stream))
+        assert owner.resize(len(prompt))
+        owner.commit(prompt[:12])
+        assert core.probe_reuse(None, prompt) == 12
+
+        manager, _ = _make_admission_manager()
+        manager.kv_cache_map = {}
+        manager._stream = torch.cuda.current_stream()
+        manager._has_cp_helix = False
+        manager.reuse_match_backoff = 0
+        manager._reuse_token_source = lambda request: prompt
+        manager._augment_tokens_for_block_reuse = lambda tokens, request, end: tokens[:end]
+
+        def create(request_id, lora_id, tokens, **kwargs):
+            nonlocal successor
+            successor = core.create_kv_cache(None, tokens, expected_prompt_length=len(prompt))
+            manager.kv_cache_map[request_id] = successor
+            return successor
+
+        manager._create_kv_cache = create
+        request = _ContextRequest(1, prompt, len(prompt), "conv", execution_reuse_limit=limit)
+        assert manager.prepare_context_cache(request) == limit
+        assert successor.num_committed_tokens == limit
+        assert owner.num_committed_tokens == 12
+        assert core.probe_reuse(None, prompt) == 12
+    finally:
+        for cache in (successor, owner):
+            if cache is not None:
+                cache.close()
+        core.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("prompt_length,frontier", [(5, 8), (8, 12)])
 def test_retire_native_decode_commit_survives_owner_close(prompt_length, frontier) -> None:
     from tensorrt_llm.execution_version import ExecutionVersion
@@ -1729,6 +1780,7 @@ class _ContextRequest:
     use_conversation_params: bool = True
     lora_task_id: int | None = None
     cache_salt: str | None = None
+    execution_reuse_limit: int | None = None
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False

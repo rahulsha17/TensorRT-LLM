@@ -43,6 +43,9 @@ class VersionUpdate:
         session_id: Unique identity of the authority owner for this worker.
         sequence: Positive publication number assigned by that owner.
         version: Full execution identity, including its uint64 epoch.
+        resume_prefix_length: Common cache-lookup bound for collective RESUME.
+            None keeps ordinary single-worker reuse. The local receipt must
+            cover this length, and a retry cannot change it.
     """
 
     session_id: str
@@ -50,6 +53,7 @@ class VersionUpdate:
     version: ExecutionVersion
     alignment: AlignmentRequest | None = None
     resume: AlignmentReceipt | None = None
+    resume_prefix_length: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id:
@@ -68,6 +72,14 @@ class VersionUpdate:
             not isinstance(self.resume, AlignmentReceipt) or self.resume.request != self.alignment
         ):
             raise ValueError("RESUME must match this publication's alignment")
+        if self.resume_prefix_length is not None and (
+            self.resume is None
+            or type(self.resume_prefix_length) is not int
+            or not self.resume.request.revised_input.min_reuse_tokens
+            <= self.resume_prefix_length
+            <= self.resume.reusable_prefix_length
+        ):
+            raise ValueError("RESUME prefix must be covered by the live reservation")
 
 
 @dataclass(frozen=True)
@@ -260,7 +272,7 @@ class WorkerVersionTable:
                 if self.poll_alignment(update.resume.request) != update.resume:
                     raise RuntimeError("RESUME requires the live ALIGN receipt and completed FENCE")
                 assert self.alignment_state is not None
-                self.alignment_state.authorize_resume(update.resume)
+                self.alignment_state.authorize_resume(update.resume, update.resume_prefix_length)
             if self.alignment_state is not None:
                 self.alignment_state.observe(update.version, update.alignment)
             self._versions[key] = update

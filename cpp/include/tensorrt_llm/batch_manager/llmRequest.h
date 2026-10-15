@@ -1007,6 +1007,26 @@ public:
         return mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
     }
 
+    //! Maximum prefix the execution authority permits this request to reuse.
+    [[nodiscard]] std::optional<SizeType32> getExecutionReuseLimit() const noexcept
+    {
+        return mExecutionReuseLimit;
+    }
+
+    //! Bind a collective RESUME frontier before allocation. Retries cannot change it.
+    void setExecutionReuseLimit(std::optional<SizeType32> limit)
+    {
+        TLLM_CHECK_WITH_INFO(!limit || (*limit >= 0 && *limit < mPromptLen), "Invalid execution reuse limit");
+        if (mExecutionReuseLimit)
+        {
+            TLLM_CHECK_WITH_INFO(limit == mExecutionReuseLimit, "Execution reuse limit cannot change");
+            return;
+        }
+        TLLM_CHECK_WITH_INFO(mPrepopulatedPromptLenTarget == 0 && mContextCurrentPositionTarget == 0,
+            "Execution reuse limit must be bound before context allocation");
+        mExecutionReuseLimit = limit;
+    }
+
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
     {
         // Add debug log for prepopulatedPromptLen
@@ -1905,6 +1925,7 @@ protected:
     // Up to inputLen - 1 tokens can be reused.
     SizeType32 mPrepopulatedPromptLenTarget{0};
     SizeType32 mPrepopulatedPromptLenDraft{0};
+    std::optional<SizeType32> mExecutionReuseLimit;
 
     // Estimated number of reusable tokens from the KV cache radix tree.
     // Set by the capacity scheduler (during getNeededBlocksOneStep /

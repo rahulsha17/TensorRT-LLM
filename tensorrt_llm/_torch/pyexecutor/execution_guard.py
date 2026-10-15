@@ -243,13 +243,15 @@ class ExecutionDeviceGuard:
         state = self.table.alignment_state
         version = request.py_execution_version
         if state is not None and version is not None:
-            state.claim(
+            prefix_length = state.claim(
                 version,
                 request.py_request_id,
                 tuple(request.get_tokens(0)),
                 request.cache_salt,
                 request.lora_task_id,
             )
+            if prefix_length is not None:
+                request.execution_reuse_limit = prefix_length
 
     def revoke_obsolete_requests(self, requests: list[LlmRequest]) -> list[LlmRequest]:
         """Stop scheduling old work, keeping slots until the normal result drain.

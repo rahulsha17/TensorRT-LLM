@@ -53,8 +53,10 @@ class CollectivePublicationTransport:
     worker does not prevent attempting publication to the remaining workers.
     A failed attempt never establishes completion or rolls back authority.
 
-    ALIGN requires equal reserved lengths. Each local hold stays with its worker;
-    RESUME translates the aggregate receipt back to those exact local receipts.
+    ALIGN chooses the shortest reserved prefix. Each local hold stays with its
+    worker; RESUME translates the aggregate receipt back to those exact local
+    receipts and supplies the common length as a cache-lookup limit. Every worker
+    must acknowledge that limit before the frontend can admit the successor.
     Failure retains holds until a newer revision or worker teardown reclaims them.
     Closing channels alone does not prove FENCE or release native resources.
 
@@ -140,8 +142,18 @@ class CollectivePublicationTransport:
                 raise ValueError("RESUME requires this collective's live ALIGN receipt")
             if self.poll_alignment(update.resume.request, stop) != update.resume:
                 raise RuntimeError("RESUME requires every worker's live reservation and FENCE")
+            prefix_length = (
+                aligned.receipt.reusable_prefix_length
+                if update.resume_prefix_length is None
+                else update.resume_prefix_length
+            )
             local_updates = {
-                id(t): replace(update, resume=r) for t, r in zip(self._transports, aligned.workers)
+                id(t): replace(
+                    update,
+                    resume=r,
+                    resume_prefix_length=prefix_length,
+                )
+                for t, r in zip(self._transports, aligned.workers)
             }
         else:
             local_updates = {id(t): update for t in self._transports}
@@ -192,9 +204,6 @@ class CollectivePublicationTransport:
         if any(r is None for r in receipts):
             return None
         workers = tuple(r for r in receipts if r is not None)
-        lengths = {r.reusable_prefix_length for r in workers}
-        if len(lengths) != 1:
-            raise RuntimeError("workers reserved different prefix lengths; RESUME is unsafe")
         version = request.revision.successor_version
         key = (version.tenant_id, version.scope_id)
         aligned = self._alignments.get(key)
@@ -202,7 +211,9 @@ class CollectivePublicationTransport:
             if aligned.workers != workers:
                 raise RuntimeError("worker reservation changed after collective ALIGN")
             return aligned.receipt
-        receipt = AlignmentReceipt(request, uuid4().hex, workers[0].reusable_prefix_length)
+        receipt = AlignmentReceipt(
+            request, uuid4().hex, min(r.reusable_prefix_length for r in workers)
+        )
         self._alignments[key] = _CollectiveAlignment(receipt, workers)
         return receipt
 

@@ -956,7 +956,8 @@ def test_alignment_wake_is_consumed_without_becoming_inference(guard):
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("mode", ["eager", "graph", "compiled", "compiled-graph"])
-def test_resume_handoff_before_common_forward_boundary(guard, v2, overlap, mode):
+@pytest.mark.parametrize("common_prefix", [None, 0, 2])
+def test_resume_handoff_before_common_forward_boundary(guard, v2, overlap, mode, common_prefix):
     from tensorrt_llm.execution_alignment import (
         AlignmentInput,
         AlignmentRequest,
@@ -979,18 +980,21 @@ def test_resume_handoff_before_common_forward_boundary(guard, v2, overlap, mode)
     guard.table.apply(VersionUpdate("session", 2, NEXT, alignment))
     state.process()
     receipt = guard.table.poll_alignment(alignment)
-    guard.table.apply(VersionUpdate("session", 3, NEXT, alignment, receipt))
+    guard.table.apply(VersionUpdate("session", 3, NEXT, alignment, receipt, common_prefix))
     request = _request(NEXT)
     request.get_tokens = Mock(return_value=list(revised.input_token_ids))
     request.cache_salt = revised.cache_salt
     request.lora_task_id = None
     guard.validate_successor(request)
-    request.prepopulated_prompt_len = 2
-    with pytest.raises(RuntimeError, match="aligned KV prefix"):
+    expected = 3 if common_prefix is None else common_prefix
+    if common_prefix is not None:
+        assert request.execution_reuse_limit == expected
+    request.prepopulated_prompt_len = 2 if common_prefix is None else common_prefix + 1
+    with pytest.raises(RuntimeError, match="KV prefix"):
         with guard.forward(_batch(request, context=True)):
             pytest.fail("must not submit the model without its prefix")
     guard.device.submission.assert_not_called()
-    request.prepopulated_prompt_len = 3
+    request.prepopulated_prompt_len = expected
     with guard.forward(_batch(request, context=True)):
         assert next(iter(state._records.values())).attached
     native_hold.settle.assert_called_once()

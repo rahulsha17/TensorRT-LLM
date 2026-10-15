@@ -130,6 +130,7 @@ class _AlignmentRecord:
     receipt: AlignmentReceipt | None = None
     error: Exception | None = None
     resumed: bool = False
+    resume_prefix_length: int | None = None
     request_id: int | None = None
     attached: bool = False
 
@@ -270,6 +271,7 @@ class WorkerAlignmentState:
                             record.receipt.reusable_prefix_length if record.receipt else None
                         ),
                         "resumed": record.resumed,
+                        "resume_prefix_length": record.resume_prefix_length,
                         "attached": record.attached,
                         "request_id": record.request_id,
                         "failed": record.error is not None,
@@ -285,12 +287,23 @@ class WorkerAlignmentState:
                 "records": records,
             }
 
-    def authorize_resume(self, receipt: AlignmentReceipt) -> None:
+    def authorize_resume(self, receipt: AlignmentReceipt, prefix_length: int | None = None) -> None:
         """Validate a live reservation before opening worker admission; no CUDA calls."""
         with self._lock:
             if self.poll(receipt.request) != receipt:
                 raise RuntimeError("RESUME does not match the live ALIGN reservation")
-            self._records[receipt.request].resumed = True
+            if prefix_length is not None and (
+                type(prefix_length) is not int
+                or not receipt.request.revised_input.min_reuse_tokens
+                <= prefix_length
+                <= receipt.reusable_prefix_length
+            ):
+                raise ValueError("RESUME prefix is not covered by this reservation")
+            record = self._records[receipt.request]
+            if record.resumed and record.resume_prefix_length != prefix_length:
+                raise RuntimeError("RESUME cannot change the agreed prefix")
+            record.resume_prefix_length = prefix_length
+            record.resumed = True
 
     def _record_for_version(self, version: ExecutionVersion) -> _AlignmentRecord | None:
         # Callers hold the state lock. Initial versions have no alignment record.
@@ -314,8 +327,8 @@ class WorkerAlignmentState:
         input_token_ids: tuple[int, ...],
         cache_salt: str | None,
         lora_task_id: int | None,
-    ) -> None:
-        """Bind a resumed revision to one physical request before scheduling."""
+    ) -> int | None:
+        """Bind one physical request and return its agreed cache-lookup limit."""
         with self._lock:
             record = self._record_for_version(version)
             if record is None:
@@ -332,6 +345,7 @@ class WorkerAlignmentState:
             if record.request_id is not None and record.request_id != request_id:
                 raise RuntimeError("RESUME already belongs to another request")
             record.request_id = request_id
+            return record.resume_prefix_length
 
     def confirm_attachment(
         self, version: ExecutionVersion, request_id: int, reused_tokens: int
@@ -348,7 +362,13 @@ class WorkerAlignmentState:
             if not record.resumed or record.request_id != request_id or record.error is not None:
                 raise RuntimeError("request does not own this RESUME")
             if not record.attached:
-                if record.receipt is None or reused_tokens < record.receipt.reusable_prefix_length:
+                promised = record.resume_prefix_length
+                if promised is not None:
+                    if reused_tokens != promised:
+                        raise RuntimeError("successor did not acquire the agreed KV prefix")
+                elif (
+                    record.receipt is None or reused_tokens < record.receipt.reusable_prefix_length
+                ):
                     raise RuntimeError("successor did not acquire the aligned KV prefix")
                 record.attached = True
             self._reclaim(record, settle=True)

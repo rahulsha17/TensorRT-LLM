@@ -3670,6 +3670,11 @@ class KVCacheManagerV2(BaseResourceManager):
             len(all_tokens),
             max(len(all_tokens) - 1, 0) + self.reuse_match_backoff,
         )
+        execution_limit = req.execution_reuse_limit
+        if execution_limit is not None:
+            reuse_limit = (
+                execution_limit if reuse_limit is None else min(reuse_limit, execution_limit)
+            )
         if reuse_limit is not None:
             # ``reuse_limit`` caps the claimed depth, not the evidence. Retain
             # the D following tokens that prove the draft KV at that depth.

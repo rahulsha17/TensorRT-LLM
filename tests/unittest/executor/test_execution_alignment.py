@@ -20,6 +20,7 @@ from tensorrt_llm.execution_gate import ExecutionAuthorityError
 from tensorrt_llm.execution_mailbox import (
     ExecutionController,
     LocalPublicationTransport,
+    VersionUpdate,
     WorkerVersionTable,
 )
 from tensorrt_llm.execution_version import ExecutionVersion
@@ -30,6 +31,40 @@ OLD = ExecutionVersion("tenant", "scope", 7)
 NEW = replace(OLD, epoch=8)
 REVISION = Revision("edit", OLD, NEW)
 INPUT = AlignmentInput((1, 2, 3, 4, 5), cache_salt="shared")
+
+
+@pytest.mark.parametrize("prefix", [-1, 4, True, 1.5])
+def test_resume_limit_rejects_invalid_or_unreserved_prefix(prefix):
+    request = AlignmentRequest("session", REVISION, INPUT)
+    state = WorkerAlignmentState(lambda _: Mock(num_tokens=3), lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    receipt = state.poll(request)
+    with pytest.raises(ValueError, match="prefix"):
+        VersionUpdate("session", 2, NEW, request, receipt, prefix)
+    with pytest.raises(ValueError, match="prefix"):
+        state.authorize_resume(receipt, prefix)
+    assert not state.snapshot()["records"][0]["resumed"]
+    state.close()
+    state.process()
+
+
+def test_resume_limit_requires_receipt_and_cannot_change_on_retry():
+    with pytest.raises(ValueError, match="prefix"):
+        VersionUpdate("session", 2, NEW, resume_prefix_length=0)
+    request = AlignmentRequest("session", REVISION, INPUT)
+    state = WorkerAlignmentState(lambda _: Mock(num_tokens=3), lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    receipt = state.poll(request)
+    state.authorize_resume(receipt, 2)
+    state.authorize_resume(receipt, 2)
+    for changed in (None, 0, 1, 3):
+        with pytest.raises(RuntimeError, match="cannot change"):
+            state.authorize_resume(receipt, changed)
+    assert state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None) == 2
+    state.close()
+    state.process()
 
 
 @pytest.fixture(params=["local", "ipc"])
