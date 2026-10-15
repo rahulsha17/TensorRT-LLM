@@ -14,6 +14,53 @@ from tensorrt_llm.executor.execution_watchdog import ExecutionCohortWatchdog, ch
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.mark.parametrize("failed_monitor", [False, True])
+def test_ray_transport_and_watchdog_use_the_supplied_authority_owner(monkeypatch, failed_monitor):
+    from tensorrt_llm.executor.ray import executor as ray_executor
+
+    transport = Mock()
+    prepare = Mock(return_value=transport)
+    monitor = Mock()
+    if failed_monitor:
+        monitor.start.side_effect = RuntimeError("watchdog failed")
+    create_monitor = Mock(return_value=monitor)
+    monkeypatch.setattr(ray_executor, "create_execution_cohort_transport", prepare)
+    monkeypatch.setattr(ray_executor, "ExecutionCohortWatchdog", create_monitor)
+    frontend = SimpleNamespace(
+        world_size=2,
+        _execution_session_id="frontend-identity",
+        _execution_bootstrap_rpc=Mock(),
+        _abort_execution_bootstrap=Mock(),
+        _fail_rpc_executor=Mock(),
+        _execution_control_error=None,
+    )
+    if failed_monitor:
+        with pytest.raises(RuntimeError, match="watchdog failed"):
+            ray_executor.RayExecutor._create_execution_transport(frontend, "shared-owner")
+        transport.close.assert_called_once()
+        frontend._abort_execution_bootstrap.assert_called_once()
+        assert frontend._execution_control_error is monitor.start.side_effect
+    else:
+        assert (
+            ray_executor.RayExecutor._create_execution_transport(frontend, "shared-owner")
+            is transport
+        )
+        transport.close.assert_not_called()
+        monitor.start.assert_called_once()
+    prepare.assert_called_once_with(
+        frontend,
+        "shared-owner",
+        frontend._execution_bootstrap_rpc,
+        frontend._abort_execution_bootstrap,
+    )
+    assert create_monitor.call_args.args[:2] == ("shared-owner", 2)
+    create_monitor.call_args.args[2]()
+    frontend._execution_bootstrap_rpc.assert_called_once_with(
+        "check_execution_health", ("shared-owner",), 30.0
+    )
+    assert frontend._execution_session_id == "frontend-identity"
+
+
 @pytest.mark.parametrize("size", [2, 4])
 @pytest.mark.parametrize(
     "fault", ["actor-dead", "timeout", "missing", "wrong-session", "wrong-rank"]

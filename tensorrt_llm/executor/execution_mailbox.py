@@ -14,15 +14,31 @@ import zmq
 
 from ..execution_alignment import AlignmentReceipt, AlignmentRequest
 from ..execution_fence import FenceReceipt, FenceRequest
-from ..execution_mailbox import PublicationReceipt, VersionUpdate, WorkerVersionTable
+from ..execution_mailbox import (
+    PublicationReceipt,
+    VersionUpdate,
+    WorkerIdentity,
+    WorkerVersionTable,
+)
 from .ipc import IpcQueue
 
 __all__ = ["ExecutionMailboxServer", "IpcPublicationTransport"]
 
 
 @dataclass(frozen=True)
+class _IdentityQuery:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class _IdentityStatus:
+    update: _IdentityQuery
+    identity: WorkerIdentity
+
+
+@dataclass(frozen=True)
 class _PublicationFailure:
-    update: VersionUpdate | FenceRequest | AlignmentRequest
+    update: VersionUpdate | FenceRequest | AlignmentRequest | _IdentityQuery
     message: str
 
 
@@ -53,6 +69,27 @@ class IpcPublicationTransport:
         self._timeout = timeout
         self._queue: IpcQueue | None = None
 
+    def identify(self, session_id: str) -> WorkerIdentity:
+        """Inspect a prepared worker using a separate, bounded bootstrap connection.
+
+        The temporary socket stays on the bootstrap thread. This transport's
+        publication socket is still created later by its owning publisher.
+        """
+        query = _IdentityQuery(session_id)
+        probe = IpcPublicationTransport(self._address, timeout=self._timeout)
+        try:
+            response = probe._exchange(query, Event())
+            if (
+                not isinstance(response, _IdentityStatus)
+                or response.update != query
+                or not isinstance(response.identity, WorkerIdentity)
+                or response.identity.session_id != session_id
+            ):
+                raise ValueError("worker identity does not match authority bootstrap")
+            return response.identity
+        finally:
+            probe.close()
+
     def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
         """Send and await a matching acknowledgement, ignoring replies to earlier attempts."""
         response = self._exchange(update, stop)
@@ -73,8 +110,8 @@ class IpcPublicationTransport:
         return response.receipt
 
     def _exchange(
-        self, update: VersionUpdate | FenceRequest | AlignmentRequest, stop: Event
-    ) -> PublicationReceipt | _FenceStatus | _AlignmentStatus:
+        self, update: VersionUpdate | FenceRequest | AlignmentRequest | _IdentityQuery, stop: Event
+    ) -> PublicationReceipt | _FenceStatus | _AlignmentStatus | _IdentityStatus:
         """Exchange one bounded status query on the publisher's socket."""
         if self._queue is None:
             self._queue = IpcQueue(self._address, is_server=False, name="retire_publisher")
@@ -98,7 +135,14 @@ class IpcPublicationTransport:
             except Empty:
                 continue
             if not isinstance(
-                response, (PublicationReceipt, _PublicationFailure, _FenceStatus, _AlignmentStatus)
+                response,
+                (
+                    PublicationReceipt,
+                    _PublicationFailure,
+                    _FenceStatus,
+                    _AlignmentStatus,
+                    _IdentityStatus,
+                ),
             ):
                 raise ValueError("invalid execution publication acknowledgement")
             if response.update != update:
@@ -168,11 +212,24 @@ class ExecutionMailboxServer:
                     update = queue.get(timeout=0.05)
                 except Empty:
                     continue
-                if not isinstance(update, (VersionUpdate, FenceRequest, AlignmentRequest)):
+                if not isinstance(
+                    update, (VersionUpdate, FenceRequest, AlignmentRequest, _IdentityQuery)
+                ):
                     raise ValueError("invalid execution publication")
-                response: PublicationReceipt | _FenceStatus | _AlignmentStatus | _PublicationFailure
+                response: (
+                    PublicationReceipt
+                    | _FenceStatus
+                    | _AlignmentStatus
+                    | _IdentityStatus
+                    | _PublicationFailure
+                )
                 try:
-                    if isinstance(update, AlignmentRequest):
+                    if isinstance(update, _IdentityQuery):
+                        identity = self._table.identity
+                        if identity.session_id != update.session_id:
+                            raise ValueError("worker belongs to a different authority session")
+                        response = _IdentityStatus(update, identity)
+                    elif isinstance(update, AlignmentRequest):
                         response = _AlignmentStatus(update, self._table.poll_alignment(update))
                     elif isinstance(update, FenceRequest):
                         response = _FenceStatus(update, self._table.poll_fence(update))

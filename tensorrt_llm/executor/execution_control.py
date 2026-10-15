@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from ..execution_gate import ExecutionAuthorityError, HostExecution
-from ..execution_mailbox import ExecutionController, LocalPublicationTransport, WorkerVersionTable
+from ..execution_mailbox import (
+    ExecutionController,
+    LocalPublicationTransport,
+    PublicationTransport,
+    WorkerVersionTable,
+)
 from ..execution_version import ExecutionVersion
 from .execution_mailbox import ExecutionMailboxServer, IpcPublicationTransport
 
@@ -29,6 +34,7 @@ class ExecutionControlMixin:
         self._execution_submit_started = False
         self._execution_session_id = uuid4().hex
         self._execution_controller: ExecutionController | None = None
+        self._execution_shared = False
         self._execution_version_table: WorkerVersionTable | None = None
         self._execution_mailbox_server: ExecutionMailboxServer | None = None
 
@@ -53,8 +59,18 @@ class ExecutionControlMixin:
             ) from self._execution_control_error
         if self._execution_control_closed or self.doing_shutdown:
             raise RuntimeError("executor execution control is closed")
+        if (
+            self._execution_shared
+            and self._execution_controller is not None
+            and self._execution_controller.closed
+        ):
+            raise RuntimeError("shared execution authority is closed; restart required")
 
     def _create_execution_controller(self) -> ExecutionController:
+        transport = self._create_execution_transport(self._execution_session_id)
+        return ExecutionController(self._execution_session_id, transport)
+
+    def _create_execution_transport(self, session_id: str) -> PublicationTransport:
         raise NotImplementedError("execution publication is not supported by this executor")
 
     def _execution_admission(
@@ -133,9 +149,9 @@ class WorkerExecutionControlMixin:
                 raise RuntimeError("execution publication has not been initialized")
             return self._execution_version_table
 
-    def _create_execution_controller(self) -> ExecutionController:
-        table = self._bind_execution_version_table(self._execution_session_id)
-        return ExecutionController(self._execution_session_id, LocalPublicationTransport(table))
+    def _create_execution_transport(self, session_id: str) -> PublicationTransport:
+        table = self._bind_execution_version_table(session_id)
+        return LocalPublicationTransport(table)
 
     def start_execution_mailbox(self, session_id: str) -> tuple[str, bytes]:
         """Bootstrap the dedicated publication channel over the existing authenticated RPC."""
@@ -170,14 +186,12 @@ class WorkerExecutionControlMixin:
 class ProxyExecutionControlMixin:
     """Keep authority at the sole frontend and publish to its IPC worker."""
 
-    def _create_execution_controller(self) -> ExecutionController:
+    def _create_execution_transport(self, session_id: str) -> PublicationTransport:
         if self._num_frontends != 1 or not self._is_pytorch_backend or self.model_world_size != 1:
             raise NotImplementedError(
                 "execution publication requires one frontend and one PyTorch rank"
             )
         if not self.workers_started or self._engine_dead or self.rpc_client is None:
             raise RuntimeError("execution publication requires a running worker")
-        address = self.rpc_client.start_execution_mailbox(self._execution_session_id).remote(
-            timeout=5
-        )
-        return ExecutionController(self._execution_session_id, IpcPublicationTransport(address))
+        address = self.rpc_client.start_execution_mailbox(session_id).remote(timeout=5)
+        return IpcPublicationTransport(address)

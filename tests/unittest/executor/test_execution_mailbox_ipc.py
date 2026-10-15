@@ -26,6 +26,75 @@ pytestmark = pytest.mark.cpu_only
 VERSION = ExecutionVersion("tenant", "scope", 0)
 
 
+def test_worker_identity_survives_endpoint_aliases_without_publishing_authority():
+    from tensorrt_llm.execution_mailbox import WorkerVersionTable
+    from tensorrt_llm.executor.execution_mailbox import ExecutionMailboxServer
+
+    table = WorkerVersionTable("owner")
+    first, second = ExecutionMailboxServer(table), ExecutionMailboxServer(table)
+    left, right = IpcPublicationTransport(first.address), IpcPublicationTransport(second.address)
+    try:
+        assert first.address[0] != second.address[0]
+        assert left.identify("owner") == right.identify("owner") == table.identity
+        assert left._queue is None and right._queue is None
+        assert table.current_version("tenant", "scope") is None
+        controller = ExecutionController("owner", left)
+        try:
+            assert controller.register(VERSION).wait().observed_version == VERSION
+        finally:
+            controller.close()
+    finally:
+        left.close()
+        right.close()
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("fault", ["foreign-owner", "closed-worker"])
+def test_worker_identity_requires_the_live_bound_authority(fault):
+    from tensorrt_llm.execution_mailbox import WorkerVersionTable
+    from tensorrt_llm.executor.execution_mailbox import ExecutionMailboxServer
+
+    table = WorkerVersionTable("owner")
+    server = ExecutionMailboxServer(table)
+    transport = IpcPublicationTransport(server.address)
+    try:
+        if fault == "closed-worker":
+            table.close()
+        with pytest.raises(RuntimeError):
+            transport.identify("foreign" if fault == "foreign-owner" else "owner")
+        assert transport._queue is None
+    finally:
+        transport.close()
+        server.close()
+
+
+@pytest.mark.parametrize("fault", ["query", "owner", "identity-type", "response-type"])
+def test_worker_identity_rejects_mismatched_replies(monkeypatch, fault):
+    from tensorrt_llm.execution_mailbox import WorkerIdentity
+    from tensorrt_llm.executor.execution_mailbox import _IdentityQuery, _IdentityStatus
+
+    response = _IdentityStatus(_IdentityQuery("owner"), WorkerIdentity("owner", "worker"))
+    if fault == "query":
+        response = replace(response, update=_IdentityQuery("other"))
+    elif fault == "owner":
+        response = replace(response, identity=WorkerIdentity("other", "worker"))
+    elif fault == "identity-type":
+        response = replace(response, identity="worker")
+    else:
+        response = object()
+    monkeypatch.setattr(IpcPublicationTransport, "_exchange", lambda *args: response)
+    with pytest.raises(ValueError, match="worker identity"):
+        IpcPublicationTransport(("tcp://127.0.0.1:1", b"key")).identify("owner")
+
+
+def test_worker_identity_unreachable_peer_has_a_bounded_timeout():
+    transport = IpcPublicationTransport(("tcp://127.0.0.1:1", b"key"), timeout=0.05)
+    with pytest.raises(TimeoutError):
+        transport.identify("owner")
+    assert transport._queue is None
+
+
 class _Worker(WorkerExecutionControlMixin, ExecutionControlMixin):
     def __init__(self, world_size: int = 1, frontends: int = 1, pytorch: bool = True) -> None:
         self._init_execution_control()

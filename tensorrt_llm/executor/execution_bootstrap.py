@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 from ..execution_collective import CollectivePublicationTransport, ExecutionParticipant
 from ..execution_consensus import ExecutionStepConsensus
-from ..execution_mailbox import ExecutionController, WorkerVersionTable
+from ..execution_mailbox import WorkerVersionTable
 from .execution_mailbox import ExecutionMailboxServer, IpcPublicationTransport
 
 if TYPE_CHECKING:
@@ -27,7 +27,7 @@ __all__ = [
     "GlooExecutionCohort",
     "inspect_execution_worker",
     "start_execution_worker",
-    "create_execution_cohort",
+    "create_execution_cohort_transport",
 ]
 
 
@@ -175,11 +175,12 @@ def start_execution_worker(
             raise
 
 
-def create_execution_cohort(
+def create_execution_cohort_transport(
     frontend: "RayExecutor",
+    session_id: str,
     call_all: Callable[[str, tuple, float], list],
     abort_workers: Callable[[], None],
-) -> ExecutionController:
+) -> CollectivePublicationTransport:
     """Bootstrap before admission under the frontend's execution-control lock.
 
     ``call_all`` must start every RPC before waiting and enforce the supplied
@@ -204,7 +205,9 @@ def create_execution_cohort(
         raise RuntimeError("distributed execution control must start before request admission")
     if frontend._shutdown_event.is_set() or len(frontend.workers) != size:
         raise RuntimeError("execution bootstrap requires the full running worker set")
-    session = frontend._execution_session_id
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("execution bootstrap requires an authority session")
+    session = session_id
     infos = call_all("inspect_execution_bootstrap", (session, size), 30.0)
     if (
         len(infos) != size
@@ -251,7 +254,7 @@ def create_execution_cohort(
             {p: IpcPublicationTransport(address) for p, address in zip(participants, addresses)},
             publication_source=participants[0],
         )
-        return ExecutionController(session, transport)
+        return transport
     except Exception as error:
         frontend._execution_control_error = error
         abort_workers()

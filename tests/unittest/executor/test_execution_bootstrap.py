@@ -80,8 +80,10 @@ class Frontend(ExecutionControlMixin):
         )
         self.abort = Mock()
 
-    def _create_execution_controller(self):
-        return bootstrap.create_execution_cohort(self, self.call_all, self.abort)
+    def _create_execution_transport(self, session_id):
+        return bootstrap.create_execution_cohort_transport(
+            self, session_id, self.call_all, self.abort
+        )
 
     def close(self):
         self._shutdown_execution_control()
@@ -110,6 +112,24 @@ def test_bootstrap_attaches_all_distinct_workers_once(frontend):
             90.0,
         )
         frontend.abort.assert_not_called()
+
+
+def test_external_owner_does_not_replace_frontend_identity(frontend):
+    identity = frontend._execution_session_id
+    frontend.infos = [replace(info, session_id="shared-owner") for info in frontend.infos]
+    frontend.ready = [
+        replace(reply, info=info) for reply, info in zip(frontend.ready, frontend.infos)
+    ]
+    transport = frontend._create_execution_transport("shared-owner")
+    try:
+        assert frontend._execution_session_id == identity
+        assert frontend._execution_controller is None
+        assert [call.args[1] for call in frontend.call_all.call_args_list] == [
+            ("shared-owner", 2),
+            ("shared-owner", 2),
+        ]
+    finally:
+        transport.close()
 
 
 @pytest.mark.parametrize(

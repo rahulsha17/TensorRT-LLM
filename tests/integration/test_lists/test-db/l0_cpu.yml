@@ -148,6 +148,7 @@ l0_cpu:
   - unittest/executor/test_execution_fence.py
   - unittest/executor/test_execution_mailbox.py
   - unittest/executor/test_execution_collective.py
+  - unittest/executor/test_execution_group.py
   - unittest/executor/test_execution_consensus.py
   - unittest/executor/test_execution_bootstrap.py
   - unittest/executor/test_execution_watchdog.py

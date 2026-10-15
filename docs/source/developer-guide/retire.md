@@ -255,6 +255,48 @@ can proceed only if every rank accepts it. Missing ranks, different rows or
 progress, and failed collectives invalidate the coordinator until restart.
 Invalid local input still enters the collective so peers can observe failure.
 
+### One authority across executor frontends
+
+A runtime that owns several executor frontends in one process can bind them to
+one controller before any frontend admits requests or creates its own authority:
+
+```python
+from tensorrt_llm.executor.execution_group import create_shared_execution_controller
+
+controller = create_shared_execution_controller((first_executor, second_executor))
+controller.register(version).wait()
+assert first_executor.get_execution_controller() is controller
+assert second_executor.get_execution_controller() is controller
+```
+
+The frontends share one registry and one admission/result gate. A revision
+accepted through either frontend immediately revokes old host results on both.
+Each worker group keeps its existing TP coordination. Publication, FENCE and
+RESUME require every group, including every rank inside each group.
+
+Bootstrap locks all frontend admission paths until every member is attached.
+Workers report an immutable identity for their bound table over authenticated
+IPC. Two handles for the same worker cannot count as two participants, even
+when one handle is local and the other uses IPC. The worker identity query uses
+a temporary connection; the publisher creates its own socket on its own thread.
+A partial bootstrap failure disables all member frontends until restart.
+
+The group is fixed for that authority's lifetime. Closing any member's control
+path closes the shared controller and blocks new submissions on all members.
+Shut down each executor normally to stop its workers and finish cleanup;
+closing authority alone does not prove that GPU or transfer access has ended.
+
+This supplies a common owner for separate placements, but does not yet enable
+disaggregated RETIRE. Existing transfer and connector guards remain in place.
+ALIGN currently reserves on every member and uses the shortest common prefix.
+Destination-specific ALIGN, version-bound transfer messages and transfer
+qualification are still required before prefill/decode transfer can be enabled.
+Frontends in separate runtime processes also need an external owner/admission
+protocol; they cannot independently create controllers with the same epoch and
+claim one shared authority.
+
+### Coordinating model execution
+
 The device guard coordinates scheduling, token/context commits, and early exit.
 Empty sampler results and untagged batches still enter their expected votes.
 Device waits finish before acquiring host authority. A failed wait, missing

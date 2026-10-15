@@ -10,7 +10,7 @@ from typing import Callable, List, Optional
 
 from .._utils import nvtx_range_debug
 from ..execution_collective import CollectivePublicationTransport, ExecutionParticipant
-from ..execution_mailbox import ExecutionController
+from ..execution_mailbox import PublicationTransport
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
 from ..logger import logger
@@ -46,7 +46,7 @@ class RpcExecutorMixin:
         self.main_loop = None
         self.main_loop_thread = None
 
-    def _create_execution_controller(self) -> ExecutionController:
+    def _create_execution_transport(self, session_id: str) -> PublicationTransport:
         args = self.worker_kwargs["llm_args"]
         if (
             args.backend != "pytorch"
@@ -60,14 +60,12 @@ class RpcExecutorMixin:
             )
         if self._shutdown_event.is_set() or self.rpc_client is None:
             raise RuntimeError("execution publication requires a running worker")
-        address = self.rpc_client.start_execution_mailbox(self._execution_session_id).remote(
-            timeout=5
-        )
+        address = self.rpc_client.start_execution_mailbox(session_id).remote(timeout=5)
         participant = ExecutionParticipant(0, 0)
         transport = CollectivePublicationTransport(
             (participant,), {participant: IpcPublicationTransport(address)}
         )
-        return ExecutionController(self._execution_session_id, transport)
+        return transport
 
     def setup_mainloop(
         self, tasks: Optional[List[Callable]] = None, thread_name: str = "rpc_proxy_main_loop"

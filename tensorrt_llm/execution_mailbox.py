@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from queue import Empty, Queue
 from threading import Event, Lock, RLock, Thread
 from typing import Protocol
+from uuid import uuid4
 
 from .execution_alignment import (
     AlignmentInput,
@@ -32,7 +33,22 @@ __all__ = [
     "VersionPublication",
     "VersionUpdate",
     "WorkerVersionTable",
+    "WorkerIdentity",
 ]
+
+
+@dataclass(frozen=True)
+class WorkerIdentity:
+    """Identify one bound worker table, independently of its publication endpoint."""
+
+    session_id: str
+    worker_id: str
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str) or not value for value in (self.session_id, self.worker_id)
+        ):
+            raise ValueError("worker identity requires an authority session and worker ID")
 
 
 @dataclass(frozen=True)
@@ -159,6 +175,7 @@ class WorkerVersionTable:
         if not isinstance(session_id, str) or not session_id:
             raise ValueError("session_id must be a nonempty string")
         self._session_id = session_id
+        self._identity = WorkerIdentity(session_id, uuid4().hex)
         self._lock = RLock()
         self._versions: dict[tuple[str, str], VersionUpdate] = {}
         # Forward submission holds the device lock. Its advisory polls must not
@@ -248,6 +265,13 @@ class WorkerVersionTable:
     def session_id(self) -> str:
         """Identity of the authority owner bound for this table's lifetime."""
         return self._session_id
+
+    @property
+    def identity(self) -> WorkerIdentity:
+        """Read this worker lifetime's identity without granting execution authority."""
+        with self._lock:
+            self._require_open()
+            return self._identity
 
     def apply(self, update: VersionUpdate) -> PublicationReceipt:
         """Record an owner update atomically; duplicate or delayed messages never rewind it."""
@@ -412,6 +436,11 @@ class ExecutionController:
         self._queue: Queue[VersionPublication | FenceRequest | AlignmentRequest | None] = Queue()
         self._thread = Thread(target=self._run, name="retire_publication", daemon=True)
         self._thread.start()
+
+    @property
+    def closed(self) -> bool:
+        """Whether this authority owner has stopped admitting work."""
+        return self._stop.is_set()
 
     def register(self, version: ExecutionVersion) -> VersionPublication:
         """Register an initial version and schedule its publication."""

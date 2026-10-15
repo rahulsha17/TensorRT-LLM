@@ -36,9 +36,9 @@ except ImportError:
 from tensorrt_llm.executor.ray.utils import unwrap_ray_errors
 from tensorrt_llm.logger import logger
 
-from ...execution_mailbox import ExecutionController
+from ...execution_mailbox import PublicationTransport
 from ...llmapi.utils import logger_debug
-from ..execution_bootstrap import create_execution_cohort
+from ..execution_bootstrap import create_execution_cohort_transport
 from ..execution_watchdog import ExecutionCohortWatchdog
 from ..executor import GenerationExecutor
 from ..postproc_worker import PostprocWorkerConfig
@@ -279,28 +279,28 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         metrics = self.collective_rpc("get_startup_metrics", target_ranks=0)
         return metrics[0] if metrics and isinstance(metrics[0], dict) else {}
 
-    def _create_execution_controller(self) -> ExecutionController:
+    def _create_execution_transport(self,
+                                    session_id: str) -> PublicationTransport:
         if self.world_size == 1:
-            return super()._create_execution_controller()
-        controller = create_execution_cohort(self,
-                                             self._execution_bootstrap_rpc,
-                                             self._abort_execution_bootstrap)
+            return super()._create_execution_transport(session_id)
+        transport = create_execution_cohort_transport(
+            self, session_id, self._execution_bootstrap_rpc,
+            self._abort_execution_bootstrap)
         try:
             self._execution_watchdog = ExecutionCohortWatchdog(
-                self._execution_session_id,
-                self.world_size, lambda: self._execution_bootstrap_rpc(
-                    "check_execution_health",
-                    (self._execution_session_id, ), 30.0),
+                session_id, self.world_size,
+                lambda: self._execution_bootstrap_rpc("check_execution_health",
+                                                      (session_id, ), 30.0),
                 self._fail_rpc_executor)
             self._execution_watchdog.start()
         except Exception as error:
             self._execution_control_error = error
             try:
-                controller.close()
+                transport.close()
             finally:
                 self._abort_execution_bootstrap()
             raise
-        return controller
+        return transport
 
     def _execution_bootstrap_rpc(self, method: str, args: tuple,
                                  timeout: float) -> list:
