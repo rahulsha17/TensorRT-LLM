@@ -100,6 +100,7 @@ def test_context_frontier_requires_gpu_completion_before_host_acceptance(revoked
 
     old = ExecutionVersion("tenant", "scope", 0)
     guard = object.__new__(ExecutionDeviceGuard)
+    guard._rank_consensus = None
     guard.device = DeviceExecutionAuthority(torch.cuda.current_device())
     guard.table = WorkerVersionTable("session")
     guard.table.bind_device_publisher(guard.device)
@@ -281,6 +282,7 @@ def test_native_sampler_consumes_overlap_batch_containing_canceled_request(logpr
 
     version = ExecutionVersion("tenant", "scope", 7)
     guard = object.__new__(ExecutionDeviceGuard)
+    guard._rank_consensus = None
     guard.device = DeviceExecutionAuthority(torch.cuda.current_device())
     guard.table = WorkerVersionTable("session")
     guard.table.bind_device_publisher(guard.device)

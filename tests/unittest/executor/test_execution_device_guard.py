@@ -18,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.execution_consensus import ExecutionStepConsensus
 from tensorrt_llm.execution_mailbox import VersionUpdate, WorkerVersionTable
 from tensorrt_llm.execution_version import ExecutionVersion
 
@@ -60,6 +61,7 @@ def _request(version=VERSION):
 @pytest.fixture
 def guard(monkeypatch):
     result = object.__new__(ExecutionDeviceGuard)
+    result._rank_consensus = None
     result.table = WorkerVersionTable("session")
     result.table.apply(VersionUpdate("session", 1, VERSION))
     result.device = Mock()
@@ -1121,6 +1123,98 @@ def test_boundary_observer_tracks_verdict_and_restores_after_unwind() -> None:
         ("eager_layer", 12, 16, False),
     ]
     inner.assert_called_once_with("eager_layer", 8, 16, True)
+
+
+@pytest.mark.parametrize("phase", ["schedule", "context_commit", "token_commit"])
+def test_remote_rejection_prevents_local_progress(guard, phase):
+    request = _request()
+    calls = []
+
+    def gather(vote):
+        calls.append(vote)
+        if phase == "token_commit":
+            # GPU completion must precede the host collective.
+            state.execution_ticket.wait.assert_called_once()
+            assert state.sampler_event is None
+        return [vote, replace(vote, rank=1, allowed=(False,))]
+
+    guard._rank_consensus = ExecutionStepConsensus("session", 0, (0, 1), gather)
+    if phase == "schedule":
+        assert guard.revoke_obsolete_requests([request]) == [request]
+    elif phase == "context_commit":
+        with guard.context_commit(_batch(request, context=True)) as accepted:
+            assert not accepted.context_requests
+    else:
+        state = _state(request, allowed=[True])
+        with guard.token_commit(state):
+            assert request.is_finished
+    assert request.is_finished
+    assert not guard._kv_frontiers
+    assert [v.phase for v in calls] == [phase]
+    assert calls[0].rows[0].version == VERSION
+    assert guard.table.current_version("tenant", "scope") == VERSION
+
+
+def test_remote_early_exit_uses_exact_boundary_and_records_local_readers(guard):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        execution_early_exit_point,
+        get_layer_early_exit_point,
+    )
+
+    calls = []
+
+    def gather(vote):
+        calls.append(vote)
+        return [vote, replace(vote, rank=1, allowed=(False,))]
+
+    guard._rank_consensus = ExecutionStepConsensus("session", 0, (0, 1), gather)
+    request = _request()
+    with pytest.raises(ExecutionEarlyExit):
+        with guard.forward(_batch(request, context=True)):
+            assert get_layer_early_exit_point() is not None
+            execution_early_exit_point("decoder_layer", 3, 64)
+    assert [v.phase for v in calls] == ["early_exit:decoder_layer:3:64"]
+    assert guard._uses[id(request)].event is not None
+    guard.device.wait_event.assert_not_called()
+    assert get_layer_early_exit_point() is None
+    execution_early_exit_point()
+
+
+@pytest.mark.parametrize("untagged", [False, True])
+def test_coordinated_entry_includes_empty_and_untagged_batches(guard, untagged):
+    votes = []
+
+    def gather(vote):
+        votes.append(vote)
+        return [vote, replace(vote, rank=1)]
+
+    guard._rank_consensus = ExecutionStepConsensus("session", 0, (0, 1), gather)
+    requests = [_request(None)] if untagged else []
+    assert guard.revoke_obsolete_requests(requests) == []
+    assert len(votes) == 1 and len(votes[0].rows) == len(requests)
+
+
+def test_boundary_poll_restores_outer_authority_on_exception() -> None:
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        early_exit_scope,
+        execution_early_exit_point,
+    )
+
+    outer = Mock(return_value=False)
+    inner = Mock(return_value=True)
+    with early_exit_scope(None, boundary_poll=outer):
+        execution_early_exit_point("outer", 0, 1)
+        with pytest.raises(ExecutionEarlyExit):
+            with early_exit_scope(None, boundary_poll=inner):
+                execution_early_exit_point("inner", 2, 4)
+        execution_early_exit_point("outer", 1, 1)
+        with pytest.raises(ValueError, match="one early-exit"):
+            with early_exit_scope(lambda: False, boundary_poll=inner):
+                pytest.fail("ambiguous authority accepted")
+    assert [call.args for call in outer.call_args_list] == [("outer", 0, 1), ("outer", 1, 1)]
+    inner.assert_called_once_with("inner", 2, 4)
 
 
 def test_prefill_trace_carries_request_identity_and_partial_submission(guard, monkeypatch) -> None:

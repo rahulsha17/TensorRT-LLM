@@ -13,6 +13,7 @@ import torch
 
 from ...bindings.executor import FinishReason
 from ...execution_alignment import AlignmentRequest, AlignmentSafetyError, WorkerAlignmentState
+from ...execution_consensus import ExecutionRow, ExecutionStepConsensus
 from ...execution_fence import RequestDrainTracker
 from ...execution_gate import ExecutionAuthorityError
 from ...execution_mailbox import WorkerVersionTable
@@ -77,6 +78,9 @@ class ExecutionDeviceGuard:
         if not executor._is_kv_manager_v2 and not hasattr(LlmRequest, "freeze_retire_kv_frontier"):
             raise RuntimeError("RETIRE V1 prefill inheritance requires rebuilt native bindings")
         self.table = table
+        # Installed only by a bootstrap that coordinates all model ranks.
+        # Executor topology validation still excludes multi-rank execution.
+        self._rank_consensus: ExecutionStepConsensus | None = None
         attention_binding = getattr(executor.model_engine, "execution_attention", None)
         self._native_kv_guards = attention_binding is not None
         self.device = (
@@ -196,13 +200,33 @@ class ExecutionDeviceGuard:
         to reject an obsolete admission; GPU authority independently gates tokens.
         """
         versions = [request.py_execution_version for request in requests]
-        if not any(version is not None for version in versions):
+        if self._rank_consensus is None and not any(version is not None for version in versions):
             return []
         with self.table.guard_versions(versions) as allowed:
+            allowed = self._coordinate("schedule", requests, allowed)
             obsolete = [request for request, accepted in zip(requests, allowed) if not accepted]
             for request in obsolete:
                 self._cancel(request)
             return obsolete
+
+    def _coordinate(
+        self, phase: str, requests: list[LlmRequest], allowed: list[bool] | tuple[bool, ...]
+    ) -> tuple[bool, ...]:
+        """Agree before changing logical progress; physical allocation stays rank-local."""
+        if self._rank_consensus is None:
+            return tuple(allowed)
+        rows = tuple(
+            ExecutionRow(
+                request.py_request_id,
+                request.py_execution_version,
+                request.get_num_tokens(0),
+                request.context_current_position,
+                request.context_chunk_size,
+                request.state.name,
+            )
+            for request in requests
+        )
+        return self._rank_consensus.agree(phase, rows, tuple(allowed))
 
     @contextmanager
     def forward(self, batch: ScheduledRequests) -> Iterator[None]:
@@ -224,10 +248,19 @@ class ExecutionDeviceGuard:
         for request in requests:
             self._kv_frontiers.setdefault(id(request), request.prepopulated_prompt_len)
         # Include untagged rows: one live neighbor prohibits a whole-batch exit.
-        versions = tuple(r.py_execution_version for r in batch.all_requests())
+        all_requests = list(batch.all_requests())
+        versions = tuple(r.py_execution_version for r in all_requests)
 
         def wholly_obsolete() -> bool:
             return bool(versions) and not any(self.table.observe_allowed(versions))
+
+        def coordinated_obsolete(boundary: str, submitted: int, total: int) -> bool:
+            allowed = self._coordinate(
+                f"early_exit:{boundary}:{submitted}:{total}",
+                all_requests,
+                self.table.observe_allowed(versions),
+            )
+            return bool(versions) and not any(allowed)
 
         traced = bool(requests) and bool(batch.context_requests) and execution_trace_enabled()
         trace_requests = (
@@ -260,10 +293,16 @@ class ExecutionDeviceGuard:
             self.device.submission(),
             early_exit_scope(
                 wholly_obsolete
-                if self._early_exit_enabled and versions and all(v is not None for v in versions)
+                if self._rank_consensus is None
+                and self._early_exit_enabled
+                and versions
+                and all(v is not None for v in versions)
                 else None,
                 layer_checks=sum(r.context_chunk_size for r in batch.context_requests) >= 32,
                 observer=observe if traced else None,
+                boundary_poll=coordinated_obsolete
+                if self._rank_consensus is not None and self._early_exit_enabled
+                else None,
             ),
         ):
             for request in requests:
@@ -345,8 +384,13 @@ class ExecutionDeviceGuard:
             raise RuntimeError("sampling step has no complete device commit verdict")
         accepted = []
         with self.table.guard_versions(list(ticket.versions)) as host_allowed:
-            for request, host_ok, device_ok in zip(state.requests, host_allowed, commit.allowed):
-                if not (host_ok and device_ok):
+            allowed = self._coordinate(
+                "token_commit",
+                state.requests,
+                [host and device for host, device in zip(host_allowed, commit.allowed)],
+            )
+            for request, allowed_row in zip(state.requests, allowed):
+                if not allowed_row:
                     self._cancel(request)
                 elif request.py_execution_version is not None and not request.is_finished:
                     accepted.append((request, request.get_num_tokens(0)))
@@ -376,7 +420,7 @@ class ExecutionDeviceGuard:
         """Guard context progress and V2 prefix publication without changing sampler row order."""
         requests = batch.context_requests
         versions = [request.py_execution_version for request in requests]
-        if not any(version is not None for version in versions):
+        if self._rank_consensus is None and not any(version is not None for version in versions):
             yield batch
             return
         if self._native_kv_guards:
@@ -394,6 +438,7 @@ class ExecutionDeviceGuard:
             for event in events.values():
                 self.device.wait_event(event)
         with self.table.guard_versions(versions) as allowed:
+            allowed = self._coordinate("context_commit", requests, allowed)
             rejected = {id(r) for r, ok in zip(requests, allowed) if not ok}
             for request in requests:
                 if id(request) in rejected:

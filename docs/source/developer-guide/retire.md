@@ -238,6 +238,26 @@ collectives or per-layer exit. Multi-rank executor support remains disabled
 until those paths can keep all ranks in the same collective schedule. Closing
 the transport only closes channels; it does not certify drain or native cleanup.
 
+`ExecutionStepConsensus` supplies the next part of that integration: an engine
+boundary vote over a fixed set of ranks. Votes carry the authority session,
+step number, boundary, ordered request versions, and logical progress. A row
+can proceed only if every rank accepts it. Missing ranks, different rows or
+progress, and failed collectives invalidate the coordinator until restart.
+Invalid local input still enters the collective so peers can observe failure.
+
+The device guard has consensus hooks before scheduling cancellation, token and
+context commits, and early exit. Early-exit votes include the exact layer or
+graph-segment boundary; they retain the existing GPU-use records. Token and
+context waits finish before a host commit vote. Physical allocation identifiers
+remain local. Single-rank execution keeps its existing local authority checks.
+
+These hooks are tested with bounded host collectives and controlled device
+completion. They are not yet attached by distributed bootstrap, and do not
+enable TP/PP. Before enabling that topology, the executor must register mirrored
+admissions before any rank can report drain, coordinate empty/error paths, and
+provide a host-only collective with distributed failure handling. Pipeline
+stages do not enter every boundary together; they require separate ordering.
+
 Updates carry the full execution version, a publication sequence, and an
 executor-session identity. Epochs retain their full 64-bit range. Worker tables
 are isolated by tenant and scope; an unknown scope is not treated as epoch zero.

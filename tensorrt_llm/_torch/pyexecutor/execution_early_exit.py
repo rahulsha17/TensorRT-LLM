@@ -33,6 +33,9 @@ class ExecutionEarlyExit(Exception):
 _layer_checks: ContextVar[bool] = ContextVar("execution_layer_checks", default=False)
 
 _poll: ContextVar[Callable[[], bool] | None] = ContextVar("execution_early_exit", default=None)
+_boundary_poll: ContextVar[Callable[[str, int, int], bool] | None] = ContextVar(
+    "execution_boundary_poll", default=None
+)
 _observer: ContextVar[Callable[[str, int, int, bool], None] | None] = ContextVar(
     "execution_boundary_observer", default=None
 )
@@ -57,14 +60,19 @@ def early_exit_scope(
     *,
     layer_checks: bool = True,
     observer: Callable[[str, int, int, bool], None] | None = None,
+    boundary_poll: Callable[[str, int, int], bool] | None = None,
 ) -> Iterator[None]:
     """Bind a batch-local poll, restoring it even if model execution raises."""
+    if poll is not None and boundary_poll is not None:
+        raise ValueError("choose one early-exit authority poll")
     token = _poll.set(poll)
+    boundary_token = _boundary_poll.set(boundary_poll)
     layer_token = _layer_checks.set(layer_checks)
     observer_token = _observer.set(observer)
     try:
         yield
     finally:
+        _boundary_poll.reset(boundary_token)
         _observer.reset(observer_token)
         _poll.reset(token)
         _layer_checks.reset(layer_token)
@@ -79,7 +87,12 @@ def execution_early_exit_point(
     KV or prove GPU completion; the executor still records and drains all uses.
     """
     poll = _poll.get()
-    obsolete = poll is not None and poll()
+    boundary_poll = _boundary_poll.get()
+    obsolete = (
+        boundary_poll(boundary, submitted, total)
+        if boundary_poll is not None
+        else poll is not None and poll()
+    )
     observer = _observer.get()
     if observer is not None:
         observer(boundary, submitted, total, obsolete)
@@ -89,4 +102,5 @@ def execution_early_exit_point(
 
 def get_layer_early_exit_point() -> Callable[..., None] | None:
     """Return the active prefill hook, or None for unarmed/short decode batches."""
-    return execution_early_exit_point if _layer_checks.get() and _poll.get() is not None else None
+    armed = _poll.get() is not None or _boundary_poll.get() is not None
+    return execution_early_exit_point if _layer_checks.get() and armed else None
