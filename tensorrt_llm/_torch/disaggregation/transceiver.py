@@ -72,6 +72,7 @@ from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, nvt
 from tensorrt_llm.bindings import DataType, LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+from tensorrt_llm.execution_fence import RequestDrainTracker
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -457,6 +458,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             f"KV cache transceiver | backend=NIXL | TX({tx_status}) | RX({rx_status}) | "
             f"waiting_for_peer_info={len(self._wait_reqs)}"
         )
+
+    def bind_execution_drain(self, drain: RequestDrainTracker) -> None:
+        """Track each native send/receive session through physical retirement."""
+        self._transfer_worker.bind_execution_drain(drain)
 
     def shutdown(self) -> None:
         shutdown_lock = getattr(self, "_shutdown_lock", None)

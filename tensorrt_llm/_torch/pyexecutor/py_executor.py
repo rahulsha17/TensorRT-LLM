@@ -4064,6 +4064,9 @@ class PyExecutor:
         try:
             self.async_transfer_manager.bind_execution_drain(
                 table.drain_tracker)
+            transceiver = getattr(self, 'kv_cache_transceiver', None)
+            if transceiver is not None:
+                transceiver.bind_execution_drain(table.drain_tracker)
         except Exception as error:
             guard.execution_failed(error)
             raise

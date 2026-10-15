@@ -91,8 +91,21 @@ def _batch(*requests, context=False):
     return batch
 
 
-@pytest.mark.parametrize("binding_fails", [False, True])
-def test_authority_installation_binds_transfer_drain_or_fails_closed(monkeypatch, binding_fails):
+@pytest.mark.parametrize(
+    "binding_failure,has_transceiver",
+    [
+        (None, False),
+        (None, True),
+        ("manager", False),
+        ("manager", True),
+        ("session", True),
+    ],
+)
+def test_authority_installation_binds_transfer_drain_or_fails_closed(
+    monkeypatch,
+    binding_failure,
+    has_transceiver,
+):
     table = WorkerVersionTable("session")
     tracker = RequestDrainTracker()
     guard = SimpleNamespace(
@@ -108,9 +121,13 @@ def test_authority_installation_binds_transfer_drain_or_fails_closed(monkeypatch
         "tensorrt_llm._torch.pyexecutor.execution_guard.ExecutionDeviceGuard", make_guard
     )
     transfers = Mock()
-    executor = SimpleNamespace(_execution_guard=None, async_transfer_manager=transfers)
-    if binding_fails:
-        transfers.bind_execution_drain.side_effect = RuntimeError("bind failed")
+    transceiver = Mock() if has_transceiver else None
+    executor = SimpleNamespace(
+        _execution_guard=None, async_transfer_manager=transfers, kv_cache_transceiver=transceiver
+    )
+    if binding_failure:
+        owner = transfers if binding_failure == "manager" else transceiver
+        owner.bind_execution_drain.side_effect = RuntimeError("bind failed")
         with pytest.raises(RuntimeError, match="bind failed"):
             PyExecutor.configure_execution_authority(executor, table)
         assert executor._execution_guard is None
@@ -122,6 +139,11 @@ def test_authority_installation_binds_transfer_drain_or_fails_closed(monkeypatch
         PyExecutor.configure_execution_authority(executor, table)
         guard.execution_failed.assert_not_called()
     transfers.bind_execution_drain.assert_called_once_with(tracker)
+    if transceiver is not None:
+        if binding_failure == "manager":
+            transceiver.bind_execution_drain.assert_not_called()
+        else:
+            transceiver.bind_execution_drain.assert_called_once_with(tracker)
 
 
 def test_residency_rpc_preserves_cache_namespace_and_page_tiers(monkeypatch) -> None:

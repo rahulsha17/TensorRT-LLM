@@ -25,7 +25,19 @@ import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
+from functools import partial
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    TypeVar,
+    Union,
+)
 
 import msgpack
 import numpy as np
@@ -84,6 +96,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
+from tensorrt_llm.execution_fence import RequestDrainTracker, RequestResourceClaim
 
 if TYPE_CHECKING:
     from .bounce import Config
@@ -2328,17 +2341,50 @@ class _SessionCleanup:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._error: Optional[Exception] = None
+        self._drain: Optional[RequestDrainTracker] = None
+        self._claim: Optional[RequestResourceClaim] = None
+        self._finished = False
+        self._released = False
+
+    def bind_claim(self, drain: RequestDrainTracker, claim: RequestResourceClaim) -> None:
+        """Attach a pre-acquired claim, including when close won the race."""
+        with self._lock:
+            try:
+                if self._claim is not None:
+                    raise RuntimeError("KV session already has an execution claim")
+                if self._error is not None:
+                    raise RuntimeError("KV session cleanup is unproven") from self._error
+                self._drain, self._claim = drain, claim
+                self._release_claim()
+            except Exception as error:
+                self._error = error
+                drain.fail(error)
+                if self._drain is not None:
+                    self._drain.fail(error)
+                raise
+
+    def _release_claim(self) -> None:
+        if self._finished and self._claim is not None and not self._released:
+            assert self._drain is not None
+            self._drain.release_resource(self._claim)
+            self._released = True
 
     def run(self, cleanup: Callable[[], bool]) -> bool:
         with self._lock:
             if self._error is not None:
                 raise RuntimeError("KV session cleanup is unproven") from self._error
             try:
-                return cleanup()
+                finished = cleanup()
+                if finished:
+                    self._finished = True
+                    self._release_claim()
+                return finished
             except Exception as error:
                 # A slot release or unregister may have taken effect before
                 # raising. Retrying it cannot establish safe ownership.
                 self._error = error
+                if self._drain is not None:
+                    self._drain.fail(error)
                 raise
 
 
@@ -4540,9 +4586,15 @@ class TransferWorkerConfig:
     agent_bounce_params: Optional[Dict[str, str]] = None
 
 
+_SessionT = TypeVar("_SessionT", TxSession, RxSession)
+
+
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
         self._config = config
+        self._execution_session_lock = threading.Lock()
+        self._execution_drain: Optional[RequestDrainTracker] = None
+        self._sessions_started = False
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
             if not config.enforce_physical_ownership:
@@ -4589,31 +4641,88 @@ class TransferWorker:
         self._rank_info.sender_endpoints = endpoints
         self._rank_info.layer_num_per_pp = layer_num_per_pp
 
+    def bind_execution_drain(self, drain: RequestDrainTracker) -> None:
+        """Bind before session admission; only physical retirement can prove FENCE."""
+        if not isinstance(drain, RequestDrainTracker):
+            raise TypeError("execution drain must be a RequestDrainTracker")
+        with self._execution_session_lock:
+            if self._execution_drain is drain:
+                return
+            if self._execution_drain is not None or self._sessions_started:
+                raise RuntimeError("cannot change KV execution drain after session admission")
+            if not self._config.enforce_physical_ownership or self._retirement_watchdog is None:
+                raise RuntimeError("KV execution drain requires physical ownership and retirement")
+            self._execution_drain = drain
+
+    def _create_session(
+        self,
+        request: LlmRequest,
+        direction: Literal["send", "receive"],
+        create: Callable[[], _SessionT],
+    ) -> _SessionT:
+        with self._execution_session_lock:
+            self._sessions_started = True
+            version = getattr(request, "py_execution_version", None)
+            if version is None:
+                return create()
+            drain = self._execution_drain
+            if drain is None:
+                raise RuntimeError("tagged KV session requires execution drain tracking")
+            try:
+                claim = drain.acquire_resource(
+                    request.py_request_id, version, f"kv-{direction}-session"
+                )
+                session = create()
+                if (
+                    not session._enforce_physical_ownership
+                    or session.request_id != claim.request_id
+                    or request.py_request_id != claim.request_id
+                    or request.py_execution_version != version
+                ):
+                    raise RuntimeError("KV session execution ownership changed during admission")
+                session._cleanup.bind_claim(drain, claim)
+                return session
+            except Exception as error:
+                # Construction may already have exposed a session to listener
+                # threads. Retain the claim even if no handle was returned.
+                drain.fail(error)
+                raise
+
     def create_tx_session(self, request: LlmRequest) -> TxSession:
         params = request.py_disaggregated_params
         assert params is not None
-        return TxSession(
-            request_id=request.py_request_id,
-            params=params,
-            sender=self._sender,
-            aux_buffer=self._aux_buffer,
-            timeout_s=self._config.tx_timeout_s,
-            prompt_len=request.prompt_len,
-            overall_timeout_s=self._config.tx_overall_timeout_s,
-            retirement_watchdog=getattr(self, "_retirement_watchdog", None),
+        return self._create_session(
+            request,
+            "send",
+            partial(
+                TxSession,
+                request_id=request.py_request_id,
+                params=params,
+                sender=self._sender,
+                aux_buffer=self._aux_buffer,
+                timeout_s=self._config.tx_timeout_s,
+                prompt_len=request.prompt_len,
+                overall_timeout_s=self._config.tx_overall_timeout_s,
+                retirement_watchdog=getattr(self, "_retirement_watchdog", None),
+            ),
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
         params = request.py_disaggregated_params
         assert params is not None
-        return RxSession(
-            request_id=request.py_request_id,
-            params=params,
-            receiver=self._receiver,
-            aux_buffer=self._aux_buffer,
-            timeout_s=self._config.rx_timeout_s,
-            prompt_len=request.prompt_len,
-            retirement_watchdog=getattr(self, "_retirement_watchdog", None),
+        return self._create_session(
+            request,
+            "receive",
+            partial(
+                RxSession,
+                request_id=request.py_request_id,
+                params=params,
+                receiver=self._receiver,
+                aux_buffer=self._aux_buffer,
+                timeout_s=self._config.rx_timeout_s,
+                prompt_len=request.prompt_len,
+                retirement_watchdog=getattr(self, "_retirement_watchdog", None),
+            ),
         )
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:

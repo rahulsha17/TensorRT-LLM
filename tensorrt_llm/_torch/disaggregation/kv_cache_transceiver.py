@@ -9,6 +9,7 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
+from tensorrt_llm.execution_fence import RequestDrainTracker
 from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
                                           CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
@@ -282,6 +283,11 @@ class KvCacheTransceiver(ABC):
     # may remain in flight indefinitely and the executor skips its
     # timeout/cancellation sweeps. Implementations must set this attribute.
     kv_transfer_timeout_ms: Optional[int]
+
+    def bind_execution_drain(self, drain: RequestDrainTracker) -> None:
+        """Bind request-version lifetime accounting before transfer admission."""
+        raise RuntimeError(
+            "this KV transceiver does not support execution drain tracking")
 
     @property
     def pipeline_transfer_enabled(self) -> bool:

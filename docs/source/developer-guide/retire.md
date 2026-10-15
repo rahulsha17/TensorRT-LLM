@@ -602,13 +602,23 @@ close cannot report success while those operations are running. If cleanup
 raises after a possible side effect, later close attempts keep failing and do
 not repeat that cleanup. A refusal because DMA or retirement is still pending
 can be retried once it drains. This makes successful close a usable lifetime
-boundary for resource claims; receive and pipelined-session claims are not yet
-wired into RETIRE.
+boundary for resource claims.
+
+The Python transfer worker takes a separate claim before constructing each tagged
+send or receive session. This includes early pipelined sends and receives that
+never enter the completed-context transfer manager. The claim uses the local
+request ID and its execution version, not the peer's transfer ID. It survives
+request cleanup and cancellation, then releases after session cleanup succeeds.
+Construction or cleanup uncertainty poisons drain; request-ID reuse cannot release
+a successor's claim. Binding requires physical ownership and a retirement
+watchdog and must happen before any session is admitted. Other transceivers
+reject this binding. These internal hooks do not enable disaggregated RETIRE.
 
 These claims account for resource lifetime; they do not publish authority or
 validate transferred content. End-to-end disaggregated RETIRE still needs shared
-authority across prefill and decode, version-bound transfer admission, receive
-ownership and prefix validation. Device guards continue to reject transfer and
+authority across prefill and decode, version-bound transfer admission and
+placement-aware prefix validation. Physical retirement must also be qualified for
+each supported layout and transport. Device guards continue to reject transfer and
 connector configurations until those paths are integrated and qualified.
 
 ## ALIGN (step 7)

@@ -966,6 +966,9 @@ def test_transfer_worker_passes_overall_timeout_to_tx_session(monkeypatch) -> No
         session_constructor,
     )
     worker = object.__new__(TransferWorker)
+    worker._execution_session_lock = threading.Lock()
+    worker._execution_drain = None
+    worker._sessions_started = False
     worker._config = TransferWorkerConfig(
         kv_cache_manager=Mock(),
         device_id=0,
