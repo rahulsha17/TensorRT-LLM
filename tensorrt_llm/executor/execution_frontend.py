@@ -46,6 +46,7 @@ class FrontendAuthorityGate:
         self._closed = False
         self._observed: dict[tuple[str, str], VersionUpdate] = {}
         self._active: dict[tuple[str, str], VersionUpdate] = {}
+        self._initial: dict[tuple[str, str], ExecutionVersion] = {}
         self._floors: dict[tuple[str, str], ExecutionVersion] = {}
         self._seals: dict[tuple[str, str, str], Revision] = {}
         self._gate = HostExecutionGate(self._lock, self._current_locked)
@@ -94,6 +95,26 @@ class FrontendAuthorityGate:
                 self._deadline = self._clock() + self._lease_seconds
             return self._heartbeat
 
+    def check_owner(self, owner: str | None = None) -> None:
+        """Check the bound owner without holding host authority across worker I/O."""
+        with self._lock:
+            self._require_live_locked(owner)
+
+    def declare(self, owner: str, version: ExecutionVersion) -> None:
+        """Establish a scope before asynchronous worker publication; do not admit work."""
+        if not isinstance(version, ExecutionVersion):
+            raise TypeError("scope declaration requires an execution version")
+        key = (version.tenant_id, version.scope_id)
+        with self._lock:
+            self._require_live_locked(owner)
+            observed = self._observed.get(key)
+            known = self._floors.get(key) or (
+                observed.version if observed is not None else self._initial.get(key)
+            )
+            if known is not None and known != version:
+                raise ValueError("scope declaration conflicts with known frontend authority")
+            self._initial.setdefault(key, version)
+
     def seal(self, owner: str, revision: Revision) -> Revision:
         """Revoke old host effects before the owner commits this revision.
 
@@ -113,7 +134,9 @@ class FrontendAuthorityGate:
                     raise ValueError("revision ID conflicts with an earlier frontend seal")
                 return previous
             observed = self._observed.get(key)
-            known = self._floors.get(key) or (None if observed is None else observed.version)
+            known = self._floors.get(key) or (
+                self._initial.get(key) if observed is None else observed.version
+            )
             if known != expected:
                 raise ValueError("frontend seal does not follow the known scope epoch")
             self._seals[seal_key] = revision
@@ -132,6 +155,11 @@ class FrontendAuthorityGate:
             if update.session_id != self.identity.session_id:
                 raise ValueError("publication belongs to another authority session")
             previous = self._observed.get(key)
+            initial = self._initial.get(key)
+            if previous is None and initial is not None and initial != update.version:
+                floor = self._floors.get(key)
+                if floor is None or not initial.epoch <= update.version.epoch <= floor.epoch:
+                    self._protocol_failure_locked("publication lacks a declared or sealed epoch")
             if previous is not None:
                 if update.sequence == previous.sequence:
                     if update != previous:

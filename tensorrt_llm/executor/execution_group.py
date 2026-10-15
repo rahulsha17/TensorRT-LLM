@@ -76,6 +76,7 @@ def create_shared_execution_controller(
                 or frontend._execution_controller is not None
                 or frontend._execution_version_table is not None
                 or frontend._execution_mailbox_server is not None
+                or frontend._execution_frontend_gate is not None
             ):
                 raise RuntimeError("shared authority must start before admission or worker binding")
 

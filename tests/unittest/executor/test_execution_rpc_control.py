@@ -121,92 +121,96 @@ def rpc_worker(submit):
 
 @pytest.mark.parametrize("version", [None, OLD])
 def test_worker_admission_error_reaches_frontend_over_real_rpc(frontend, version):
-    owner, _ = frontend
-    owner.get_execution_controller().register(OLD).wait()
+    with closing(frontend[0]):
+        owner, _ = frontend
+        owner.get_execution_controller().register(OLD).wait()
 
-    def reject(req):
-        assert req.id == 41 and req.execution_version == version
-        raise ValueError("worker admission rejected")
+        def reject(req):
+            assert req.id == 41 and req.execution_version == version
+            raise ValueError("worker admission rejected")
 
-    with rpc_worker(reject) as (client, acknowledgements):
-        owner.rpc_client = client
-        result = owner.submit(request(version))
-        error = result.queue.get(timeout=5)
-        assert isinstance(error, ErrorResponse)
-        assert "worker admission rejected" in error.error_msg
-        assert "Worker traceback:" in error.error_msg
-        assert acknowledgements[0].done()
-        # Queue delivery precedes terminal cleanup under this lock.
-        with owner._execution_control_lock:
-            assert owner._results == {}
-            if result._execution is not None:
-                assert result._execution._wake is None
+        with rpc_worker(reject) as (client, acknowledgements):
+            owner.rpc_client = client
+            result = owner.submit(request(version))
+            error = result.queue.get(timeout=5)
+            assert isinstance(error, ErrorResponse)
+            assert "worker admission rejected" in error.error_msg
+            assert "Worker traceback:" in error.error_msg
+            assert acknowledgements[0].done()
+            # Queue delivery precedes terminal cleanup under this lock.
+            with owner._execution_control_lock:
+                assert owner._results == {}
+                if result._execution is not None:
+                    assert result._execution._wake is None
 
 
 @pytest.mark.parametrize("version", [None, OLD])
 def test_admission_ack_is_serializable_and_does_not_complete_request(frontend, version):
-    owner, _ = frontend
-    owner.get_execution_controller().register(OLD).wait()
-    worker_handle = Lock()  # A worker-local result must never be sent over RPC.
-    with rpc_worker(lambda req: worker_handle) as (client, acknowledgements):
-        owner.rpc_client = client
-        result = owner.submit(request(version))
-        assert acknowledgements[0].result(5) is None
-        assert result.queue.empty()
-        assert owner._results[41] is result
-        if result._execution is not None:
-            assert result._execution._wake is not None
-        owner.handle_responses([ErrorResponse(41, "ordinary terminal response", 9)])
-        assert result.queue.get(timeout=5).error_msg == "ordinary terminal response"
+    with closing(frontend[0]):
+        owner, _ = frontend
+        owner.get_execution_controller().register(OLD).wait()
+        worker_handle = Lock()  # A worker-local result must never be sent over RPC.
+        with rpc_worker(lambda req: worker_handle) as (client, acknowledgements):
+            owner.rpc_client = client
+            result = owner.submit(request(version))
+            assert acknowledgements[0].result(5) is None
+            assert result.queue.empty()
+            assert owner._results[41] is result
+            if result._execution is not None:
+                assert result._execution._wake is not None
+            owner.handle_responses([ErrorResponse(41, "ordinary terminal response", 9)])
+            assert result.queue.get(timeout=5).error_msg == "ordinary terminal response"
 
 
 def test_delayed_real_rpc_admission_does_not_block_revision(frontend):
-    owner, table = frontend
-    control = owner.get_execution_controller()
-    control.register(OLD).wait()
-    entered, release = Event(), Event()
+    with closing(frontend[0]):
+        owner, table = frontend
+        control = owner.get_execution_controller()
+        control.register(OLD).wait()
+        entered, release = Event(), Event()
 
-    def admit(req):
-        entered.set()
-        assert release.wait(5)
-        with table.admission(req.execution_version):
-            raise AssertionError("stale request must not be admitted")
+        def admit(req):
+            entered.set()
+            assert release.wait(5)
+            with table.admission(req.execution_version):
+                raise AssertionError("stale request must not be admitted")
 
-    with rpc_worker(admit) as (client, acknowledgements):
-        owner.rpc_client = client
-        try:
-            result = owner.submit(request())
-            assert entered.wait(5)
-            control.advance(REVISION).publication.wait()
-            assert not acknowledgements[0].done()
-            assert isinstance(result.queue.get(timeout=5), ExecutionAuthorityError)
-        finally:
-            release.set()
-        finished = Event()
-        acknowledgements[0].add_done_callback(lambda _: finished.set())
-        assert finished.wait(5)
-        assert acknowledgements[0].exception() is not None
-        assert owner._results == {}
-        assert result.queue.empty()
+        with rpc_worker(admit) as (client, acknowledgements):
+            owner.rpc_client = client
+            try:
+                result = owner.submit(request())
+                assert entered.wait(5)
+                control.advance(REVISION).publication.wait()
+                assert not acknowledgements[0].done()
+                assert isinstance(result.queue.get(timeout=5), ExecutionAuthorityError)
+            finally:
+                release.set()
+            finished = Event()
+            acknowledgements[0].add_done_callback(lambda _: finished.set())
+            assert finished.wait(5)
+            assert acknowledgements[0].exception() is not None
+            assert owner._results == {}
+            assert result.queue.empty()
 
 
 @pytest.mark.parametrize("version", [None, OLD])
 def test_late_admission_error_does_not_reach_replacement_result(frontend, version):
-    owner, _ = frontend
-    owner.get_execution_controller().register(OLD).wait()
-    old_result = owner.submit(request(version))
-    old_ack = owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value
-    owner.handle_responses([ErrorResponse(41, "request ended", 9)])
-    assert old_result.queue.get_nowait().error_msg == "request ended"
+    with closing(frontend[0]):
+        owner, _ = frontend
+        owner.get_execution_controller().register(OLD).wait()
+        old_result = owner.submit(request(version))
+        old_ack = owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value
+        owner.handle_responses([ErrorResponse(41, "request ended", 9)])
+        assert old_result.queue.get_nowait().error_msg == "request ended"
 
-    owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value = Future()
-    replacement = owner.submit(request(version))
-    old_ack.set_exception(ValueError("late admission error"))
-    assert old_result.queue.empty()
-    assert replacement.queue.empty()
-    assert owner._results[41] is replacement
-    if replacement._execution is not None:
-        assert replacement._execution._wake is not None
+        owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value = Future()
+        replacement = owner.submit(request(version))
+        old_ack.set_exception(ValueError("late admission error"))
+        assert old_result.queue.empty()
+        assert replacement.queue.empty()
+        assert owner._results[41] is replacement
+        if replacement._execution is not None:
+            assert replacement._execution._wake is not None
 
 
 def test_rpc_bootstrap_is_lazy_and_uses_dedicated_authenticated_mailbox(frontend):

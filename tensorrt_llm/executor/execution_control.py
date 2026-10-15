@@ -21,6 +21,9 @@ from .execution_mailbox import ExecutionMailboxServer, IpcPublicationTransport
 __all__ = ["ExecutionControlMixin", "ProxyExecutionControlMixin", "WorkerExecutionControlMixin"]
 
 if TYPE_CHECKING:
+    from .execution_frontend import FrontendAuthorityGate
+    from .execution_frontend_ipc import FrontendAuthorityServer
+    from .execution_member import ExecutionMemberEndpoint, MemberPublicationServer
     from .result import GenerationResult
 
 
@@ -37,6 +40,11 @@ class ExecutionControlMixin:
         self._execution_shared = False
         self._execution_version_table: WorkerVersionTable | None = None
         self._execution_mailbox_server: ExecutionMailboxServer | None = None
+        self._execution_frontend_gate: FrontendAuthorityGate | None = None
+        self._execution_frontend_server: FrontendAuthorityServer | None = None
+        self._execution_member_server: MemberPublicationServer | None = None
+        self._execution_member_endpoint: ExecutionMemberEndpoint | None = None
+        self._execution_member_bind_host: str | None = None
 
     def get_execution_controller(self) -> ExecutionController:
         """Get host authority for an explicitly supported executor topology.
@@ -48,6 +56,10 @@ class ExecutionControlMixin:
         """
         with self._execution_control_lock:
             self._require_execution_control_open()
+            if self._execution_frontend_gate is not None:
+                raise RuntimeError(
+                    "execution authority is owned by the external runtime controller"
+                )
             if self._execution_controller is None:
                 self._execution_controller = self._create_execution_controller()
             return self._execution_controller
@@ -59,6 +71,8 @@ class ExecutionControlMixin:
             ) from self._execution_control_error
         if self._execution_control_closed or self.doing_shutdown:
             raise RuntimeError("executor execution control is closed")
+        if self._execution_frontend_gate is not None and self._execution_frontend_gate.closed:
+            raise RuntimeError("remote execution authority is closed; restart required")
         if (
             self._execution_shared
             and self._execution_controller is not None
@@ -79,9 +93,15 @@ class ExecutionControlMixin:
         with self._execution_control_lock:
             self._require_execution_control_open()
             if version is None:
+                if self._execution_frontend_gate is not None:
+                    self._execution_frontend_gate.check_owner()
                 self._execution_submit_started = True
                 return nullcontext(None)
-            owner = self._execution_controller or self._execution_version_table
+            owner = (
+                self._execution_frontend_gate
+                or self._execution_controller
+                or self._execution_version_table
+            )
             if owner is None:
                 raise ExecutionAuthorityError(
                     "register execution authority before submitting tagged work"
@@ -105,12 +125,22 @@ class ExecutionControlMixin:
             controller = self._execution_controller
             server = self._execution_mailbox_server
             table = self._execution_version_table
-        if controller is not None:
-            controller.close()
-        if server is not None:
-            server.close()
-        elif table is not None:
-            table.close()
+            host_server = self._execution_frontend_server
+            member_server = self._execution_member_server
+        closers = []
+        for component in (host_server, member_server, controller, server):
+            if component is not None:
+                closers.append(component.close)
+        if server is None and table is not None:
+            closers.append(table.close)
+        errors = []
+        for close in closers:
+            try:
+                close()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise RuntimeError("execution control teardown did not complete") from errors[0]
 
 
 class WorkerExecutionControlMixin:

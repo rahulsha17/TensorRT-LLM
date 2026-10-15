@@ -291,38 +291,78 @@ disaggregated RETIRE. Existing transfer and connector guards remain in place.
 ALIGN currently reserves on every member and uses the shortest common prefix.
 Destination-specific ALIGN, version-bound transfer messages and transfer
 qualification are still required before prefill/decode transfer can be enabled.
-Frontends in separate runtime processes also need an external owner/admission
-protocol; they cannot independently create controllers with the same epoch and
-claim one shared authority.
+For frontends in separate runtime processes, use the external owner described
+below. Independent local controllers with matching epochs are separate authorities.
 
 ### Frontend control across processes
 
-`FrontendAuthorityGate` and `FrontendAuthorityServer` provide the internal host
-side of that protocol. The server has its own authenticated channel and lease
-loop, separate from worker publication and GPU drain. Its identity includes the
-authority session and a unique frontend lifetime. A replacement process cannot
-accept messages for the previous lifetime.
+The runtime prepares each frontend, collects the descriptors through its
+authenticated bootstrap, and creates one owner:
 
-The intended order is: seal every frontend, accept ADVANCE at the owner, publish
+```python
+# Run in each frontend process before any request admission. Use the same fresh
+# session_id, chosen by the runtime. For another host, supply its concrete IPv4
+# address as bind_host so the owner can reach the two control listeners.
+from tensorrt_llm.executor.execution_member import prepare_execution_member
+
+member = prepare_execution_member(executor, session_id)
+
+# Run in the runtime process after collecting every member descriptor.
+from tensorrt_llm.executor.execution_remote import create_remote_execution_controller
+
+controller = create_remote_execution_controller(tuple(member_descriptors))
+controller.register(initial_version).wait()
+```
+
+The returned controller has the same `advance`, `align`, and `resume` methods as
+a local owner. Each prepared executor uses its remote frontend gate for admission
+and result delivery. Calling `get_execution_controller()` on that executor raises
+an error; it cannot silently create another owner. Exact preparation retries
+return the existing descriptor. Membership is fixed, and bootstrap rejects two
+frontends that report the same worker table, including nested worker groups.
+
+Each frontend has two authenticated listeners: one for host authority and one
+that forwards publication, FENCE and ALIGN to its existing workers. Worker
+connections stay on their own listener thread. A blocked worker call therefore
+cannot prevent host sealing or lease expiry. Endpoint identity includes the
+authority session and a unique frontend lifetime. A replacement process cannot
+accept messages for the previous lifetime. Keep the descriptor's authentication
+keys inside the trusted runtime control plane.
+
+The order is: seal every frontend, accept ADVANCE at the owner, publish
 to workers, complete FENCE and ALIGN, then activate the acknowledged RESUME.
 Sealing immediately rejects old admission and output and wakes old consumers.
 It does not wait for a worker and does not certify that GPU or transfer access
 has stopped. A canceled request can still have resource claims keeping FENCE
-pending.
+pending. The owner validates the expected epoch and revision ID before sealing,
+then repeats the registry CAS after every seal ACK. Invalid or historical
+revisions do not seal the current epoch again. A scope is declared before its
+initial worker publication, so it can be revised while that publication is still
+in flight.
 
 Observation alone cannot admit a successor. Activation must name the exact
 observed publication, and a revised scope requires RESUME. Duplicate seals and
 delayed activations cannot restore an older epoch. Each endpoint binds one owner
 incarnation; fresh heartbeat sequences renew its lease. Replayed heartbeats do
-not extend it. Expiry closes host authority permanently and wakes consumers;
-it never releases KV memory.
+not extend it. The default lease is 30 seconds with a five-second control timeout.
+Heartbeats run independently of publication and renew all frontends in parallel.
+Expiry closes host authority permanently and wakes consumers; it never releases
+KV memory. Losing a member fails the owner and closes the reachable host gates.
+An unreachable frontend relies on its lease; owner loss is not instantaneous
+across a network partition.
 
-These are internal building blocks, tested over real IPC and separately spawned
-processes. They are **not yet wired into executor admission or an external
-authority coordinator**. That integration must validate fixed membership, seal
-all frontends before accepting a revision, activate only after every worker ACK,
-and handle partial failure without reopening old authority. Existing transfer
-and connector guards remain enabled. Host endpoint tests do not qualify GPU
+On partial sealing or host activation failure, the owner closes authority and
+fails outstanding waits. It never rolls back to the old epoch. A newer revision
+may overtake an in-flight RESUME; the delayed activation cannot reopen that
+successor. Normal shutdown closes the controller and each executor. Recovery
+requires a fresh runtime session and worker teardown: closing host authority or
+waiting for its lease is not proof of safe physical reclamation.
+
+The control path is tested over real IPC and separately spawned processes with
+worker version tables, drain tracking and ALIGN reservations. It preserves the
+existing supported executor topologies. Common-prefix ALIGN still reserves on
+every worker; destination-specific transfer remains separate work. Existing
+transfer and connector guards remain enabled. Host tests do not qualify GPU
 execution or disaggregated KV transfer.
 
 ### Coordinating model execution

@@ -145,23 +145,43 @@ class ScopeRegistry:
             raise TypeError("revision must be a Revision")
         expected = revision.expected_version
         with self._lock:
+            previous = self._check_advance_locked(revision)
+            if previous is not None:
+                return previous
             record = self._get_record(expected.tenant_id, expected.scope_id)
-            receipt = record.receipts.get(revision.revision_id)
-            if receipt is not None:
-                if receipt.revision != revision:
-                    raise ValueError("revision_id conflicts with an accepted revision")
-                return receipt
-            if record.snapshot.current_version != expected:
-                raise ValueError(
-                    f"expected epoch {expected.epoch}, "
-                    f"but current epoch is {record.snapshot.current_version.epoch}"
-                )
             receipt = AdvanceReceipt(revision)
             snapshot = ScopeSnapshot(revision.successor_version, pending_revision=revision)
             record.receipts[revision.revision_id] = receipt
             # The authority and pending successor change together under the lock.
             record.snapshot = snapshot
             return receipt
+
+    def check_advance(self, revision: Revision) -> AdvanceReceipt | None:
+        """Validate without accepting; return a receipt only for an exact historical retry.
+
+        This is not an admission permit or a reservation. A remote coordinator
+        serializes its mutations, validates here, seals every frontend, and then
+        calls advance(), which repeats the CAS under the registry lock.
+        """
+        if not isinstance(revision, Revision):
+            raise TypeError("revision must be a Revision")
+        with self._lock:
+            return self._check_advance_locked(revision)
+
+    def _check_advance_locked(self, revision: Revision) -> AdvanceReceipt | None:
+        expected = revision.expected_version
+        record = self._get_record(expected.tenant_id, expected.scope_id)
+        previous = record.receipts.get(revision.revision_id)
+        if previous is not None:
+            if previous.revision != revision:
+                raise ValueError("revision_id conflicts with an accepted revision")
+            return previous
+        if record.snapshot.current_version != expected:
+            raise ValueError(
+                f"expected epoch {expected.epoch}, "
+                f"but current epoch is {record.snapshot.current_version.epoch}"
+            )
+        return None
 
     def resume(self, revision: Revision) -> ScopeSnapshot:
         """Clear pending state after the controller validates worker RESUME acknowledgement."""

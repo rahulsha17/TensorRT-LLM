@@ -615,24 +615,32 @@ class ExecutionController:
         """Read accepted authority, including when publication has failed."""
         return self._registry.snapshot(tenant_id, scope_id)
 
-    def close(self) -> None:
-        """Fail outstanding waits and stop the publisher before releasing the transport."""
+    def fail(self, error: Exception) -> None:
+        """Revoke authority and fail waits without joining the publisher thread.
+
+        Transport and liveness callbacks may use this while publication is in
+        flight. Executor shutdown still calls close() to join the publisher.
+        """
+        if not isinstance(error, Exception):
+            raise TypeError("execution failure requires an exception")
         with self._lock:
             if not self._stop.is_set():
                 self._stop.set()
                 self._gate.close_locked()
                 for publication in self._pending:
-                    publication._future.set_exception(
-                        RuntimeError("execution controller is closed")
-                    )
+                    publication._future.set_exception(error)
                 self._pending.clear()
                 for fence in self._pending_fences.values():
-                    fence._future.set_exception(RuntimeError("execution controller is closed"))
+                    fence._future.set_exception(error)
                 self._pending_fences.clear()
                 for aligned in self._pending_alignments.values():
-                    aligned._future.set_exception(RuntimeError("execution controller is closed"))
+                    aligned._future.set_exception(error)
                 self._pending_alignments.clear()
                 self._queue.put(None)
+
+    def close(self) -> None:
+        """Fail outstanding waits and stop the publisher before releasing the transport."""
+        self.fail(RuntimeError("execution controller is closed"))
         self._thread.join(timeout=5)
         if self._thread.is_alive():
             raise RuntimeError("execution publisher did not stop")

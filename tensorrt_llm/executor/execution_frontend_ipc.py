@@ -21,16 +21,49 @@ from uuid import uuid4
 
 import zmq
 
+from ..execution_alignment import AlignmentReceipt, AlignmentRequest
 from ..execution_authority import Revision
+from ..execution_fence import FenceReceipt, FenceRequest
 from ..execution_mailbox import PublicationReceipt, VersionUpdate, WorkerIdentity
+from ..execution_version import ExecutionVersion
 from .execution_frontend import FrontendAuthorityGate
 from .ipc import IpcQueue
 
 __all__ = ["FrontendAuthorityEndpoint", "FrontendAuthorityServer", "FrontendAuthorityClient"]
 
-_Operation = Literal["bind", "renew", "seal", "observe", "activate", "release"]
-_Argument = float | int | Revision | VersionUpdate | None
-_Value = PublicationReceipt | Revision | bool | int | None
+_Operation = Literal[
+    "bind",
+    "renew",
+    "declare",
+    "seal",
+    "observe",
+    "activate",
+    "release",
+    "describe",
+    "publish",
+    "fence",
+    "alignment",
+]
+_Argument = (
+    float
+    | int
+    | Revision
+    | VersionUpdate
+    | ExecutionVersion
+    | FenceRequest
+    | AlignmentRequest
+    | None
+)
+_Value = (
+    PublicationReceipt
+    | Revision
+    | FenceReceipt
+    | AlignmentReceipt
+    | tuple[WorkerIdentity, ...]
+    | bool
+    | int
+    | None
+)
 
 
 @dataclass(frozen=True)
@@ -101,14 +134,21 @@ class FrontendAuthorityClient:
         if self._exchange("bind", _timeout(lease_seconds)) is not None:
             raise ValueError("invalid frontend binding acknowledgement")
 
-    def renew(self, sequence: int) -> int:
+    def renew(self, sequence: int, *, stop: Event | None = None) -> int:
         """Send a monotonically increasing heartbeat; duplicate sequences do not renew."""
         if type(sequence) is not int or sequence <= 0:
             raise ValueError("heartbeat sequence must be a positive integer")
-        value = self._exchange("renew", sequence)
+        value = self._exchange("renew", sequence, stop=stop)
         if type(value) is not int or value < sequence:
             raise ValueError("invalid frontend heartbeat acknowledgement")
         return value
+
+    def declare(self, version: ExecutionVersion) -> None:
+        """Establish a scope before publication without opening admission."""
+        if not isinstance(version, ExecutionVersion):
+            raise TypeError("scope declaration requires an execution version")
+        if self._exchange("declare", version) is not None:
+            raise ValueError("invalid frontend declaration acknowledgement")
 
     def seal(self, revision: Revision) -> Revision:
         """Wait for old host effects to be revoked at this member only."""
@@ -142,7 +182,9 @@ class FrontendAuthorityClient:
         if self._exchange("release") is not None:
             raise ValueError("invalid frontend release acknowledgement")
 
-    def _exchange(self, operation: _Operation, argument: _Argument = None) -> _Value:
+    def _exchange(
+        self, operation: _Operation, argument: _Argument = None, *, stop: Event | None = None
+    ) -> _Value:
         command = _Command(self._endpoint.identity, self._owner, uuid4().hex, operation, argument)
         queue = IpcQueue(
             self._endpoint.address,
@@ -156,6 +198,8 @@ class FrontendAuthorityClient:
         deadline = monotonic() + self._timeout
         try:
             while monotonic() < deadline:
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("frontend authority exchange stopped")
                 try:
                     queue.put_nowait(command)
                     break
@@ -163,6 +207,8 @@ class FrontendAuthorityClient:
                     # Bound both connection setup and acknowledgement waits.
                     queue.socket.poll(timeout=1, flags=zmq.POLLOUT)
             while (remaining := deadline - monotonic()) > 0:
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("frontend authority exchange stopped")
                 try:
                     reply = queue.get(timeout=min(remaining, 0.05))
                 except Empty:
@@ -223,7 +269,12 @@ class FrontendAuthorityServer:
     def _dispatch(self, command: _Command) -> _Value:
         if command.identity != self._gate.identity:
             raise ValueError("command belongs to a different frontend lifetime")
-        if not isinstance(command.owner, str) or not command.owner or not command.request_id:
+        if (
+            not isinstance(command.owner, str)
+            or not command.owner
+            or not isinstance(command.request_id, str)
+            or not command.request_id
+        ):
             raise ValueError("command requires an owner incarnation and request identity")
         owner, argument = command.owner, command.argument
         if command.operation == "bind":
@@ -234,6 +285,10 @@ class FrontendAuthorityServer:
             if type(argument) is not int:
                 raise TypeError("heartbeat requires an integer sequence")
             return self._gate.renew(owner, argument)
+        elif command.operation == "declare":
+            if not isinstance(argument, ExecutionVersion):
+                raise TypeError("scope declaration requires an execution version")
+            self._gate.declare(owner, argument)
         elif command.operation == "seal":
             if not isinstance(argument, Revision):
                 raise TypeError("seal requires a revision")
