@@ -4,7 +4,7 @@
 
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from threading import Barrier, Condition, Event, RLock
 from types import SimpleNamespace
@@ -83,6 +83,9 @@ class Frontend(ExecutionControlMixin):
     def _create_execution_controller(self):
         return bootstrap.create_execution_cohort(self, self.call_all, self.abort)
 
+    def close(self):
+        self._shutdown_execution_control()
+
 
 @pytest.fixture
 def frontend():
@@ -92,20 +95,21 @@ def frontend():
 
 
 def test_bootstrap_attaches_all_distinct_workers_once(frontend):
-    controller = frontend.get_execution_controller()
-    assert frontend.get_execution_controller() is controller
-    assert len(controller._transport.participants) == 2
-    assert frontend.call_all.call_args_list[0].args == (
-        "inspect_execution_bootstrap",
-        (frontend._execution_session_id, 2),
-        30.0,
-    )
-    assert frontend.call_all.call_args_list[1].args == (
-        "start_execution_bootstrap",
-        (frontend._execution_session_id, 2),
-        90.0,
-    )
-    frontend.abort.assert_not_called()
+    with closing(frontend):
+        controller = frontend.get_execution_controller()
+        assert frontend.get_execution_controller() is controller
+        assert len(controller._transport.participants) == 2
+        assert frontend.call_all.call_args_list[0].args == (
+            "inspect_execution_bootstrap",
+            (frontend._execution_session_id, 2),
+            30.0,
+        )
+        assert frontend.call_all.call_args_list[1].args == (
+            "start_execution_bootstrap",
+            (frontend._execution_session_id, 2),
+            90.0,
+        )
+        frontend.abort.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -141,9 +145,10 @@ def test_late_bootstrap_is_rejected_even_after_untagged_admission(frontend):
 
 
 def test_unregistered_tag_does_not_prevent_initial_bootstrap(frontend):
-    with pytest.raises(ExecutionAuthorityError):
-        frontend._execution_admission(VERSION)
-    assert frontend.get_execution_controller() is not None
+    with closing(frontend):
+        with pytest.raises(ExecutionAuthorityError):
+            frontend._execution_admission(VERSION)
+        assert frontend.get_execution_controller() is not None
 
 
 @pytest.mark.parametrize("fault", ["missing", "rank", "worker", "type"])
@@ -193,40 +198,41 @@ def test_partial_bootstrap_permanently_closes_all_frontend_admission(frontend, f
 
 @pytest.mark.parametrize("failure", [False, True])
 def test_untagged_admission_waits_for_complete_bootstrap(frontend, failure):
-    entered, release, attempting, admitted = Event(), Event(), Event(), Event()
+    with closing(frontend):
+        entered, release, attempting, admitted = Event(), Event(), Event(), Event()
 
-    def rpc(method, args, timeout):
-        if method == "inspect_execution_bootstrap":
-            return frontend.infos
-        entered.set()
-        assert release.wait(3)
-        if failure:
-            raise TimeoutError("bootstrap timed out")
-        return frontend.ready
+        def rpc(method, args, timeout):
+            if method == "inspect_execution_bootstrap":
+                return frontend.infos
+            entered.set()
+            assert release.wait(3)
+            if failure:
+                raise TimeoutError("bootstrap timed out")
+            return frontend.ready
 
-    def submit():
-        attempting.set()
-        with frontend._execution_admission(None):
-            admitted.set()
+        def submit():
+            attempting.set()
+            with frontend._execution_admission(None):
+                admitted.set()
 
-    frontend.call_all.side_effect = rpc
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        setup = pool.submit(frontend.get_execution_controller)
-        assert entered.wait(3)
-        ingress = pool.submit(submit)
-        assert attempting.wait(3)
-        assert not admitted.wait(0.05)
-        release.set()
-        if failure:
-            with pytest.raises(TimeoutError):
+        frontend.call_all.side_effect = rpc
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            setup = pool.submit(frontend.get_execution_controller)
+            assert entered.wait(3)
+            ingress = pool.submit(submit)
+            assert attempting.wait(3)
+            assert not admitted.wait(0.05)
+            release.set()
+            if failure:
+                with pytest.raises(TimeoutError):
+                    setup.result(timeout=3)
+                with pytest.raises(RuntimeError, match="restart required"):
+                    ingress.result(timeout=3)
+                assert not admitted.is_set()
+            else:
                 setup.result(timeout=3)
-            with pytest.raises(RuntimeError, match="restart required"):
                 ingress.result(timeout=3)
-            assert not admitted.is_set()
-        else:
-            setup.result(timeout=3)
-            ingress.result(timeout=3)
-            assert admitted.is_set()
+                assert admitted.is_set()
 
 
 @pytest.mark.parametrize("size", [2, 4])

@@ -4,6 +4,7 @@
 
 import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import replace
 from queue import Queue
 from threading import Event
@@ -47,6 +48,9 @@ class Frontend(RpcExecutorMixin, ExecutionControlMixin):
         self._set_fatal_error = Mock()
         self._get_next_client_id = Mock(return_value=41)
 
+    def close(self):
+        self._shutdown_execution_control()
+
 
 def request(version=OLD):
     value = SimpleNamespace(id=None, execution_version=version, disaggregated_params=None)
@@ -79,15 +83,20 @@ def frontend(monkeypatch):
 
 
 def test_rpc_bootstrap_is_lazy_and_uses_dedicated_authenticated_mailbox(frontend):
-    owner, table = frontend
-    owner.rpc_client.start_execution_mailbox.assert_not_called()
-    control = owner.get_execution_controller()
-    assert control.register(OLD).wait().observed_version == OLD
-    assert table.current_version("tenant", "scope") == OLD
-    assert len(control._transport.participants) == 1
-    assert owner.get_execution_controller() is control
-    owner.rpc_client.start_execution_mailbox.assert_called_once_with(owner._execution_session_id)
-    owner.rpc_client.start_execution_mailbox.return_value.remote.assert_called_once_with(timeout=5)
+    with closing(frontend[0]):
+        owner, table = frontend
+        owner.rpc_client.start_execution_mailbox.assert_not_called()
+        control = owner.get_execution_controller()
+        assert control.register(OLD).wait().observed_version == OLD
+        assert table.current_version("tenant", "scope") == OLD
+        assert len(control._transport.participants) == 1
+        assert owner.get_execution_controller() is control
+        owner.rpc_client.start_execution_mailbox.assert_called_once_with(
+            owner._execution_session_id
+        )
+        owner.rpc_client.start_execution_mailbox.return_value.remote.assert_called_once_with(
+            timeout=5
+        )
 
 
 @pytest.mark.parametrize(
@@ -125,49 +134,52 @@ def test_missing_authority_rejects_tagged_rpc_before_sending(frontend):
 
 
 def test_pending_rpc_send_does_not_hold_authority_or_prevent_revoke(frontend):
-    owner, _ = frontend
-    control = owner.get_execution_controller()
-    control.register(OLD).wait()
-    result = owner.submit(request())
-    sent = owner.rpc_client.submit.return_value.remote_future.return_value
-    assert not sent.done()
-    owner.rpc_client.submit.return_value.remote.assert_not_called()
-    control.advance(REVISION).publication.wait()
-    with pytest.raises(ExecutionAuthorityError):
-        result._result_step(0.1)
-    assert not sent.done()
-    sent.set_result(None)
+    with closing(frontend[0]):
+        owner, _ = frontend
+        control = owner.get_execution_controller()
+        control.register(OLD).wait()
+        result = owner.submit(request())
+        sent = owner.rpc_client.submit.return_value.remote_future.return_value
+        assert not sent.done()
+        owner.rpc_client.submit.return_value.remote.assert_not_called()
+        control.advance(REVISION).publication.wait()
+        with pytest.raises(ExecutionAuthorityError):
+            result._result_step(0.1)
+        assert not sent.done()
+        sent.set_result(None)
 
 
 def test_immediate_async_send_failure_runs_callback_outside_authority(frontend):
-    owner, _ = frontend
-    control = owner.get_execution_controller()
-    control.register(OLD).wait()
-    failed = Future()
-    failed.set_exception(OSError("send failed"))
-    owner.rpc_client.submit.return_value.remote_future.return_value = failed
-    handle = owner.handle_responses
+    with closing(frontend[0]):
+        owner, _ = frontend
+        control = owner.get_execution_controller()
+        control.register(OLD).wait()
+        failed = Future()
+        failed.set_exception(OSError("send failed"))
+        owner.rpc_client.submit.return_value.remote_future.return_value = failed
+        handle = owner.handle_responses
 
-    def check_unlocked(responses):
-        assert not control._lock.locked()
-        handle(responses)
+        def check_unlocked(responses):
+            assert not control._lock.locked()
+            handle(responses)
 
-    owner.handle_responses = check_unlocked
-    result = owner.submit(request())
-    error = result.queue.get_nowait()
-    assert isinstance(error, ErrorResponse) and "send failed" in error.error_msg
-    assert owner._results == {}
-    assert result._execution._wake is None
+        owner.handle_responses = check_unlocked
+        result = owner.submit(request())
+        error = result.queue.get_nowait()
+        assert isinstance(error, ErrorResponse) and "send failed" in error.error_msg
+        assert owner._results == {}
+        assert result._execution._wake is None
 
 
 def test_cancelled_transport_future_reports_terminal_failure(frontend):
-    owner, _ = frontend
-    owner.get_execution_controller().register(OLD).wait()
-    result = owner.submit(request())
-    owner.rpc_client.submit.return_value.remote_future.return_value.cancel()
-    error = result.queue.get_nowait()
-    assert isinstance(error, ErrorResponse) and "cancelled" in error.error_msg
-    assert owner._results == {}
+    with closing(frontend[0]):
+        owner, _ = frontend
+        owner.get_execution_controller().register(OLD).wait()
+        result = owner.submit(request())
+        owner.rpc_client.submit.return_value.remote_future.return_value.cancel()
+        error = result.queue.get_nowait()
+        assert isinstance(error, ErrorResponse) and "cancelled" in error.error_msg
+        assert owner._results == {}
 
 
 def test_early_worker_reply_finds_result_registered_before_send(frontend):
@@ -184,40 +196,45 @@ def test_early_worker_reply_finds_result_registered_before_send(frontend):
 
 
 def test_synchronous_send_rejection_removes_result_and_host_hold(frontend):
-    owner, _ = frontend
-    control = owner.get_execution_controller()
-    control.register(OLD).wait()
-    owner.rpc_client.submit.return_value.remote_future.side_effect = RuntimeError("send rejected")
-    with pytest.raises(RuntimeError, match="send rejected"):
-        owner.submit(request())
-    assert owner._results == {}
-    assert not list(control._gate._executions)
+    with closing(frontend[0]):
+        owner, _ = frontend
+        control = owner.get_execution_controller()
+        control.register(OLD).wait()
+        owner.rpc_client.submit.return_value.remote_future.side_effect = RuntimeError(
+            "send rejected"
+        )
+        with pytest.raises(RuntimeError, match="send rejected"):
+            owner.submit(request())
+        assert owner._results == {}
+        assert not list(control._gate._executions)
 
 
 def test_stale_terminal_response_is_dropped_and_detaches_notifications(frontend):
-    owner, _ = frontend
-    control = owner.get_execution_controller()
-    control.register(OLD).wait()
-    result = owner.submit(request())
-    control.advance(REVISION).publication.wait()
-    assert isinstance(result.queue.get_nowait(), ExecutionAuthorityError)
-    owner.handle_responses([ErrorResponse(41, "late worker reply", 9)])
-    assert result.queue.empty() and owner._results == {}
-    assert result._execution._wake is None
-    with pytest.raises(ExecutionAuthorityError):
-        result._check_execution_authority()
+    with closing(frontend[0]):
+        owner, _ = frontend
+        control = owner.get_execution_controller()
+        control.register(OLD).wait()
+        result = owner.submit(request())
+        control.advance(REVISION).publication.wait()
+        assert isinstance(result.queue.get_nowait(), ExecutionAuthorityError)
+        owner.handle_responses([ErrorResponse(41, "late worker reply", 9)])
+        assert result.queue.empty() and owner._results == {}
+        assert result._execution._wake is None
+        with pytest.raises(ExecutionAuthorityError):
+            result._check_execution_authority()
 
 
 def test_unrelated_revision_preserves_result_delivery(frontend):
-    owner, _ = frontend
-    control = owner.get_execution_controller()
-    control.register(OLD).wait()
-    result = owner.submit(request())
-    other = replace(OLD, scope_id="other")
-    control.register(other).wait()
-    control.advance(Revision("other-edit", other, replace(other, epoch=8))).publication.wait()
-    owner.handle_responses([ErrorResponse(41, "current reply", 9)])
-    assert result.queue.get_nowait().error_msg == "current reply"
+    with closing(frontend[0]):
+        owner, _ = frontend
+        control = owner.get_execution_controller()
+        control.register(OLD).wait()
+        result = owner.submit(request())
+        other = replace(OLD, scope_id="other")
+        control.register(other).wait()
+        control.advance(Revision("other-edit", other, replace(other, epoch=8))).publication.wait()
+        owner.handle_responses([ErrorResponse(41, "current reply", 9)])
+        assert result.queue.get_nowait().error_msg == "current reply"
 
 
 def test_shutdown_revokes_pending_rpc_result(frontend):
@@ -336,30 +353,31 @@ def test_pending_transport_send_cannot_block_frontend_failure(frontend, version)
 
 @pytest.mark.parametrize("revoked", [False, True])
 def test_async_consumer_is_not_notified_for_dropped_rpc_response(frontend, monkeypatch, revoked):
-    owner, _ = frontend
-    control = owner.get_execution_controller()
-    control.register(OLD).wait()
-    result = owner.submit(request())
+    with closing(frontend[0]):
+        owner, _ = frontend
+        control = owner.get_execution_controller()
+        control.register(OLD).wait()
+        result = owner.submit(request())
 
-    class AsyncQueueBridge:
-        notify_many = Mock()
+        class AsyncQueueBridge:
+            notify_many = Mock()
 
-        def __init__(self):
-            self.loop = object()
-            self.put_nowait = Mock()
+            def __init__(self):
+                self.loop = object()
+                self.put_nowait = Mock()
 
-    monkeypatch.setattr("tensorrt_llm.executor.rpc_proxy_mixin._SyncQueue", AsyncQueueBridge)
-    bridge = AsyncQueueBridge()
-    result.queue = bridge
-    if revoked:
-        control.advance(REVISION).publication.wait()
-    response = ErrorResponse(41, "worker reply", 9)
-    owner.handle_responses([response])
-    if revoked:
-        bridge.put_nowait.assert_not_called()
-        bridge.notify_many.assert_not_called()
-    else:
-        bridge.put_nowait.assert_called_once_with(response)
-        bridge.notify_many.assert_called_once_with(bridge.loop, [bridge])
-    assert owner._results == {}
-    assert result._execution._wake is None
+        monkeypatch.setattr("tensorrt_llm.executor.rpc_proxy_mixin._SyncQueue", AsyncQueueBridge)
+        bridge = AsyncQueueBridge()
+        result.queue = bridge
+        if revoked:
+            control.advance(REVISION).publication.wait()
+        response = ErrorResponse(41, "worker reply", 9)
+        owner.handle_responses([response])
+        if revoked:
+            bridge.put_nowait.assert_not_called()
+            bridge.notify_many.assert_not_called()
+        else:
+            bridge.put_nowait.assert_called_once_with(response)
+            bridge.notify_many.assert_called_once_with(bridge.loop, [bridge])
+        assert owner._results == {}
+        assert result._execution._wake is None
