@@ -4,7 +4,7 @@
 
 import os
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -20,7 +20,12 @@ from ...execution_mailbox import WorkerVersionTable
 from ...execution_version import ExecutionVersion
 from .execution_alignment import KVAlignmentAdapter
 from .execution_device import DeviceExecutionAuthority
-from .execution_early_exit import early_exit_scope, execution_trace_enabled, trace_execution
+from .execution_early_exit import (
+    ExecutionEarlyExit,
+    early_exit_scope,
+    execution_trace_enabled,
+    trace_execution,
+)
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .sampler import SampleStateTorch, TorchSampler
@@ -233,36 +238,51 @@ class ExecutionDeviceGuard:
         Host observation precedes device publication. No GPU readback is needed
         to reject an obsolete admission; GPU authority independently gates tokens.
         """
-        versions = [request.py_execution_version for request in requests]
-        if self._rank_consensus is None and not any(version is not None for version in versions):
+        if self._rank_consensus is None and not any(
+            request.py_execution_version is not None for request in requests
+        ):
             return []
-        with self.table.guard_versions(versions) as allowed:
+        with ExitStack() as authority:
+            with self._preparing_step("schedule"):
+                versions = [request.py_execution_version for request in requests]
+                allowed = authority.enter_context(self.table.guard_versions(versions))
             allowed = self._coordinate("schedule", requests, allowed)
-            obsolete = [request for request, accepted in zip(requests, allowed) if not accepted]
-            for request in obsolete:
-                self._cancel(request)
+            with self._completing_step("schedule_done", requests):
+                obsolete = [request for request, accepted in zip(requests, allowed) if not accepted]
+                for request in obsolete:
+                    self._cancel(request)
             return obsolete
 
     def _coordinate(
-        self, phase: str, requests: list[LlmRequest], allowed: list[bool] | tuple[bool, ...]
+        self,
+        phase: str,
+        requests: list[LlmRequest],
+        allowed: list[bool] | tuple[bool, ...],
+        *,
+        local_error: Exception | None = None,
     ) -> tuple[bool, ...]:
         """Agree before changing logical progress; physical allocation stays rank-local."""
         if self._rank_consensus is None:
+            if local_error is not None:
+                raise local_error
             return tuple(allowed)
         rows = ()
-        local_error = None
         try:
-            rows = tuple(
-                ExecutionRow(
-                    request.py_request_id,
-                    request.py_execution_version,
-                    request.get_num_tokens(0),
-                    request.context_current_position,
-                    request.context_chunk_size,
-                    request.state.name,
+            snapshot = []
+            for request in requests:
+                token_count = request.get_num_tokens(0)
+                snapshot.append(
+                    ExecutionRow(
+                        request.py_request_id,
+                        request.py_execution_version,
+                        token_count,
+                        request.context_current_position,
+                        request.context_chunk_size if request.is_context_init_state else 0,
+                        request.state.name,
+                        request.get_token(0, token_count - 1) if token_count else None,
+                    )
                 )
-                for request in requests
-            )
+            rows = tuple(snapshot)
         except Exception as error:
             local_error = error
         try:
@@ -273,6 +293,39 @@ class ExecutionDeviceGuard:
             raise
 
     @contextmanager
+    def _preparing_step(self, phase: str) -> Iterator[None]:
+        """Report failed local preparation at the vote peers are about to enter."""
+        try:
+            yield
+        except Exception as error:
+            self._coordinate(phase, [], [], local_error=error)
+            raise
+
+    @contextmanager
+    def _completing_step(
+        self, phase: str, requests: list[LlmRequest], *, allow_early_exit: bool = False
+    ) -> Iterator[None]:
+        """Agree on completed mutation or forward exit before the next model step."""
+        failure = None
+        early_exit = None
+        try:
+            yield
+        except ExecutionEarlyExit as error:
+            if allow_early_exit:
+                early_exit = error
+                phase += f":early_exit:{error.boundary}:{error.submitted}:{error.total}"
+            else:
+                failure = error
+        except Exception as error:
+            failure = error
+        if self._rank_consensus is not None:
+            self._coordinate(phase, requests, [True] * len(requests), local_error=failure)
+        if failure is not None:
+            raise failure
+        if early_exit is not None:
+            raise early_exit
+
+    @contextmanager
     def forward(self, batch: ScheduledRequests) -> Iterator[None]:
         """Record all submitted readers, including a forward that raises midway.
 
@@ -280,20 +333,23 @@ class ExecutionDeviceGuard:
         later event for a request therefore covers its earlier device uses too.
         Calls run on the engine's execution stream, outside model graph capture.
         """
-        requests = [r for r in batch.all_requests() if r.py_execution_version is not None]
-        state = self.table.alignment_state
-        if state is not None:
+        entry_phase = f"forward_entry:early_exit={int(self._early_exit_enabled)}"
+        with self._preparing_step(entry_phase):
+            # Include untagged rows: one live neighbor prohibits a whole-batch exit.
+            all_requests = list(batch.all_requests())
+            requests = [r for r in all_requests if r.py_execution_version is not None]
+            versions = tuple(r.py_execution_version for r in all_requests)
+            state = self.table.alignment_state
+            if state is not None:
+                for request in requests:
+                    state.confirm_attachment(
+                        request.py_execution_version,
+                        request.py_request_id,
+                        request.prepopulated_prompt_len,
+                    )
             for request in requests:
-                state.confirm_attachment(
-                    request.py_execution_version,
-                    request.py_request_id,
-                    request.prepopulated_prompt_len,
-                )
-        for request in requests:
-            self._kv_frontiers.setdefault(id(request), request.prepopulated_prompt_len)
-        # Include untagged rows: one live neighbor prohibits a whole-batch exit.
-        all_requests = list(batch.all_requests())
-        versions = tuple(r.py_execution_version for r in all_requests)
+                self._kv_frontiers.setdefault(id(request), request.prepopulated_prompt_len)
+        self._coordinate(entry_phase, all_requests, [True] * len(all_requests))
 
         def wholly_obsolete() -> bool:
             return bool(versions) and not any(self.table.observe_allowed(versions))
@@ -334,6 +390,7 @@ class ExecutionDeviceGuard:
             )
 
         with (
+            self._completing_step("forward_done", all_requests, allow_early_exit=True),
             self.device.submission(),
             early_exit_scope(
                 wholly_obsolete
@@ -405,101 +462,119 @@ class ExecutionDeviceGuard:
     @contextmanager
     def token_commit(self, state: SampleStateTorch | None) -> Iterator[None]:
         """Order host token mutation with publication, at the usual overlap consume point."""
-        if state is None:
+        if self._rank_consensus is None and (
+            state is None
+            or state.execution_ticket is None
+            and not any(r.py_execution_version is not None for r in state.requests)
+        ):
             yield
             return
-        ticket = state.execution_ticket
-        versions = [request.py_execution_version for request in state.requests]
-        if ticket is None:
-            if any(version is not None for version in versions):
-                raise RuntimeError("tagged sampling step has no device commit ticket")
-            yield
-            return
-        if tuple(versions) != ticket.versions:
-            raise RuntimeError("execution identity changed while sampling was in flight")
-        if tuple(r.py_seq_slot for r in state.requests) != ticket.sequence_slots:
-            raise RuntimeError("sequence slots changed while sampling was in flight")
-        if state.sampler_event is not None:
-            state.sampler_event.synchronize()
-            # The sampler must not repeat this wait while holding host authority.
-            state.sampler_event = None
-        commit = ticket.wait()
-        if len(commit.allowed) != len(state.requests):
-            raise RuntimeError("sampling step has no complete device commit verdict")
         accepted = []
-        with self.table.guard_versions(list(ticket.versions)) as host_allowed:
+        with ExitStack() as authority:
+            with self._preparing_step("token_commit"):
+                requests = [] if state is None else state.requests
+                versions = [r.py_execution_version for r in requests]
+                ticket = None if state is None else state.execution_ticket
+                device_allowed = [True] * len(requests)
+                if ticket is None:
+                    if any(version is not None for version in versions):
+                        raise RuntimeError("tagged sampling step has no device commit ticket")
+                else:
+                    if tuple(versions) != ticket.versions:
+                        raise RuntimeError(
+                            "execution identity changed while sampling was in flight"
+                        )
+                    if tuple(r.py_seq_slot for r in requests) != ticket.sequence_slots:
+                        raise RuntimeError("sequence slots changed while sampling was in flight")
+                if state is not None and state.sampler_event is not None:
+                    state.sampler_event.synchronize()
+                    # The sampler must not repeat this wait under host authority.
+                    state.sampler_event = None
+                if ticket is not None:
+                    device_allowed = ticket.wait().allowed
+                    if len(device_allowed) != len(requests):
+                        raise RuntimeError("sampling step has no complete device commit verdict")
+                host_allowed = authority.enter_context(self.table.guard_versions(versions))
             allowed = self._coordinate(
                 "token_commit",
-                state.requests,
-                [host and device for host, device in zip(host_allowed, commit.allowed)],
+                requests,
+                [host and device for host, device in zip(host_allowed, device_allowed)],
             )
-            for request, allowed_row in zip(state.requests, allowed):
-                if not allowed_row:
-                    self._cancel(request)
-                elif request.py_execution_version is not None and not request.is_finished:
-                    accepted.append((request, request.get_num_tokens(0)))
-            yield
-            for request, before in accepted:
-                after = request.get_num_tokens(0)
-                if after == before:
-                    continue
-                if after != before + 1 or request.context_remaining_length != 0:
-                    raise RuntimeError("RETIRE requires one accepted token after completed context")
-                # The ticket completes after this step's forward. The new token
-                # has no KV yet; its preceding input does. Keep only progress
-                # accepted by both device and host authority.
-                self._kv_frontiers[id(request)] = before
-        # V2 can rebase pages while committing. Drain the latest reader, which
-        # may belong to the next overlapped forward, outside host authority.
-        for request, _ in accepted:
-            frontier = self._kv_frontiers.get(id(request), 0)
-            if self._kv_manager is not None and self._kv_manager.needs_execution_prefix_commit(
-                request, frontier
-            ):
-                self._wait_for_use(request, required=True)
-                self._kv_manager.preserve_execution_prefix(request, frontier)
+            with self._completing_step("token_commit_done", requests):
+                for request, allowed_row in zip(requests, allowed):
+                    if not allowed_row:
+                        self._cancel(request)
+                    elif request.py_execution_version is not None and not request.is_finished:
+                        accepted.append((request, request.get_num_tokens(0)))
+                yield
+                for request, before in accepted:
+                    after = request.get_num_tokens(0)
+                    if after == before:
+                        continue
+                    if after != before + 1 or request.context_remaining_length != 0:
+                        raise RuntimeError(
+                            "RETIRE requires one accepted token after completed context"
+                        )
+                    # The new sample has no KV yet; its accepted input does.
+                    self._kv_frontiers[id(request)] = before
+        # V2 rebasing drains the latest reader outside host authority. All ranks
+        # finish preservation, or report failure, before another model step.
+        with self._completing_step("token_prefix_done", requests):
+            for request, _ in accepted:
+                frontier = self._kv_frontiers.get(id(request), 0)
+                if self._kv_manager is not None and self._kv_manager.needs_execution_prefix_commit(
+                    request, frontier
+                ):
+                    self._wait_for_use(request, required=True)
+                    self._kv_manager.preserve_execution_prefix(request, frontier)
 
     @contextmanager
     def context_commit(self, batch: ScheduledRequests) -> Iterator[ScheduledRequests]:
         """Guard context progress and V2 prefix publication without changing sampler row order."""
-        requests = batch.context_requests
-        versions = [request.py_execution_version for request in requests]
-        if self._rank_consensus is None and not any(version is not None for version in versions):
+        if self._rank_consensus is None and not any(
+            r.py_execution_version is not None for r in batch.context_requests
+        ):
             yield batch
             return
-        if self._native_kv_guards:
-            # A later publication can suppress queued KV writes. Complete this
-            # chunk before accepting its frontier, then recheck host authority.
-            # Keep the publisher unlocked throughout the wait.
-            events = {}
-            for request, version in zip(requests, versions):
-                if version is None:
-                    continue
-                use = self._uses.get(id(request))
-                if use is None or use.request is not request or use.event is None:
-                    raise RuntimeError("context GPU completion is unknown; refusing prefix commit")
-                events[id(use.event)] = use.event
-            for event in events.values():
-                self.device.wait_event(event)
-        with self.table.guard_versions(versions) as allowed:
-            allowed = self._coordinate("context_commit", requests, allowed)
-            rejected = {id(r) for r, ok in zip(requests, allowed) if not ok}
-            for request in requests:
-                if id(request) in rejected:
-                    self._cancel(request)
-            accepted = copy(batch)
-            accepted.context_requests_chunking = [
-                r for r in batch.context_requests_chunking if id(r) not in rejected
-            ]
-            accepted.context_requests_last_chunk = [
-                r for r in batch.context_requests_last_chunk if id(r) not in rejected
-            ]
-            yield accepted
-            for request in accepted.context_requests:
-                if request.py_execution_version is not None and not request.is_finished:
-                    self._kv_frontiers[id(request)] = max(
-                        self._kv_frontiers.get(id(request), 0), request.context_current_position
-                    )
+        with ExitStack() as authority:
+            with self._preparing_step("context_commit"):
+                requests = batch.context_requests
+                versions = [request.py_execution_version for request in requests]
+                if self._native_kv_guards:
+                    # Complete native KV writes before accepting their frontier;
+                    # publication stays unlocked during every device wait.
+                    events = {}
+                    for request, version in zip(requests, versions):
+                        if version is None:
+                            continue
+                        use = self._uses.get(id(request))
+                        if use is None or use.request is not request or use.event is None:
+                            raise RuntimeError(
+                                "context GPU completion is unknown; refusing prefix commit"
+                            )
+                        events[id(use.event)] = use.event
+                    for event in events.values():
+                        self.device.wait_event(event)
+                host_allowed = authority.enter_context(self.table.guard_versions(versions))
+            allowed = self._coordinate("context_commit", requests, host_allowed)
+            with self._completing_step("context_commit_done", requests):
+                rejected = {id(r) for r, ok in zip(requests, allowed) if not ok}
+                for request in requests:
+                    if id(request) in rejected:
+                        self._cancel(request)
+                accepted = copy(batch)
+                accepted.context_requests_chunking = [
+                    r for r in batch.context_requests_chunking if id(r) not in rejected
+                ]
+                accepted.context_requests_last_chunk = [
+                    r for r in batch.context_requests_last_chunk if id(r) not in rejected
+                ]
+                yield accepted
+                for request in accepted.context_requests:
+                    if request.py_execution_version is not None and not request.is_finished:
+                        self._kv_frontiers[id(request)] = max(
+                            self._kv_frontiers.get(id(request), 0), request.context_current_position
+                        )
 
     def _wait_for_use(self, request: LlmRequest, *, required: bool = False) -> None:
         use = self._uses.get(id(request))

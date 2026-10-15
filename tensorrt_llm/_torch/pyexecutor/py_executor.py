@@ -8163,15 +8163,16 @@ class PyExecutor:
     def _update_requests(self,
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
-        if sample_state is None:
+        guard = getattr(self, '_execution_guard', None)
+        if sample_state is None and guard is None:
             return
         try:
-            guard = getattr(self, '_execution_guard', None)
             commit = (guard.token_commit(sample_state)
                       if guard is not None else nullcontext())
             with commit:
-                self.sampler.update_requests(sample_state, resource_manager)
-                self._accumulate_spec_dec_stats(sample_state)
+                if sample_state is not None:
+                    self.sampler.update_requests(sample_state, resource_manager)
+                    self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

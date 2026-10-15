@@ -20,6 +20,7 @@ class ExecutionRow:
     context_position: int
     context_chunk_size: int
     state: str
+    last_token_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,11 @@ class ExecutionStepConsensus:
                 )
                 or not isinstance(row.state, str)
                 or not row.state
+                or (row.token_count == 0 and row.last_token_id is not None)
+                or (
+                    row.token_count > 0
+                    and (type(row.last_token_id) is not int or row.last_token_id < 0)
+                )
             ):
                 raise ValueError("invalid execution row or authority verdict")
             if row.request_id in identities:

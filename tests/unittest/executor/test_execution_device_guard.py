@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise native execution guard wiring with a controlled device verdict."""
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import replace
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -19,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.execution_consensus import ExecutionStepConsensus
+from tensorrt_llm.execution_fence import RequestDrainTracker
 from tensorrt_llm.execution_mailbox import VersionUpdate, WorkerVersionTable
 from tensorrt_llm.execution_version import ExecutionVersion
 
@@ -36,6 +39,7 @@ def _request(version=VERSION):
         context_chunk_size=64,
         context_remaining_length=64,
         is_finished=False,
+        is_context_init_state=False,
         py_execution_version=version,
         py_seq_slot=2,
         py_decoding_iter=3,
@@ -48,6 +52,7 @@ def _request(version=VERSION):
         num_tokens=64,
     )
     request.get_num_tokens = lambda beam: request.num_tokens
+    request.get_token = lambda beam, position: 7
 
     def finish(reason):
         assert reason == FinishReason.CANCELLED
@@ -1150,7 +1155,10 @@ def test_remote_rejection_prevents_local_progress(guard, phase):
             assert request.is_finished
     assert request.is_finished
     assert not guard._kv_frontiers
-    assert [v.phase for v in calls] == [phase]
+    expected = [phase, phase + "_done"]
+    if phase == "token_commit":
+        expected.append("token_prefix_done")
+    assert [v.phase for v in calls] == expected
     assert calls[0].rows[0].version == VERSION
     assert guard.table.current_version("tenant", "scope") == VERSION
 
@@ -1174,7 +1182,11 @@ def test_remote_early_exit_uses_exact_boundary_and_records_local_readers(guard):
         with guard.forward(_batch(request, context=True)):
             assert get_layer_early_exit_point() is not None
             execution_early_exit_point("decoder_layer", 3, 64)
-    assert [v.phase for v in calls] == ["early_exit:decoder_layer:3:64"]
+    assert [v.phase for v in calls] == [
+        "forward_entry:early_exit=1",
+        "early_exit:decoder_layer:3:64",
+        "forward_done:early_exit:decoder_layer:3:64",
+    ]
     assert guard._uses[id(request)].event is not None
     guard.device.wait_event.assert_not_called()
     assert get_layer_early_exit_point() is None
@@ -1192,7 +1204,8 @@ def test_coordinated_entry_includes_empty_and_untagged_batches(guard, untagged):
     guard._rank_consensus = ExecutionStepConsensus("session", 0, (0, 1), gather)
     requests = [_request(None)] if untagged else []
     assert guard.revoke_obsolete_requests(requests) == []
-    assert len(votes) == 1 and len(votes[0].rows) == len(requests)
+    assert [v.phase for v in votes] == ["schedule", "schedule_done"]
+    assert all(len(v.rows) == len(requests) for v in votes)
 
 
 def test_boundary_poll_restores_outer_authority_on_exception() -> None:
@@ -1714,3 +1727,353 @@ def test_frontier_without_completion_record_cannot_be_released(guard):
     assert guard._kv_frontiers[id(request)] == 64
     guard._kv_manager.preserve_execution_prefix.assert_not_called()
     guard._kv_manager.stop_request_committing.assert_not_called()
+
+
+def _guard_group(template, size):
+    """Separate guard state and bounded host transport for each simulated rank."""
+    condition = Condition()
+    rounds = {}
+    calls = [0] * size
+    guards = []
+
+    def endpoint(rank):
+        def gather(vote):
+            with condition:
+                step = calls[rank]
+                calls[rank] += 1
+                values = rounds.setdefault(step, {})
+                values[rank] = vote
+                condition.notify_all()
+                if not condition.wait_for(lambda: len(values) == size, timeout=3):
+                    raise TimeoutError("test rank skipped an execution boundary")
+                return [values[r] for r in range(size)]
+
+        return gather
+
+    for rank in range(size):
+        local = copy(template)
+        local.table = WorkerVersionTable("session")
+        local.table.apply(VersionUpdate("session", 1, VERSION))
+        local.table.drain_tracker = RequestDrainTracker()
+        local.device = Mock()
+        local.device.submission.side_effect = nullcontext
+        local._uses = {}
+        local._kv_frontiers = {}
+        local._kv_manager = Mock()
+        local._kv_manager.needs_execution_prefix_commit.return_value = False
+        local._rank_consensus = ExecutionStepConsensus(
+            "session", rank, tuple(range(size)), endpoint(rank)
+        )
+        guards.append(local)
+    return guards
+
+
+def _all_rank_failure(guards, run):
+    def attempt(rank):
+        with pytest.raises(RuntimeError, match="invalid local input|disagree"):
+            run(rank, guards[rank])
+        with pytest.raises(RuntimeError, match="restart required"):
+            guards[rank].revoke_obsolete_requests([])
+        # Local terminal cleanup must not erase the distributed failure.
+        guards[rank].table.drain_tracker.complete(42, VERSION)
+        with pytest.raises(RuntimeError, match="unknown"):
+            guards[rank].table.drain_tracker.drained(VERSION)
+
+    with ThreadPoolExecutor(max_workers=len(guards)) as pool:
+        list(pool.map(attempt, range(len(guards))))
+
+
+@pytest.mark.parametrize("size", [2, 4])
+def test_rank_steps_preserve_equal_progress_with_different_physical_slots(guard, size):
+    guards = _guard_group(guard, size)
+
+    def run(rank):
+        local = guards[rank]
+        request = _request()
+        request.py_seq_slot = rank + 7
+        local.revoke_obsolete_requests([request])
+        with local.forward(_batch(request, context=True)):
+            pass
+        with local.context_commit(_batch(request, context=True)):
+            request.context_current_position = 64
+            request.context_remaining_length = 0
+        with local.token_commit(_state(request, allowed=[True])):
+            request.num_tokens += 1
+        return local._kv_frontiers[id(request)]
+
+    with ThreadPoolExecutor(max_workers=size) as pool:
+        assert list(pool.map(run, range(size))) == [64] * size
+
+
+@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("kind", ["none", "empty", "untagged"])
+def test_rank_commits_include_absent_empty_and_untagged_sampler_states(guard, size, kind):
+    guards = _guard_group(guard, size)
+
+    def run(rank):
+        local = guards[rank]
+        requests = [_request(None)] if kind == "untagged" else []
+        state = None if kind == "none" else _state(*requests)
+        event = None if state is None else state.sampler_event
+        with local.token_commit(state):
+            if state is not None:
+                assert state.sampler_event is None
+        with local.context_commit(_batch(*requests, context=True)):
+            pass
+        with local.forward(_batch(*requests)):
+            pass
+        if event is not None:
+            event.synchronize.assert_called_once()
+        assert local.table.drain_tracker.drained(VERSION)
+
+    with ThreadPoolExecutor(max_workers=size) as pool:
+        list(pool.map(run, range(size)))
+
+
+@pytest.mark.parametrize("fault_rank", [0, 1])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_ticket",
+        "retagged",
+        "slot_changed",
+        "sampler_wait",
+        "ticket_wait",
+        "short_verdict",
+        "table_closed",
+        "absent_state",
+    ],
+)
+def test_rank_token_preparation_failure_reaches_peers(guard, fault, fault_rank):
+    guards = _guard_group(guard, 2)
+
+    def run(rank, local):
+        request = _request()
+        state = _state(request, allowed=[True])
+        if rank == fault_rank:
+            if fault == "missing_ticket":
+                state.execution_ticket = None
+            elif fault == "retagged":
+                request.py_execution_version = None
+            elif fault == "slot_changed":
+                request.py_seq_slot += 1
+            elif fault == "sampler_wait":
+                state.sampler_event.synchronize.side_effect = RuntimeError("CUDA wait failed")
+            elif fault == "ticket_wait":
+                state.execution_ticket.wait.side_effect = RuntimeError("commit wait failed")
+            elif fault == "short_verdict":
+                state.execution_ticket.wait.return_value.allowed = []
+            elif fault == "table_closed":
+                local.table.close()
+            elif fault == "absent_state":
+                state = None
+        with local.token_commit(state):
+            pytest.fail("failed preparation admitted host tokens")
+
+    _all_rank_failure(guards, run)
+
+
+@pytest.mark.parametrize("fault", ["missing_use", "missing_event", "wait_failed", "table_closed"])
+def test_rank_context_preparation_failure_reaches_peers(guard, fault):
+    guards = _guard_group(guard, 2)
+
+    def run(rank, local):
+        request = _request()
+        local._native_kv_guards = True
+        event = Mock()
+        local._uses[id(request)] = SimpleNamespace(request=request, event=event)
+        if rank == 1:
+            if fault == "missing_use":
+                local._uses.clear()
+            elif fault == "missing_event":
+                local._uses[id(request)].event = None
+            elif fault == "wait_failed":
+                local.device.wait_event.side_effect = RuntimeError("context wait failed")
+            else:
+                local.table.close()
+        with local.context_commit(_batch(request, context=True)):
+            pytest.fail("failed preparation admitted context progress")
+
+    _all_rank_failure(guards, run)
+
+
+@pytest.mark.parametrize("phase", ["token", "context", "prefix"])
+def test_rank_commit_body_failure_keeps_every_drain_unknown(guard, phase):
+    guards = _guard_group(guard, 2)
+
+    def run(rank, local):
+        request = _request()
+        if phase == "prefix":
+            local._kv_manager.needs_execution_prefix_commit.return_value = True
+            local._uses[id(request)] = SimpleNamespace(request=request, event=Mock())
+            if rank == 1:
+                local._kv_manager.preserve_execution_prefix.side_effect = RuntimeError(
+                    "rebase failed"
+                )
+        commit = (
+            local.context_commit(_batch(request, context=True))
+            if phase == "context"
+            else local.token_commit(_state(request, allowed=[True]))
+        )
+        with commit:
+            if rank == 1 and phase != "prefix":
+                raise RuntimeError("host update failed")
+
+    _all_rank_failure(guards, run)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "version",
+        "order",
+        "attachment",
+        "mode",
+        "forward",
+        "record",
+        "exit",
+    ],
+)
+def test_rank_forward_entry_and_completion_fail_together(guard, fault):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import ExecutionEarlyExit
+
+    guards = _guard_group(guard, 2)
+    entered = []
+
+    def run(rank, local):
+        local._early_exit_enabled = False
+        first, second = _request(), _request(None)
+        second.py_request_id = 43
+        requests = [first, second]
+        if rank == 1:
+            if fault == "version":
+                first.py_execution_version = NEXT
+            elif fault == "order":
+                requests.reverse()
+            elif fault == "attachment":
+                local.table.alignment_state = Mock()
+                local.table.alignment_state.confirm_attachment.side_effect = RuntimeError(
+                    "KV hold lost"
+                )
+            elif fault == "mode":
+                local._early_exit_enabled = True
+            elif fault == "record":
+                local._record_uses = Mock(side_effect=RuntimeError("event record failed"))
+        with local.forward(_batch(*requests, context=True)):
+            entered.append(rank)
+            if rank == 1 and fault == "forward":
+                raise RuntimeError("model failed after partial submission")
+            if rank == 1 and fault == "exit":
+                raise ExecutionEarlyExit("decoder_layer", 3, 64)
+
+    _all_rank_failure(guards, run)
+    if fault in ("version", "order", "attachment", "mode"):
+        assert not entered
+    else:
+        assert sorted(entered) == [0, 1]
+
+
+@pytest.mark.parametrize("with_guard", [False, True])
+def test_executor_empty_sampler_reaches_guard_without_mutating_sampler(with_guard):
+    executor = SimpleNamespace(
+        sampler=Mock(),
+        _accumulate_spec_dec_stats=Mock(),
+        _handle_errors=Mock(),
+        _execution_guard=None,
+    )
+    if with_guard:
+        executor._execution_guard = Mock()
+        executor._execution_guard.token_commit.side_effect = lambda state: nullcontext()
+    PyExecutor._update_requests(executor, None)
+    executor.sampler.update_requests.assert_not_called()
+    executor._accumulate_spec_dec_stats.assert_not_called()
+    executor._handle_errors.assert_not_called()
+    if with_guard:
+        executor._execution_guard.token_commit.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("size", [2, 4])
+def test_rank_early_exit_agrees_and_preserves_every_submitted_reader(guard, size):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
+        ExecutionEarlyExit,
+        execution_early_exit_point,
+    )
+
+    guards = _guard_group(guard, size)
+    guards[-1].table.apply(VersionUpdate("session", 2, NEXT))
+
+    def run(rank):
+        local = guards[rank]
+        request = _request()
+        with pytest.raises(ExecutionEarlyExit) as stopped:
+            with local.forward(_batch(request, context=True)):
+                execution_early_exit_point("decoder_layer", 3, 64)
+        assert (stopped.value.boundary, stopped.value.submitted) == ("decoder_layer", 3)
+        assert local._uses[id(request)].event is not None
+        # A successful early exit remains a usable coordinator. The next empty
+        # consume point must still participate instead of skipping a vote.
+        with local.token_commit(None):
+            pass
+        local.device.wait_event.assert_not_called()
+
+    with ThreadPoolExecutor(max_workers=size) as pool:
+        list(pool.map(run, range(size)))
+
+
+@pytest.mark.parametrize("fault", ["table_closed", "identity", "cancel"])
+def test_rank_scheduling_errors_reach_peers_before_next_forward(guard, fault):
+    guards = _guard_group(guard, 2)
+    for local in guards:
+        local.table.apply(VersionUpdate("session", 2, NEXT))
+
+    def run(rank, local):
+        request = _request()
+        if rank == 1:
+            if fault == "table_closed":
+                local.table.close()
+            elif fault == "identity":
+                del request.py_execution_version
+            else:
+                request.finish_by_reason.side_effect = RuntimeError("cancel failed")
+        local.revoke_obsolete_requests([request])
+
+    _all_rank_failure(guards, run)
+
+
+@pytest.mark.parametrize("state", ["CONTEXT_INIT", "GENERATION_IN_PROGRESS", "GENERATION_COMPLETE"])
+def test_step_snapshot_obeys_native_context_accessor_lifetime(guard, state):
+    class NativeContextContract(SimpleNamespace):
+        @property
+        def context_chunk_size(self):
+            assert self.is_context_init_state, "native chunk accessor is invalid after context"
+            return 64
+
+    fields = vars(_request()).copy()
+    fields.pop("context_chunk_size")
+    request = NativeContextContract(**fields)
+    request.state = SimpleNamespace(name=state)
+    request.is_context_init_state = state == "CONTEXT_INIT"
+    votes = []
+
+    def gather(vote):
+        votes.append(vote)
+        return [vote, replace(vote, rank=1)]
+
+    guard._rank_consensus = ExecutionStepConsensus("session", 0, (0, 1), gather)
+    guard._coordinate("snapshot", [request], [True])
+    row = votes[0].rows[0]
+    assert row.context_chunk_size == (64 if request.is_context_init_state else 0)
+    assert row.last_token_id == 7
+
+
+def test_equal_token_counts_do_not_hide_divergent_accepted_tokens(guard):
+    guards = _guard_group(guard, 2)
+
+    def run(rank, local):
+        request = _request()
+        request.context_remaining_length = 0
+        with local.token_commit(_state(request, allowed=[True])):
+            request.num_tokens += 1
+            request.get_token = lambda beam, position: 8 + rank
+
+    _all_rank_failure(guards, run)

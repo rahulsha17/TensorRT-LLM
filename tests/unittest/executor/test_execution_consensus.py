@@ -15,7 +15,7 @@ from tensorrt_llm.execution_version import ExecutionVersion
 
 pytestmark = pytest.mark.cpu_only
 VERSION = ExecutionVersion("tenant", "scope", 7)
-ROW = ExecutionRow(42, VERSION, 64, 0, 64, "CONTEXT_INIT")
+ROW = ExecutionRow(42, VERSION, 64, 0, 64, "CONTEXT_INIT", 7)
 
 
 class GatherGroup:
@@ -73,7 +73,7 @@ def test_one_rank_revocation_rejects_same_row_everywhere(size, phase):
 
 
 @pytest.mark.parametrize(
-    "mismatch", ["session", "phase", "request", "version", "position", "order", "empty"]
+    "mismatch", ["session", "phase", "request", "version", "position", "order", "empty", "token"]
 )
 def test_asymmetric_steps_fail_on_every_rank(mismatch):
     group = GatherGroup(2)
@@ -94,6 +94,8 @@ def test_asymmetric_steps_fail_on_every_rank(mismatch):
         other = (replace(ROW, version=replace(VERSION, epoch=8)), rows[1])
     elif mismatch == "position":
         other = (replace(ROW, context_position=64), rows[1])
+    elif mismatch == "token":
+        other = (replace(ROW, last_token_id=8), rows[1])
     elif mismatch == "order":
         other = tuple(reversed(rows))
     elif mismatch == "empty":
@@ -119,6 +121,9 @@ def test_asymmetric_steps_fail_on_every_rank(mismatch):
         ((ROW, ROW), (True, True)),
         ((replace(ROW, version=None),), (False,)),
         ((replace(ROW, token_count=-1),), (True,)),
+        ((replace(ROW, last_token_id=None),), (True,)),
+        ((replace(ROW, last_token_id=-1),), (True,)),
+        ((replace(ROW, token_count=0),), (True,)),
     ],
 )
 def test_invalid_local_input_is_reported_to_peers(bad_rows, bad_allowed):

@@ -245,11 +245,21 @@ can proceed only if every rank accepts it. Missing ranks, different rows or
 progress, and failed collectives invalidate the coordinator until restart.
 Invalid local input still enters the collective so peers can observe failure.
 
-The device guard has consensus hooks before scheduling cancellation, token and
-context commits, and early exit. Early-exit votes include the exact layer or
-graph-segment boundary; they retain the existing GPU-use records. Token and
-context waits finish before a host commit vote. Physical allocation identifiers
-remain local. Single-rank execution keeps its existing local authority checks.
+The device guard coordinates scheduling, token/context commits, and early exit.
+Empty sampler results and untagged batches still enter their expected votes.
+Device waits finish before acquiring host authority. A failed wait, missing
+ticket or closed table is reported in the vote peers are expecting. Commit
+completion checks include the resulting token count and last token, so equal
+lengths cannot hide different accepted samples. V2 prefix preservation has a
+completion vote after its device waits, outside the host-authority lock.
+
+Forward entry checks row order and progress even with early exit disabled.
+Forward completion distinguishes a normal return from an early exit and includes
+the exact exit boundary. GPU-use records remain live until normal cleanup.
+Physical allocation identifiers remain local; different sequence slots are
+valid. The native context-chunk accessor is read only during context, since
+decode and terminal requests no longer permit it. Single-rank execution does
+not enter a collective.
 
 Mirrored admissions use another agreement point, after restoring request
 versions and before adding requests to the waiting queue. The submitting rank
@@ -262,10 +272,10 @@ acknowledgement invalidates drain evidence even if local cleanup later finishes.
 
 These hooks are tested with bounded host collectives and controlled device
 completion. Distributed bootstrap does not attach them yet, so they do not
-enable TP/PP. Before enabling that topology, the executor must coordinate the
-remaining empty/error paths and provide a host-only collective with distributed
-failure handling. Pipeline stages do not enter every boundary together; they
-require separate ordering.
+enable TP/PP. Before enabling that topology, the executor must coordinate loop
+branch decisions and fatal errors outside these guarded steps, and provide a
+host-only collective with distributed failure handling. Pipeline stages do not
+enter every boundary together; they require separate ordering.
 
 Updates carry the full execution version, a publication sequence, and an
 executor-session identity. Epochs retain their full 64-bit range. Worker tables

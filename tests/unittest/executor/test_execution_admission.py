@@ -191,6 +191,8 @@ def test_local_snapshot_failure_reaches_peers_and_invalidates_drain():
             py_request_id=42,
             py_execution_version=OLD,
             get_num_tokens=lambda _: 32,
+            get_token=lambda beam, position: 7,
+            is_context_init_state=False,
             context_current_position=0,
             context_chunk_size=32,
             state=None if rank == 0 else SimpleNamespace(name="context"),
