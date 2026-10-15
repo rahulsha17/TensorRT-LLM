@@ -680,14 +680,25 @@ delayed message from reaching a different allocation. These bindings currently
 last for the worker's lifetime and are not compacted. They identify exchanges
 within the trusted control plane; they do not authenticate a network peer.
 
-Per-operation admission still needs current-authority checks before destination
-publication and backend submission. Wire identity alone does not reject new work
-on a session that was admitted before revocation. The disaggregated feature
-guards remain in place until that integration and physical qualification finish.
+Each operation also checks current authority and completed RESUME before sender
+task admission, destination publication reservation and backend submission. The
+check requires a local session in the matching direction. A sender rechecks after
+queued preparation, so an earlier task admission cannot authorize a stale DMA
+submission. Rejected receive admission fails the unpublished task and session;
+it does not leave the receiver waiting for a result that cannot arrive.
+
+These are short host reservations under the publication lock. Session and
+retirement locks are acquired first; network sends, gather work, backend calls
+and completion waits run outside authority. If a reservation wins before ADVANCE,
+its physical owners remain held while that operation finishes or fails. Rejection
+of a later slice cannot release previously published KV or auxiliary state.
+Matching completion evidence can still retire those owners after revocation.
+FENCE waits for physical drain and successful session cleanup, including when
+rejection happened before any destination was published.
 
 These claims account for resource lifetime; they do not publish authority or
 validate transferred content. End-to-end disaggregated RETIRE still needs shared
-authority across prefill and decode, version-bound transfer admission and
+authority across prefill and decode, integration of these admission hooks and
 placement-aware prefix validation. Physical retirement must also be qualified for
 each supported layout and transport. Device guards continue to reject transfer and
 connector configurations until those paths are integrated and qualified.

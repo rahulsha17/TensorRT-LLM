@@ -21,7 +21,7 @@ import queue
 import threading
 import time
 import weakref
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -107,6 +107,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.execution_fence import RequestDrainTracker, RequestResourceClaim
+from tensorrt_llm.execution_gate import ExecutionAuthorityError
 from tensorrt_llm.execution_mailbox import WorkerVersionTable
 
 if TYPE_CHECKING:
@@ -141,6 +142,13 @@ def _decode_control_message(owner: Sender | Receiver, message: list[bytes]) -> l
             raise TransferIdentityError("versioned transfer requires a bound wire adapter")
         return message
     return wire.decode(message)
+
+
+def _transfer_admission(
+    owner: Sender | Receiver, transfer_id: int, direction: Literal["send", "receive"]
+) -> AbstractContextManager[None]:
+    wire = getattr(owner, "_execution_wire", None)
+    return nullcontext() if wire is None else wire.admission(transfer_id, direction)
 
 
 class _TransferNotSubmittedError(RuntimeError):
@@ -1136,22 +1144,33 @@ class Sender(SenderBase):
         """Return True for admission, None for a duplicate, or False for rejection."""
         if not task.begin_physical_operation(peer_rank):
             return None
-        with self._ownership_poison_lock:
-            if self._ownership_poisoned is not None:
-                task.retire_unsubmitted_physical_operation(peer_rank)
-                return False
         with self._sessions_lock:
             session = self._get_session(task._unique_rid)
         if session is None:
             task.retire_unsubmitted_physical_operation(peer_rank)
             return False
-        with session.lock:
-            if session._closed or session.has_failed() or task.is_done:
-                task.retire_unsubmitted_physical_operation(peer_rank)
-                return False
-            if task.status == TaskStatus.INIT:
-                task.status = TaskStatus.TRANSFERRING
-            return True
+        try:
+            # Wait for session/retirement locks before taking authority. A
+            # contended session lock must not stall revision publication.
+            with (
+                session.lock,
+                self._ownership_poison_lock,
+                _transfer_admission(self, task._unique_rid, "send"),
+            ):
+                if (
+                    self._ownership_poisoned is not None
+                    or session._closed
+                    or session.has_failed()
+                    or task.is_done
+                ):
+                    task.retire_unsubmitted_physical_operation(peer_rank)
+                    return False
+                if task.status == TaskStatus.INIT:
+                    task.status = TaskStatus.TRANSFERRING
+                return True
+        except (ExecutionAuthorityError, TransferIdentityError):
+            task.retire_unsubmitted_physical_operation(peer_rank)
+            return False
 
     def _enqueue(self, write_meta: WriteMeta):
         # Route by (unique_rid, peer_rank) so that:
@@ -1193,14 +1212,20 @@ class Sender(SenderBase):
             completed = status.wait()
             detail = None if completed else getattr(status, "last_status_str", lambda: None)()
             return completed, detail
-        with self._ownership_poison_lock:
-            if self._ownership_poisoned is not None:
-                error = self._ownership_poisoned
-                task.retire_unsubmitted_physical_operation(peer_rank)
-                raise _TransferNotSubmittedError(
-                    "NIXL sender rejected transfer before backend submission"
-                ) from error
-            task.begin_backend_submission(peer_rank, request)
+        try:
+            with self._ownership_poison_lock, _transfer_admission(self, task._unique_rid, "send"):
+                if self._ownership_poisoned is not None:
+                    error = self._ownership_poisoned
+                    task.retire_unsubmitted_physical_operation(peer_rank)
+                    raise _TransferNotSubmittedError(
+                        "NIXL sender rejected transfer before backend submission"
+                    ) from error
+                task.begin_backend_submission(peer_rank, request)
+        except (ExecutionAuthorityError, TransferIdentityError) as error:
+            task.retire_unsubmitted_physical_operation(peer_rank)
+            raise _TransferNotSubmittedError(
+                "transfer execution has no current authority"
+            ) from error
         try:
             # SUBMITTING already retains the request. Neither backend admission
             # nor completion may hold the lock needed by deadline containment.
@@ -3833,6 +3858,7 @@ class RxSession(RxSessionBase):
                 self._ownership_evidence_guard(),
                 self.lock,
                 retirement.lock if retirement is not None else nullcontext(),
+                _transfer_admission(self._receiver, self.disagg_request_id, "receive"),
             ):
                 if self._closed or self._terminal_status is not None:
                     return False

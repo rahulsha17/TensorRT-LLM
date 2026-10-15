@@ -7,6 +7,8 @@ remains useful after revocation; it cannot restore execution authority.
 """
 
 import struct
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Literal
@@ -207,6 +209,36 @@ class ExecutionTransferWire:
             if direction in previous.local_directions:
                 raise TransferIdentityError("transfer ID cannot be reused after local admission")
             previous.local_directions.add(direction)
+
+    @contextmanager
+    def admission(self, transfer_id: int, direction: Literal["send", "receive"]) -> Iterator[None]:
+        """Reserve a short host operation under current, resumed authority.
+
+        The caller retains physical ownership before leaving this context and
+        performs network/CUDA work afterward. Completion processing does not use
+        this gate: matching old evidence must still be able to retire accessors.
+        Never acquire the authority lock while holding the wire registry lock.
+        """
+        if direction not in ("send", "receive"):
+            raise TransferIdentityError("invalid transfer direction")
+        with self._lock:
+            table = self._table
+            if table is None:
+                identity = None
+            else:
+                exchange = self._exchanges.get(transfer_id)
+                if exchange is None or direction not in exchange.local_directions:
+                    raise TransferIdentityError("operation requires a locally admitted exchange")
+                identity = exchange.identity
+        if identity is None:
+            yield
+            return
+        assert table is not None
+        with table.admission(identity.version) as execution:
+            try:
+                yield
+            finally:
+                execution.finish()
 
     def encode(self, message: list[bytes]) -> list[bytes]:
         if message and message[0] == _ENVELOPE:
