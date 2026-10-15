@@ -18,6 +18,18 @@ VERSION = ExecutionVersion("tenant", "scope", 7)
 ROW = ExecutionRow(42, VERSION, 64, 0, 64, "CONTEXT_INIT", 7)
 
 
+def test_external_failure_is_permanent_and_preserves_first_cause():
+    gather = Mock()
+    consensus = ExecutionStepConsensus("session", 0, (0, 1), gather)
+    original = RuntimeError("executor failed outside a vote")
+    consensus.fail(original)
+    consensus.fail(ValueError("later cleanup failure"))
+    with pytest.raises(RuntimeError, match="restart required") as caught:
+        consensus.agree("next", (), ())
+    assert caught.value.__cause__ is original
+    gather.assert_not_called()
+
+
 class GatherGroup:
     """A bounded host collective with independent per-endpoint invocation order."""
 

@@ -2077,3 +2077,181 @@ def test_equal_token_counts_do_not_hide_divergent_accepted_tokens(guard):
             request.get_token = lambda beam, position: 8 + rank
 
     _all_rank_failure(guards, run)
+
+
+@pytest.mark.parametrize("size", [2, 4])
+@pytest.mark.parametrize("kind", ["empty", "tagged", "untagged"])
+def test_loop_branches_agree_for_idle_and_active_ranks(guard, size, kind):
+    guards = _guard_group(guard, size)
+
+    def run(rank):
+        local = guards[rank]
+        requests = [] if kind == "empty" else [_request(None if kind == "untagged" else VERSION)]
+        batch = _batch(*requests)
+        local.check_loop_branch("stop", False, requests)
+        local.check_dispatch(batch, bool(requests), None)
+        # An empty new batch can still have a previous sampler result to drain.
+        previous = SimpleNamespace(scheduled_requests=batch)
+        local.check_dispatch(_batch(), False, previous)
+        local.check_loop_branch("stop", True, [])
+
+    with ThreadPoolExecutor(max_workers=size) as pool:
+        list(pool.map(run, range(size)))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "stop",
+        "non_boolean",
+        "dispatch",
+        "scheduled_rows",
+        "previous",
+        "previous_rows",
+        "scheduled_access",
+        "previous_access",
+    ],
+)
+def test_asymmetric_loop_branches_fail_before_work_or_cleanup(guard, fault):
+    guards = _guard_group(guard, 2)
+
+    def run(rank, local):
+        request = _request()
+        if fault in ("stop", "non_boolean"):
+            selected = bool(rank) if fault == "stop" else (None if rank else False)
+            local.check_loop_branch("stop", selected, [])
+            return
+        batch = _batch(request)
+        previous = SimpleNamespace(scheduled_requests=_batch(request))
+        can_queue = True
+        if rank:
+            if fault == "dispatch":
+                can_queue = False
+            elif fault == "scheduled_rows":
+                batch = _batch()
+            elif fault == "previous":
+                previous = None
+            elif fault == "previous_rows":
+                previous.scheduled_requests = _batch(_request(None))
+            elif fault == "scheduled_access":
+                batch = SimpleNamespace(all_requests=Mock(side_effect=ValueError("broken batch")))
+            elif fault == "previous_access":
+                previous = SimpleNamespace()
+        local.check_dispatch(batch, can_queue, previous)
+
+    _all_rank_failure(guards, run)
+
+
+def test_single_rank_branch_checks_do_not_inspect_distributed_state(guard):
+    assert not guard.is_distributed
+    guard.check_dispatch(object(), True, object())
+    guard.check_loop_branch("stop", False, [object()])
+    guard.execution_failed(RuntimeError("local request error"))
+    assert guard.table.current_version("tenant", "scope") == VERSION
+
+
+@pytest.mark.parametrize("with_guard", [False, True])
+@pytest.mark.parametrize("has_batch", [False, True])
+def test_executor_dispatch_checks_before_returning_branch(with_guard, has_batch):
+    guard = Mock() if with_guard else None
+    previous = object()
+    batch = _batch(_request()) if has_batch else _batch()
+    executor = SimpleNamespace(
+        enable_attention_dp=False, _execution_guard=guard, previous_batch=previous
+    )
+    assert PyExecutor._can_queue(executor, batch) == (has_batch, has_batch)
+    if guard is not None:
+        guard.check_dispatch.assert_called_once_with(batch, has_batch, previous)
+
+
+def test_executor_checks_stop_before_skipping_schedule():
+    guard = Mock()
+    executor = SimpleNamespace(
+        _release_unused_connector_reservations=Mock(),
+        _poll_encoder_steps=Mock(),
+        _fetch_and_activate_new_requests=Mock(return_value=[]),
+        should_stop_processing=True,
+        _execution_guard=guard,
+        active_requests=[],
+        _handle_control_request=Mock(),
+    )
+    assert PyExecutor._prepare_and_schedule_batch(executor) == (None, None)
+    guard.check_loop_branch.assert_called_once_with("stop", True, [])
+    executor._handle_control_request.assert_not_called()
+
+
+@pytest.mark.parametrize("charge_budget", [False, True])
+def test_distributed_request_error_cannot_enter_local_recovery(guard, charge_budget):
+    guard = _guard_group(guard, 2)[0]
+    executor = SimpleNamespace(_execution_guard=guard, _error_budget=Mock())
+    with pytest.raises(RuntimeError, match="distributed RETIRE execution failed: model error"):
+        PyExecutor._handle_errors(executor, "model error", requests=[], charge_budget=charge_budget)
+    executor._error_budget.consume.assert_not_called()
+
+
+@pytest.mark.parametrize("fault", ["model", "invalidation", "cleanup", "after_loop"])
+def test_distributed_error_invalidates_evidence_with_watchdog_armed(guard, monkeypatch, fault):
+    from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+
+    local = _guard_group(guard, 2)[0]
+    events = []
+    original = RuntimeError("model failed")
+    watchdog = SimpleNamespace(deadline=17, cancel=lambda: events.append("cancel watchdog"))
+
+    def arm(*args, **kwargs):
+        events.append("arm watchdog")
+        return watchdog
+
+    def kill(*args, **kwargs):
+        assert kwargs["deadline"] == 17
+        events.append("kill")
+
+    monkeypatch.setattr(executor_module, "host_profiler_context", lambda **kw: nullcontext())
+    monkeypatch.setattr(executor_module, "customized_gc_thresholds", lambda *args: nullcontext())
+    monkeypatch.setattr(executor_module, "start_rank_crash_kill_watchdog", arm)
+    monkeypatch.setattr(executor_module, "hard_kill_on_rank_crash", kill)
+
+    def loop():
+        if fault == "after_loop":
+            executor._event_loop_completed = True
+        raise original
+
+    def invalidate(error):
+        assert error is original
+        if fault != "after_loop":
+            assert events == ["arm watchdog"]
+        events.append("invalidate")
+        ExecutionDeviceGuard.execution_failed(local, error)
+        if fault == "invalidation":
+            raise RuntimeError("invalidation failed")
+
+    def cleanup():
+        events.append("cleanup")
+        local.table.drain_tracker.complete(42, VERSION)
+        with pytest.raises(RuntimeError, match="unknown"):
+            local.table.drain_tracker.drained(VERSION)
+        with pytest.raises(RuntimeError, match="closed"):
+            local.table.current_version("tenant", "scope")
+        with pytest.raises(RuntimeError, match="restart required"):
+            local._rank_consensus.agree("next", (), ())
+        if fault == "cleanup":
+            raise RuntimeError("cleanup failed")
+
+    local.execution_failed = invalidate
+    executor = SimpleNamespace(
+        _execution_guard=local,
+        _event_loop_error=None,
+        _event_loop_error_delivered=Event(),
+        is_warmup=False,
+        garbage_collection_gen0_threshold=None,
+        event_loop=loop,
+        dist=SimpleNamespace(world_size=2),
+        _executor_loop_cleanup=cleanup,
+    )
+    with pytest.raises(RuntimeError, match="failed"):
+        PyExecutor._event_loop_wrapper(executor)
+    assert executor._event_loop_error is original
+    if fault == "after_loop":
+        assert events == ["invalidate", "cleanup"]
+    else:
+        assert events == ["arm watchdog", "invalidate", "cleanup", "cancel watchdog", "kill"]

@@ -79,6 +79,11 @@ class ExecutionStepConsensus:
         self._sequence = 0
         self._failure: Exception | None = None
 
+    def fail(self, error: Exception) -> None:
+        """Invalidate this endpoint after an executor error outside a vote."""
+        if self._failure is None:
+            self._failure = error
+
     @staticmethod
     def _validate_rows(rows: tuple[ExecutionRow, ...], allowed: tuple[bool, ...]) -> None:
         if (

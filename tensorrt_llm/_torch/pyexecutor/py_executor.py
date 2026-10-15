@@ -1437,7 +1437,12 @@ class PyExecutor:
                 error_delivered=self._event_loop_error_delivered,
             ) if crashed else None
             try:
-                self._executor_loop_cleanup()
+                try:
+                    guard = getattr(self, '_execution_guard', None)
+                    if guard is not None and self._event_loop_error is not None:
+                        guard.execution_failed(self._event_loop_error)
+                finally:
+                    self._executor_loop_cleanup()
             finally:
                 if crashed:
                     # Peers cannot make progress without this rank's loop:
@@ -3811,6 +3816,11 @@ class PyExecutor:
         else:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.check_dispatch(scheduled_batch, can_queue,
+                                 getattr(self, 'previous_batch', None))
+
         return can_queue, can_queue_this_rank
 
     def _revert_gen_alloc(self, scheduled_batch):
@@ -4047,7 +4057,11 @@ class PyExecutor:
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
-        if self.should_stop_processing:
+        should_stop = self.should_stop_processing
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None:
+            guard.check_loop_branch('stop', should_stop, self.active_requests)
+        if should_stop:
             return None, None
 
         self._handle_control_request()
@@ -8270,6 +8284,12 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None and guard.is_distributed:
+            # The event-loop crash handler tears down stranded model ranks.
+            # Request-local recovery cannot restore their collective order.
+            raise RuntimeError(
+                f"distributed RETIRE execution failed: {error_msg}")
         multi_rank_adp = (self.enable_attention_dp
                           and self.dist.world_size != 1)
         # ``fatal_is_collective_aligned`` is set only by the synchronized caller

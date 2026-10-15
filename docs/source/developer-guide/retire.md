@@ -270,11 +270,20 @@ source has already reported drain. Revoked versions remain tracked until
 cleanup; recording the envelope does not restore their authority. A failed
 acknowledgement invalidates drain evidence even if local cleanup later finishes.
 
+Loop checks cover the stop decision, whether a new batch can run, and whether
+an overlap sampler batch remains to be consumed. They compare both batches'
+rows before any rank takes the corresponding branch. An unexpected error
+outside a guarded step cannot use request-local recovery when rank coordination
+is attached. The existing executor crash watchdog is armed before invalidating
+authority and drain evidence, then normal cleanup runs. Cleanup does not turn
+a failed distributed execution into a successful FENCE.
+
 These hooks are tested with bounded host collectives and controlled device
 completion. Distributed bootstrap does not attach them yet, so they do not
-enable TP/PP. Before enabling that topology, the executor must coordinate loop
-branch decisions and fatal errors outside these guarded steps, and provide a
-host-only collective with distributed failure handling. Pipeline stages do not
+enable TP/PP. Before enabling that topology, bootstrap must pause every worker
+at the same scheduler boundary, block admission during installation, and provide
+a bounded host-only collective. Common ALIGN frontiers also need negotiation.
+Pipeline stages do not
 enter every boundary together; they require separate ordering.
 
 Updates carry the full execution version, a publication sequence, and an

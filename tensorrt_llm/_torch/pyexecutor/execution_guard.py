@@ -32,7 +32,7 @@ from .sampler import SampleStateTorch, TorchSampler
 from .scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
-    from .py_executor import PyExecutor
+    from .py_executor import BatchState, PyExecutor
 
 __all__ = ["ExecutionDeviceGuard"]
 
@@ -291,6 +291,44 @@ class ExecutionDeviceGuard:
             if self.table.drain_tracker is not None:
                 self.table.drain_tracker.fail(error)
             raise
+
+    @property
+    def is_distributed(self) -> bool:
+        """Whether model steps require agreement across ranks."""
+        return self._rank_consensus is not None
+
+    def execution_failed(self, error: Exception) -> None:
+        """Invalidate distributed drain evidence before the engine's fatal cleanup."""
+        if self._rank_consensus is not None:
+            self._rank_consensus.fail(error)
+            if self.table.drain_tracker is not None:
+                self.table.drain_tracker.fail(error)
+            self.table.close()
+
+    def check_loop_branch(self, boundary: str, selected: bool, requests: list[LlmRequest]) -> None:
+        """Require equal loop decisions before ranks take different call paths."""
+        if self._rank_consensus is not None:
+            with self._preparing_step(f"loop:{boundary}"):
+                if type(selected) is not bool:
+                    raise TypeError("execution branch requires a boolean decision")
+            self._coordinate(f"loop:{boundary}:{int(selected)}", requests, [True] * len(requests))
+
+    def check_dispatch(
+        self, batch: ScheduledRequests, can_queue: bool, previous_batch: "BatchState | None"
+    ) -> None:
+        """Check scheduled and pending sampler rows before either forward branch."""
+        if self._rank_consensus is None:
+            return
+        with self._preparing_step("dispatch"):
+            requests = list(batch.all_requests())
+        self.check_loop_branch("dispatch", can_queue, requests)
+        with self._preparing_step("previous_batch"):
+            previous_requests = (
+                []
+                if previous_batch is None
+                else list(previous_batch.scheduled_requests.all_requests())
+            )
+        self.check_loop_branch("previous_batch", previous_batch is not None, previous_requests)
 
     @contextmanager
     def _preparing_step(self, phase: str) -> Iterator[None]:
