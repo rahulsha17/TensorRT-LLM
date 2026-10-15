@@ -202,6 +202,34 @@ controller. Untagged generation calls keep their existing behavior. Tagged work
 requires explicit registration and a successful initial publication; missing
 authority fails instead of silently running without checks.
 
+`CollectivePublicationTransport` provides the control-plane aggregation needed
+for multi-rank integration. The executor supplies the complete expected set of
+`ExecutionParticipant(tp_rank, pp_rank, kv_group)` coordinates and one authenticated
+endpoint for each worker. Missing, duplicate, or extra participants are rejected;
+the set cannot shrink when a worker fails.
+
+```text
+                         +-> TP/PP worker 0 -> local observation/drain/hold
+controller -> transport -+-> TP/PP worker 1 -> local observation/drain/hold
+                         +-> remaining required workers
+             |
+             +-> acknowledge only after every required worker answers
+```
+
+Publication and FENCE require every participant. ALIGN also requires the same
+reserved prefix length on every worker; incompatible lengths fail before RESUME.
+The transport retains each worker's reservation ID and translates the aggregate
+receipt back to those exact local receipts on RESUME. The frontend stays closed
+if only some workers acknowledge. A retry rechecks every local reservation;
+an acknowledgement timeout does not release memory. A later revision or worker
+teardown reclaims abandoned holds through the existing worker lifecycle.
+
+This transport is tested with local tables and authenticated IPC mailboxes. It
+is not yet connected to MPI/Ray bootstrap, and does not coordinate model
+collectives or per-layer exit. Multi-rank executor support remains disabled
+until those paths can keep all ranks in the same collective schedule. Closing
+the transport only closes channels; it does not certify drain or native cleanup.
+
 Updates carry the full execution version, a publication sequence, and an
 executor-session identity. Epochs retain their full 64-bit range. Worker tables
 are isolated by tenant and scope; an unknown scope is not treated as epoch zero.

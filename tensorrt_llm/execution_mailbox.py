@@ -359,7 +359,7 @@ class LocalPublicationTransport:
 
 
 class ExecutionController:
-    """Own a scope registry and serialize its publications to one worker.
+    """Own a scope registry and serialize its publications through one transport.
 
     Args:
         session_id: Unique authority identity shared with the worker table.
