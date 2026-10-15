@@ -2322,6 +2322,26 @@ class Sender(SenderBase):
         self.shutdown()
 
 
+class _SessionCleanup:
+    """Serialize teardown and retain uncertainty after a partial cleanup failure."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._error: Optional[Exception] = None
+
+    def run(self, cleanup: Callable[[], bool]) -> bool:
+        with self._lock:
+            if self._error is not None:
+                raise RuntimeError("KV session cleanup is unproven") from self._error
+            try:
+                return cleanup()
+            except Exception as error:
+                # A slot release or unregister may have taken effect before
+                # raising. Retrying it cannot establish safe ownership.
+                self._error = error
+                raise
+
+
 class TxSession(TxSessionBase):
     cancelled_by_peer: bool = False
     """Only meaningful once the session is CANCELLED."""
@@ -2339,6 +2359,7 @@ class TxSession(TxSessionBase):
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ):
         super().__init__(sender, SessionArgsBase(params, prompt_len=prompt_len))
+        self._cleanup = _SessionCleanup()
         self._timeout_s = timeout_s
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
@@ -2762,6 +2783,9 @@ class TxSession(TxSessionBase):
         return self._exception
 
     def close(self) -> bool:
+        return self._cleanup.run(self._close_once)
+
+    def _close_once(self) -> bool:
         with self.lock:
             if self._closed:
                 return True
@@ -3570,6 +3594,7 @@ class RxSession(RxSessionBase):
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
+        self._cleanup = _SessionCleanup()
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
@@ -4334,6 +4359,9 @@ class RxSession(RxSessionBase):
         return self._failed_wait_result() if self.has_failed() else self._completed_wait_result()
 
     def close(self) -> bool:
+        return self._cleanup.run(self._close_once)
+
+    def _close_once(self) -> bool:
         if self._enforce_physical_ownership:
             with self.lock:
                 if self._closed:

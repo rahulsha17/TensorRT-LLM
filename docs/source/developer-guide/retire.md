@@ -596,6 +596,15 @@ parent even after the request leaves the executor. The transition is atomic with
 FENCE polling, and a reused request ID cannot release an earlier allocation's
 claim. Uncertain setup or release makes drain unknown and requires a restart.
 
+Python transfer sessions serialize the entire close operation, including
+auxiliary-slot release, bounce cleanup and unregistering the session. A duplicate
+close cannot report success while those operations are running. If cleanup
+raises after a possible side effect, later close attempts keep failing and do
+not repeat that cleanup. A refusal because DMA or retirement is still pending
+can be retried once it drains. This makes successful close a usable lifetime
+boundary for resource claims; receive and pipelined-session claims are not yet
+wired into RETIRE.
+
 These claims account for resource lifetime; they do not publish authority or
 validate transferred content. End-to-end disaggregated RETIRE still needs shared
 authority across prefill and decode, version-bound transfer admission, receive
