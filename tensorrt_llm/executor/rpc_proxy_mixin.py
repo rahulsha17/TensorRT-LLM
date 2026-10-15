@@ -6,6 +6,7 @@ import atexit
 import os
 import threading
 from concurrent.futures import Future
+from copy import copy
 from typing import Callable, List, Optional
 
 from .._utils import nvtx_range_debug
@@ -116,6 +117,9 @@ class RpcExecutorMixin:
 
     def _submit_rpc_generation(self, request: GenerationRequest) -> GenerationResult:
         """Bind authority and result routing before asynchronous ingress can reply."""
+        # generate_async releases fields on its request after submit returns.
+        # RPC serialization runs later, so it needs its own attribute ownership.
+        wire_request = copy(request)
         logprob_params = self._get_logprob_params(request)
         result = GenerationResult(
             request,
@@ -136,7 +140,9 @@ class RpcExecutorMixin:
                     # Queue transport work without waiting under authority or
                     # the failure lock, including untagged neighboring work.
                     # Tagged delayed sends are rechecked by worker admission.
-                    sent = self.rpc_client.submit_for_rpc(request).remote_future(need_response=True)
+                    sent = self.rpc_client.submit_for_rpc(wire_request).remote_future(
+                        need_response=True
+                    )
             except Exception:
                 self._results.pop(request.id, None)
                 raise

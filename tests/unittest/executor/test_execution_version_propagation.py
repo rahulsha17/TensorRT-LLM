@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pickle
+from copy import copy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -66,6 +67,22 @@ def test_revision_can_keep_the_predecessors_cache_namespace() -> None:
     revision = GenerationResult(pickle.loads(pickle.dumps(_request(revised_version))))
     assert original.execution_version != revision.execution_version
     assert original.cache_salt == revision.cache_salt == "shared-prefix"
+
+
+@pytest.mark.parametrize("version", [VERSION, None])
+def test_submission_copy_keeps_fields_after_original_request_cleanup(
+    version: ExecutionVersion | None,
+) -> None:
+    original = _request(version)
+    original.multimodal_params = SimpleNamespace(multimodal_data={"image": b"input"})
+    submitted = copy(original)
+    del original.multimodal_params
+    received = pickle.loads(pickle.dumps(submitted))
+    assert received.multimodal_params.multimodal_data == {"image": b"input"}
+    assert received.prompt_token_ids == [1, 2, 3]
+    assert received.execution_version == version
+    assert received.cache_salt == "shared-prefix"
+    assert received.id == 42
 
 
 def test_cache_namespace_is_independent_of_execution_identity() -> None:

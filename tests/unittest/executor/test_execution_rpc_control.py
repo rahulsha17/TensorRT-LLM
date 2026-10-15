@@ -3,6 +3,7 @@
 """RPC frontend authority and result routing without inference or a Ray cluster."""
 
 import asyncio
+import pickle
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
@@ -278,6 +279,30 @@ def test_pending_rpc_send_does_not_hold_authority_or_prevent_revoke(frontend):
             result._result_step(0.1)
         assert not sent.done()
         sent.set_result(None)
+
+
+@pytest.mark.parametrize("version", [OLD, None])
+@pytest.mark.parametrize("payload", [None, {"image": b"retained input"}])
+def test_async_rpc_keeps_request_fields_after_generate_async_cleanup(frontend, version, payload):
+    with closing(frontend[0]):
+        owner, _ = frontend
+        if version is not None:
+            owner.get_execution_controller().register(OLD).wait()
+        original = request(version)
+        original.multimodal_params = payload
+        original.cache_salt = "shared-prefix"
+        result = owner.submit(original)
+        queued = owner.rpc_client.submit_for_rpc.call_args.args[0]
+        assert queued is not original
+        # Match GenerationExecutor.generate_async's cleanup before the transport
+        # thread serializes its queued request, including the text-only None case.
+        del original.multimodal_params
+        received = pickle.loads(pickle.dumps(queued))
+        assert received.multimodal_params == payload
+        assert received.execution_version == version
+        assert received.cache_salt == "shared-prefix"
+        assert received.id == result._generation_request.id == 41
+        owner.rpc_client.submit_for_rpc.return_value.remote_future.return_value.set_result(None)
 
 
 def test_immediate_async_send_failure_runs_callback_outside_authority(frontend):
