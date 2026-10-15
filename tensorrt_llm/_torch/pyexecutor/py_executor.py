@@ -4059,8 +4059,15 @@ class PyExecutor:
                 raise RuntimeError(
                     "executor already has an execution authority")
             return
-        self._execution_guard = ExecutionDeviceGuard(self, table,
-                                                     rank_consensus)
+        guard = ExecutionDeviceGuard(self, table, rank_consensus)
+        assert table.drain_tracker is not None
+        try:
+            self.async_transfer_manager.bind_execution_drain(
+                table.drain_tracker)
+        except Exception as error:
+            guard.execution_failed(error)
+            raise
+        self._execution_guard = guard
 
     def _prepare_and_schedule_batch(self):
         self._release_unused_connector_reservations()

@@ -91,6 +91,39 @@ def _batch(*requests, context=False):
     return batch
 
 
+@pytest.mark.parametrize("binding_fails", [False, True])
+def test_authority_installation_binds_transfer_drain_or_fails_closed(monkeypatch, binding_fails):
+    table = WorkerVersionTable("session")
+    tracker = RequestDrainTracker()
+    guard = SimpleNamespace(
+        table=table, _rank_consensus=None, execution_failed=Mock(side_effect=tracker.fail)
+    )
+
+    def make_guard(executor, installed_table, consensus):
+        assert installed_table is table and consensus is None
+        table.drain_tracker = tracker
+        return guard
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.execution_guard.ExecutionDeviceGuard", make_guard
+    )
+    transfers = Mock()
+    executor = SimpleNamespace(_execution_guard=None, async_transfer_manager=transfers)
+    if binding_fails:
+        transfers.bind_execution_drain.side_effect = RuntimeError("bind failed")
+        with pytest.raises(RuntimeError, match="bind failed"):
+            PyExecutor.configure_execution_authority(executor, table)
+        assert executor._execution_guard is None
+        with pytest.raises(RuntimeError, match="unknown"):
+            tracker.drained(VERSION)
+    else:
+        PyExecutor.configure_execution_authority(executor, table)
+        assert executor._execution_guard is guard
+        PyExecutor.configure_execution_authority(executor, table)
+        guard.execution_failed.assert_not_called()
+    transfers.bind_execution_drain.assert_called_once_with(tracker)
+
+
 def test_residency_rpc_preserves_cache_namespace_and_page_tiers(monkeypatch) -> None:
     executor = object.__new__(PyExecutor)
     executor._is_kv_manager_v2 = True

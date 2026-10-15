@@ -6,6 +6,7 @@ from typing import Dict, Optional
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm.execution_fence import RequestDrainTracker, RequestResourceClaim
 from tensorrt_llm.execution_version import ExecutionVersion
 from tensorrt_llm.logger import logger
 
@@ -40,6 +41,7 @@ class AsyncTransferManager:
             self.block_id = block_id
             self.version = version
             self.owners: set[TransferOwner] = set()
+            self.drain_claims: dict[TransferOwner, RequestResourceClaim] = {}
             self.release_error: Exception | None = None
 
         @property
@@ -59,6 +61,17 @@ class AsyncTransferManager:
 
         # Mapping of request id to the request metadata
         self._request_transfer_metadata: Dict[int, self.RequestTransferMetadata] = dict()
+        self._drain_tracker: RequestDrainTracker | None = None
+
+    def bind_execution_drain(self, tracker: RequestDrainTracker) -> None:
+        """Bind before any transfer starts; existing access cannot be reconstructed."""
+        if not isinstance(tracker, RequestDrainTracker):
+            raise TypeError("transfer drain requires a RequestDrainTracker")
+        if self._drain_tracker is tracker:
+            return
+        if self._drain_tracker is not None or self._requests_in_transfer:
+            raise RuntimeError("transfer drain must be bound once before transfers start")
+        self._drain_tracker = tracker
 
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
@@ -100,31 +113,46 @@ class AsyncTransferManager:
         if metadata is not None and owner in metadata.owners:
             raise RuntimeError("KV transfer owner already holds this request")
 
+        claim = None
+        version = request.py_execution_version
+        if version is not None:
+            if self._drain_tracker is None:
+                raise RuntimeError("tagged KV transfer requires execution drain tracking")
+            parent = next(iter(metadata.drain_claims.values()), None) if metadata else None
+            claim = self._drain_tracker.acquire_resource(
+                req_id, version, owner.value, parent=parent
+            )
+
         if metadata is None:
-            for resource_mgr_type in (
-                ResourceManagerType.SEQ_SLOT_MANAGER,
-                ResourceManagerType.SPEC_RESOURCE_MANAGER,
-            ):
-                if (
-                    resource_mgr_type in self.resource_manager.resource_managers
-                    and self.resource_manager.resource_managers[resource_mgr_type] is not None
-                ):
-                    self.resource_manager.resource_managers[resource_mgr_type].free_resources(
-                        request
-                    )
-
-            request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-
-            if self.should_store_blocks:
-                block_id = self.kv_cache_manager.store_blocks_for_reuse(request, True)
-            else:
-                block_id = None
-
+            metadata = self.RequestTransferMetadata(None, version)
             self._requests_in_transfer[req_id] = request
-            metadata = self.RequestTransferMetadata(block_id, request.py_execution_version)
             self._request_transfer_metadata[req_id] = metadata
-
+            metadata.owners.add(owner)
+            if claim is not None:
+                metadata.drain_claims[owner] = claim
+            try:
+                for resource_mgr_type in (
+                    ResourceManagerType.SEQ_SLOT_MANAGER,
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER,
+                ):
+                    manager = self.resource_manager.resource_managers.get(resource_mgr_type)
+                    if manager is not None:
+                        manager.free_resources(request)
+                request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                if self.should_store_blocks:
+                    metadata.block_id = self.kv_cache_manager.store_blocks_for_reuse(request, True)
+            except Exception as error:
+                # Native setup may have acquired pins before reporting failure.
+                # Retain the request and all claims; no retry can assume zero use.
+                metadata.release_error = error
+                if claim is not None:
+                    assert self._drain_tracker is not None
+                    self._drain_tracker.fail(error)
+                raise
+            return
         metadata.owners.add(owner)
+        if claim is not None:
+            metadata.drain_claims[owner] = claim
 
     def end_transfer(self, request: LlmRequest, *, owner: TransferOwner) -> bool:
         """
@@ -156,8 +184,12 @@ class AsyncTransferManager:
                     # An exception may follow a partial native release. A retry
                     # could decrement a different owner's pin a second time.
                     transfer_metadata.release_error = error
+                    if transfer_metadata.drain_claims:
+                        assert self._drain_tracker is not None
+                        self._drain_tracker.fail(error)
                     raise
 
+            self._release_drain_claim(transfer_metadata, owner)
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
             transfer_metadata.owners.remove(owner)
@@ -167,8 +199,21 @@ class AsyncTransferManager:
 
             return True
 
+        self._release_drain_claim(transfer_metadata, owner)
         transfer_metadata.owners.remove(owner)
         return False
+
+    def _release_drain_claim(self, metadata: RequestTransferMetadata, owner: TransferOwner) -> None:
+        claim = metadata.drain_claims.get(owner)
+        if claim is not None:
+            assert self._drain_tracker is not None
+            try:
+                self._drain_tracker.release_resource(claim)
+            except Exception as error:
+                metadata.release_error = error
+                self._drain_tracker.fail(error)
+                raise
+            del metadata.drain_claims[owner]
 
     def has_any_inflight_requests(self) -> bool:
         return len(self._requests_in_transfer) > 0

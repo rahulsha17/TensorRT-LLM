@@ -9,7 +9,7 @@ from threading import Event
 import pytest
 
 from tensorrt_llm.execution_authority import Revision
-from tensorrt_llm.execution_fence import FenceRequest, RequestDrainTracker
+from tensorrt_llm.execution_fence import FenceRequest, RequestDrainTracker, RequestResourceClaim
 from tensorrt_llm.execution_gate import ExecutionAuthorityError
 from tensorrt_llm.execution_mailbox import (
     ExecutionController,
@@ -93,6 +93,123 @@ def test_other_scopes_and_tenants_do_not_block_fence(control):
     tracker.enqueue(replace(OLD, scope_id="other"), lambda: 1)
     tracker.enqueue(replace(OLD, tenant_id="other"), lambda: 2)
     controller.advance(REVISION).fence.wait()
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_resources_outlive_terminal_request_and_release_independently(control, reverse):
+    controller, _, tracker = control
+    tracker.enqueue(OLD, lambda: 42)
+    claims = [tracker.acquire_resource(42, OLD, owner) for owner in ("send", "save")]
+    tracker.complete(42, OLD)
+    result = controller.advance(REVISION)
+    result.publication.wait()
+    for claim in reversed(claims) if reverse else claims:
+        with pytest.raises(TimeoutError):
+            result.fence.wait(0.02)
+        tracker.release_resource(claim)
+    assert result.fence.wait().request.revision == REVISION
+
+
+def test_dependent_accessor_keeps_fence_pending_after_request_cleanup(control):
+    controller, _, tracker = control
+    tracker.enqueue(OLD, lambda: 42)
+    send = tracker.acquire_resource(42, OLD, "send")
+    tracker.complete(42, OLD)
+    result = controller.advance(REVISION)
+    result.publication.wait()
+    save = tracker.acquire_resource(42, OLD, "save", parent=send)
+    tracker.release_resource(send)
+    with pytest.raises(TimeoutError):
+        result.fence.wait(0.02)
+    tracker.release_resource(save)
+    result.fence.wait()
+
+
+def test_resource_scope_filtering_and_chained_revision(control):
+    controller, _, tracker = control
+    tracker.enqueue(OLD, lambda: 1)
+    old_claim = tracker.acquire_resource(1, OLD, "send")
+    tracker.complete(1, OLD)
+    for request_id, version in enumerate(
+        (replace(OLD, scope_id="other"), replace(OLD, tenant_id="other")), start=2
+    ):
+        tracker.enqueue(version, lambda: request_id)
+        tracker.acquire_resource(request_id, version, "send")
+        tracker.complete(request_id, version)
+    first = controller.advance(REVISION)
+    second = controller.advance(Revision("again", NEW, replace(NEW, epoch=9)))
+    second.publication.wait()
+    with pytest.raises(TimeoutError):
+        second.fence.wait(0.02)
+    tracker.release_resource(old_claim)
+    first.fence.wait()
+    second.fence.wait()
+
+
+def test_resource_claim_uses_allocation_identity_even_after_request_id_reuse():
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 42)
+    old = tracker.acquire_resource(42, OLD, "send")
+    tracker.complete(42, OLD)
+    tracker.enqueue(NEW, lambda: 42)
+    new = tracker.acquire_resource(42, NEW, "send")
+    tracker.complete(42, NEW)
+    tracker.release_resource(new)
+    assert not tracker.drained(OLD)
+    assert not tracker.drained(NEW)
+    tracker.release_resource(old)
+    assert tracker.drained(NEW)
+
+
+@pytest.mark.parametrize("invalid", ["copied", "other_tracker", "released"])
+def test_unrecognized_resource_completion_fails_closed(invalid):
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 42)
+    claim = tracker.acquire_resource(42, OLD, "send")
+    tracker.complete(42, OLD)
+    if invalid == "copied":
+        completed = replace(claim)
+    elif invalid == "other_tracker":
+        other = RequestDrainTracker()
+        other.enqueue(OLD, lambda: 42)
+        completed = other.acquire_resource(42, OLD, "send")
+    else:
+        tracker.release_resource(claim)
+        completed = claim
+    with pytest.raises(RuntimeError, match="no matching live claim"):
+        tracker.release_resource(completed)
+    if invalid != "released":
+        tracker.release_resource(claim)
+    with pytest.raises(RuntimeError, match="unknown"):
+        tracker.drained(OLD)
+
+
+@pytest.mark.parametrize(
+    "parent_kind", ["none", "released", "copied", "other_request", "other_version"]
+)
+def test_late_or_unrelated_resource_cannot_acquire_ownership(parent_kind):
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 42)
+    parent = tracker.acquire_resource(42, OLD, "send")
+    tracker.complete(42, OLD)
+    if parent_kind == "none":
+        parent = None
+    elif parent_kind == "released":
+        tracker.release_resource(parent)
+    elif parent_kind == "copied":
+        parent = replace(parent)
+    request_id = 43 if parent_kind == "other_request" else 42
+    version = NEW if parent_kind == "other_version" else OLD
+    with pytest.raises(RuntimeError, match="no matching live owner"):
+        tracker.acquire_resource(request_id, version, "save", parent=parent)
+    with pytest.raises(RuntimeError, match="unknown"):
+        tracker.drained(OLD)
+
+
+def test_directly_constructed_claim_cannot_certify_resource_completion():
+    tracker = RequestDrainTracker()
+    with pytest.raises(RuntimeError, match="no matching live claim"):
+        tracker.release_resource(RequestResourceClaim(42, OLD, "send"))
 
 
 def test_close_fails_pending_fence(control):

@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -26,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, Re
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.execution_fence import RequestDrainTracker
 from tensorrt_llm.execution_version import ExecutionVersion
 
 pytestmark = pytest.mark.cpu_only
@@ -142,6 +145,9 @@ def test_mismatched_identity_cannot_touch_live_claims(operation: str, mutation: 
     manager = AsyncTransferManager(create_mock_resource_manager(cache))
     request = create_mock_request(42)
     request.py_execution_version = ExecutionVersion("tenant", "scope", 1)
+    tracker = RequestDrainTracker()
+    tracker.enqueue(request.py_execution_version, lambda: 42)
+    manager.bind_execution_drain(tracker)
     manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
 
     if mutation == "request":
@@ -240,6 +246,147 @@ def test_transfer_without_storing_blocks():
     assert manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
 
     kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+
+
+@pytest.mark.parametrize("first_owner", list(TransferOwner))
+@pytest.mark.parametrize("store_blocks", [False, True])
+def test_transfer_drain_survives_terminal_request(first_owner, store_blocks):
+    cache = MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache), store_blocks)
+    tracker = RequestDrainTracker()
+    manager.bind_execution_drain(tracker)
+    request = create_mock_request(42)
+    version = request.py_execution_version = ExecutionVersion("tenant", "scope", 1)
+    tracker.enqueue(version, lambda: 42)
+    manager.start_transfer(request, owner=first_owner)
+    tracker.complete(42, version)
+    second_owner = next(owner for owner in TransferOwner if owner is not first_owner)
+    manager.start_transfer(request, owner=second_owner)
+    assert not tracker.drained(version)
+    assert not manager.end_transfer(request, owner=first_owner)
+    assert not manager.end_transfer(request, owner=first_owner)
+    assert not tracker.drained(version)
+    assert manager.end_transfer(request, owner=second_owner)
+    assert tracker.drained(version)
+    assert cache.unpin_blocks_by_id.call_count == int(store_blocks)
+
+
+def test_tagged_transfer_requires_tracking_before_native_mutation():
+    cache, slots = MagicMock(), MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache, slots))
+    request = create_mock_request(42)
+    request.py_execution_version = ExecutionVersion("tenant", "scope", 1)
+    with pytest.raises(RuntimeError, match="requires execution drain"):
+        manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    cache.store_blocks_for_reuse.assert_not_called()
+    slots.free_resources.assert_not_called()
+    assert not manager.has_any_inflight_requests()
+
+
+@pytest.mark.parametrize("existing", ["tracker", "transfer"])
+def test_transfer_tracker_binding_cannot_replace_existing_ownership(existing):
+    manager = AsyncTransferManager(create_mock_resource_manager(MagicMock()))
+    tracker = RequestDrainTracker()
+    if existing == "tracker":
+        manager.bind_execution_drain(tracker)
+        manager.bind_execution_drain(tracker)
+    else:
+        manager.start_transfer(create_mock_request(42), owner=TransferOwner.TRANSCEIVER)
+    with pytest.raises(RuntimeError, match="bound once"):
+        manager.bind_execution_drain(RequestDrainTracker())
+
+
+@pytest.mark.parametrize("failure", ["slot", "pin", "unpin"])
+@pytest.mark.parametrize("tagged", [False, True])
+def test_uncertain_native_transfer_ownership_poison_fence(failure, tagged):
+    cache, slots = MagicMock(), MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache, slots))
+    tracker = RequestDrainTracker()
+    manager.bind_execution_drain(tracker)
+    request = create_mock_request(42)
+    version = ExecutionVersion("tenant", "scope", 1)
+    if tagged:
+        request.py_execution_version = version
+        tracker.enqueue(version, lambda: 42)
+    method = {
+        "slot": slots.free_resources,
+        "pin": cache.store_blocks_for_reuse,
+        "unpin": cache.unpin_blocks_by_id,
+    }[failure]
+    method.side_effect = RuntimeError("native state unknown")
+    if failure == "unpin":
+        manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
+        operation = manager.end_transfer
+    else:
+        operation = manager.start_transfer
+    with pytest.raises(RuntimeError, match="native state unknown"):
+        operation(request, owner=TransferOwner.TRANSCEIVER)
+    if tagged:
+        tracker.complete(42, version)
+        with pytest.raises(RuntimeError, match="drain is unknown"):
+            tracker.drained(version)
+    assert manager.has_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    method.side_effect = None
+    with pytest.raises(RuntimeError, match="release is unknown"):
+        manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    method.assert_called_once()
+
+
+@pytest.mark.parametrize("released", [False, True])
+def test_failed_drain_completion_cannot_repeat_native_unpin(monkeypatch, released):
+    cache = MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache))
+    tracker = RequestDrainTracker()
+    manager.bind_execution_drain(tracker)
+    request = create_mock_request(42)
+    version = request.py_execution_version = ExecutionVersion("tenant", "scope", 1)
+    tracker.enqueue(version, lambda: 42)
+    manager.start_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    tracker.complete(42, version)
+    original_release = tracker.release_resource
+
+    def fail_completion(claim):
+        if released:
+            original_release(claim)
+        raise RuntimeError("completion failed")
+
+    monkeypatch.setattr(tracker, "release_resource", fail_completion)
+    with pytest.raises(RuntimeError, match="completion failed"):
+        manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    with pytest.raises(RuntimeError, match="drain is unknown"):
+        tracker.drained(version)
+    assert manager.has_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    with pytest.raises(RuntimeError, match="release is unknown"):
+        manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    cache.unpin_blocks_by_id.assert_called_once()
+
+
+def test_resource_claim_precedes_slot_and_pin_side_effects():
+    entered, proceed = Event(), Event()
+    cache, slots = MagicMock(), MagicMock()
+    manager = AsyncTransferManager(create_mock_resource_manager(cache, slots))
+    tracker = RequestDrainTracker()
+    manager.bind_execution_drain(tracker)
+    request = create_mock_request(42)
+    version = request.py_execution_version = ExecutionVersion("tenant", "scope", 1)
+    tracker.enqueue(version, lambda: 42)
+
+    def release_slots(req):
+        entered.set()
+        assert proceed.wait(5)
+
+    slots.free_resources.side_effect = release_slots
+    with ThreadPoolExecutor(1) as pool:
+        started = pool.submit(manager.start_transfer, request, owner=TransferOwner.TRANSCEIVER)
+        try:
+            assert entered.wait(5)
+            tracker.complete(42, version)
+            assert not tracker.drained(version)
+        finally:
+            proceed.set()
+        started.result(5)
+    assert manager.end_transfer(request, owner=TransferOwner.TRANSCEIVER)
+    assert tracker.drained(version)
 
 
 def test_end_transfer_preserves_error_state():

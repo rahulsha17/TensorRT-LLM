@@ -5,12 +5,19 @@
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from itertools import chain
 from threading import Lock
 
 from .execution_authority import Revision
 from .execution_version import ExecutionVersion
 
-__all__ = ["FenceRequest", "FenceReceipt", "RevisionFence", "RequestDrainTracker"]
+__all__ = [
+    "FenceRequest",
+    "FenceReceipt",
+    "RevisionFence",
+    "RequestDrainTracker",
+    "RequestResourceClaim",
+]
 
 
 @dataclass(frozen=True)
@@ -49,8 +56,22 @@ class RevisionFence:
         return self._future.result(timeout=timeout)
 
 
+@dataclass(frozen=True, eq=False)
+class RequestResourceClaim:
+    """One worker-local accessor whose completion is separate from its request.
+
+    Only the exact object returned by its tracker can release the claim. Request
+    IDs and owner names may be reused after completion; they are not release
+    capabilities. A claim neither grants authority nor reserves native memory.
+    """
+
+    request_id: int
+    version: ExecutionVersion
+    owner: str
+
+
 class RequestDrainTracker:
-    """Track engine admissions until terminal cleanup, including queued work.
+    """Track engine admissions and resource accessors through their cleanup.
 
     Enqueue and registration share a lock so fast completion cannot overtake
     registration. The owner must close admission before asking whether a scope
@@ -60,6 +81,7 @@ class RequestDrainTracker:
     def __init__(self) -> None:
         self._lock = Lock()
         self._requests: dict[int, ExecutionVersion] = {}
+        self._resources: dict[RequestResourceClaim, ExecutionVersion] = {}
         self._broadcasted: set[int] = set()
         self._error: Exception | None = None
 
@@ -130,6 +152,53 @@ class RequestDrainTracker:
             if self._error is None:
                 self._error = error
 
+    def acquire_resource(
+        self,
+        request_id: int,
+        version: ExecutionVersion,
+        owner: str,
+        *,
+        parent: RequestResourceClaim | None = None,
+    ) -> RequestResourceClaim:
+        """Register an accessor before it can touch resources or outlive cleanup.
+
+        The request must still be admitted, or an existing claim must explicitly
+        cover the same request/version while a dependent accessor is registered.
+        Taking a child claim and releasing its parent are serialized, so no
+        apparent empty interval can let FENCE pass between the two owners.
+        """
+        if type(request_id) is not int or not isinstance(version, ExecutionVersion):
+            raise TypeError("resource claim requires a request ID and execution version")
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("resource owner must be a nonempty string")
+        with self._lock:
+            self._require_healthy()
+            if parent is None:
+                valid = self._requests.get(request_id) == version
+            else:
+                valid = (
+                    isinstance(parent, RequestResourceClaim)
+                    and self._resources.get(parent) == version
+                    and parent.request_id == request_id
+                    and parent.version == version
+                )
+            if not valid:
+                self._error = RuntimeError("resource accessor has no matching live owner")
+                raise self._error
+            claim = RequestResourceClaim(request_id, version, owner)
+            self._resources[claim] = version
+            return claim
+
+    def release_resource(self, claim: RequestResourceClaim) -> None:
+        """Record proven accessor completion after its native release succeeds."""
+        with self._lock:
+            if not isinstance(claim, RequestResourceClaim) or claim not in self._resources:
+                error = RuntimeError("resource completion has no matching live claim")
+                if self._error is None:
+                    self._error = error
+                raise error
+            del self._resources[claim]
+
     def complete(self, request_id: int, version: ExecutionVersion | None) -> None:
         """Record terminal cleanup, or removal of a never-activated queue item."""
         with self._lock:
@@ -147,7 +216,7 @@ class RequestDrainTracker:
             return not any(
                 (v.tenant_id, v.scope_id) == (version.tenant_id, version.scope_id)
                 and v.epoch <= version.epoch
-                for v in self._requests.values()
+                for v in chain(self._requests.values(), self._resources.values())
             )
 
     def _require_healthy(self) -> None:

@@ -581,9 +581,20 @@ releasing the old owner's resources, after the GPU completion wait. A fence rece
 permission to run the successor. It also does not wait for obsolete IPC responses
 to disappear; existing output gates prevent those responses from being delivered.
 
-The supported configurations remain those of step 5. Multi-rank execution and
-KV transfers/connectors need their own completion evidence before they can
-participate in this protocol.
+Worker-local resource claims keep FENCE pending when a transfer outlives the
+request's terminal cleanup. The transfer manager registers a separate claim for
+the transceiver and connector before releasing the sequence slot or pinning KV.
+Each accessor releases its claim only after completion; the last claim follows
+successful native unpinning. A dependent accessor can take a claim from a live
+parent even after the request leaves the executor. The transition is atomic with
+FENCE polling, and a reused request ID cannot release an earlier allocation's
+claim. Uncertain setup or release makes drain unknown and requires a restart.
+
+These claims account for resource lifetime; they do not publish authority or
+validate transferred content. End-to-end disaggregated RETIRE still needs shared
+authority across prefill and decode, version-bound transfer admission, receive
+ownership and prefix validation. Device guards continue to reject transfer and
+connector configurations until those paths are integrated and qualified.
 
 ## ALIGN (step 7)
 
