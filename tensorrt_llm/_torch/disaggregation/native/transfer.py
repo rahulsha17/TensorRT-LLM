@@ -18,7 +18,6 @@ from __future__ import annotations
 import math
 import os
 import queue
-import struct
 import threading
 import time
 import weakref
@@ -73,6 +72,17 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
+from tensorrt_llm._torch.disaggregation.native.execution_wire import (
+    _ENVELOPE as _EXECUTION_ENVELOPE,
+)
+from tensorrt_llm._torch.disaggregation.native.execution_wire import (
+    KV_RESULT_PREFIX as _KV_RESULT_PREFIX,
+)
+from tensorrt_llm._torch.disaggregation.native.execution_wire import (
+    ExecutionTransferWire,
+    MessageType,
+    TransferIdentityError,
+)
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
@@ -115,6 +125,22 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+
+
+def _send_control_message(
+    owner: Sender | Receiver, messenger: ZMQMessenger, message: list[bytes]
+) -> None:
+    wire = getattr(owner, "_execution_wire", None)
+    messenger.send(message if wire is None else wire.encode(message))
+
+
+def _decode_control_message(owner: Sender | Receiver, message: list[bytes]) -> list[bytes]:
+    wire = getattr(owner, "_execution_wire", None)
+    if wire is None:
+        if message and message[0] == _EXECUTION_ENVELOPE:
+            raise TransferIdentityError("versioned transfer requires a bound wire adapter")
+        return message
+    return wire.decode(message)
 
 
 class _TransferNotSubmittedError(RuntimeError):
@@ -193,17 +219,6 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
-
-
-class MessageType:
-    TERMINATION = b"TERMINATION"
-    KV_AGENT_RESULT = b"KV_AGENT_RESULT"
-    REQUEST_DATA = b"REQUEST_DATA"
-    REQUEST_INSTANCE_INFO = b"REQUEST_INSTANCE_INFO"
-    REGISTER_RANK_INFO = b"REGISTER_RANK_INFO"
-    AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
-    CANCEL_SESSION = b"CANCEL_SESSION"
-    SESSION_QUIESCED = b"SESSION_QUIESCED"
 
 
 class PeerIncompatibleError(ValueError):
@@ -598,7 +613,6 @@ class AgentResult(Enum):
 # KV_AGENT_RESULT prefix in one struct frame (was ascii frames serialized/parsed under the
 # GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status,
 # transfer_size. The optional bounce tail follows at message[2:].
-_KV_RESULT_PREFIX = struct.Struct("<qqq?Bq")
 _AGENT_RESULT_CODE = {
     AgentResult.SUCCESS: 0,
     AgentResult.FAILED: 1,
@@ -939,7 +953,9 @@ class Sender(SenderBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        execution_wire: Optional[ExecutionTransferWire] = None,
     ) -> None:
+        self._execution_wire = execution_wire
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
@@ -1250,7 +1266,9 @@ class Sender(SenderBase):
                 if isinstance(write_meta, tuple):
                     endpoint, message = write_meta
                     try:
-                        self._get_or_connect_thread_dealer(endpoint).send(message)
+                        _send_control_message(
+                            self, self._get_or_connect_thread_dealer(endpoint), message
+                        )
                     except Exception as e:
                         logger.warning(f"failed to send transfer rejection: {e}")
                     continue
@@ -1299,7 +1317,9 @@ class Sender(SenderBase):
         pending = _PendingSettlement(write_meta, initial_report, send_slot_id)
         self._pending_settlements[thread_idx][key] = pending
         try:
-            self._get_result_dealer(write_meta.peer_endpoint).send(initial_report)
+            _send_control_message(
+                self, self._get_result_dealer(write_meta.peer_endpoint), initial_report
+            )
         except Exception as error:
             logger.warning(f"Failed to report ambiguous transfer; retaining evidence: {error}")
             pending.report_error_logged = True
@@ -1313,7 +1333,7 @@ class Sender(SenderBase):
             try:
                 dealer = self._get_result_dealer(meta.peer_endpoint)
                 if pending.initial_report is not None:
-                    dealer.send(pending.initial_report)
+                    _send_control_message(self, dealer, pending.initial_report)
                     pending.initial_report = None
                 if not pending.backend_done:
                     if not meta.task.poll_in_doubt_physical_operation(meta.peer_rank):
@@ -1334,7 +1354,7 @@ class Sender(SenderBase):
                         True,
                         AgentResult.FAILED_QUIESCED,
                     )
-                dealer.send(message)
+                _send_control_message(self, dealer, message)
             except Exception as error:
                 # Sending may have escaped before raising. A duplicate settlement
                 # is idempotent; losing the only remaining report is not safe.
@@ -1435,14 +1455,16 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+            _send_control_message(
+                self,
+                self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True),
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
                     write_meta.receiver_slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
-                )
+                ),
             )
             return
 
@@ -1468,14 +1490,16 @@ class Sender(SenderBase):
                 if owned:
                     task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+                _send_control_message(
+                    self,
+                    self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True),
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
                         write_meta.receiver_slice_id,
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
-                    )
+                    ),
                 )
                 return
             if timer:
@@ -1550,7 +1574,7 @@ class Sender(SenderBase):
         if agent_result == AgentResult.IN_DOUBT:
             self._retain_in_doubt_transfer(write_meta, result_msg, send_slot_id)
             return
-        self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
+        _send_control_message(self, self._get_result_dealer(write_meta.peer_endpoint), result_msg)
 
         with task.lock:
             task.transferred_count += 1
@@ -1620,12 +1644,14 @@ class Sender(SenderBase):
                 # eligible claimant. Keep the claim at the send boundary so
                 # duplicate dispatch cannot publish contradictory evidence.
                 if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
-                    self._get_result_dealer(write_meta.peer_endpoint).send(
+                    _send_control_message(
+                        self,
+                        self._get_result_dealer(write_meta.peer_endpoint),
                         _make_aux_result_msg(
                             self._instance_rank,
                             write_meta.unique_rid,
                             AgentResult.FAILED,
-                        )
+                        ),
                     )
                 return
             if timer:
@@ -1657,12 +1683,14 @@ class Sender(SenderBase):
                     _make_aux_result_msg(self._instance_rank, write_meta.unique_rid, agent_result),
                 )
                 return
-            self._get_result_dealer(write_meta.peer_endpoint).send(
+            _send_control_message(
+                self,
+                self._get_result_dealer(write_meta.peer_endpoint),
                 _make_aux_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
                     agent_result,
-                )
+                ),
             )
 
         if agent_result == AgentResult.IN_DOUBT:
@@ -1949,7 +1977,11 @@ class Sender(SenderBase):
     def _start_listener(self):
         def handle_message(messages: list[bytes]):
             send_id = messages[0]
-            msg = messages[1:]
+            try:
+                msg = _decode_control_message(self, messages[1:])
+            except TransferIdentityError as error:
+                logger.error(f"Rejected KV control message: {error}")
+                return True
             match msg[0]:
                 case MessageType.TERMINATION:
                     return False
@@ -2055,12 +2087,14 @@ class Sender(SenderBase):
         ):
             return False
         try:
-            self._get_or_connect_thread_dealer(marker.endpoint).send(
+            _send_control_message(
+                self,
+                self._get_or_connect_thread_dealer(marker.endpoint),
                 [
                     MessageType.SESSION_QUIESCED,
                     str(self._instance_rank).encode("ascii"),
                     str(marker.unique_rid).encode("ascii"),
-                ]
+                ],
             )
         except Exception as error:
             logger.warning(f"Failed to acknowledge fenced session {marker.unique_rid}: {error}")
@@ -2228,7 +2262,7 @@ class Sender(SenderBase):
             return
         dealer = self._get_or_connect_dealer(endpoint)
         for message in messages:
-            dealer.send(message)
+            _send_control_message(self, dealer, message)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
@@ -2276,8 +2310,10 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                _send_control_message(
+                    self,
+                    self._get_or_connect_dealer(peer_ri.self_endpoint),
+                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")],
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
@@ -3047,7 +3083,9 @@ class Receiver(ReceiverBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        execution_wire: Optional[ExecutionTransferWire] = None,
     ):
+        self._execution_wire = execution_wire
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
@@ -3443,7 +3481,7 @@ class Receiver(ReceiverBase):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
             try:
-                messenger.send([MessageType.REQUEST_INSTANCE_INFO])
+                _send_control_message(self, messenger, [MessageType.REQUEST_INSTANCE_INFO])
                 message = messenger.receive()
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
@@ -3482,7 +3520,9 @@ class Receiver(ReceiverBase):
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
                 rank_info = self._registrar.self_rank_info
-                dealer.send([MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()])
+                _send_control_message(
+                    self, dealer, [MessageType.REGISTER_RANK_INFO, rank_info.to_bytes()]
+                )
 
             self._sender_ep_instance_map[info_endpoint] = sender_info
             return sender_info
@@ -3501,7 +3541,7 @@ class Receiver(ReceiverBase):
         sent = set()
         for endpoint in sender_endpoints:
             try:
-                self._get_or_connect_dealer(endpoint).send(message)
+                _send_control_message(self, self._get_or_connect_dealer(endpoint), message)
                 sent.add(endpoint)
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
@@ -3510,7 +3550,11 @@ class Receiver(ReceiverBase):
     def _start_listener(self):
         def handle_message(messages: list[bytes]) -> bool:
             send_id = messages[0]
-            msg = messages[1:]
+            try:
+                msg = _decode_control_message(self, messages[1:])
+            except TransferIdentityError as error:
+                logger.error(f"Rejected KV control message: {error}")
+                return True
             match msg[0]:
                 case MessageType.TERMINATION:
                     return False
@@ -3610,7 +3654,7 @@ class Receiver(ReceiverBase):
         # receiver_info serialized once and reused for every peer rank (block-table msgpack isn't free at fan-out).
         logger.debug("Sending data request to endpoint '%s'", endpoint)
         messenger = self._get_or_connect_dealer(endpoint)
-        messenger.send([MessageType.REQUEST_DATA, receiver_info_bytes])
+        _send_control_message(self, messenger, [MessageType.REQUEST_DATA, receiver_info_bytes])
 
     def __del__(self):
         try:
@@ -4596,6 +4640,7 @@ class TransferWorker:
         self._execution_session_lock = threading.Lock()
         self._execution_drain: Optional[RequestDrainTracker] = None
         self._execution_authority: Optional[WorkerVersionTable] = None
+        self._execution_wire = ExecutionTransferWire()
         self._sessions_started = False
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
@@ -4679,6 +4724,7 @@ class TransferWorker:
                 raise RuntimeError(
                     "KV execution authority requires physical ownership and retirement"
                 )
+            self._execution_wire.bind(table)
             self._execution_drain = table.drain_tracker
             self._execution_authority = table
 
@@ -4691,13 +4737,23 @@ class TransferWorker:
         with self._execution_session_lock:
             self._sessions_started = True
             version = getattr(request, "py_execution_version", None)
+            params = request.py_disaggregated_params
+            transfer_id = params.disagg_request_id
+            if transfer_id is None:
+                transfer_id = params.ctx_request_id
+            if transfer_id is None:
+                transfer_id = request.py_request_id
+            cache_salt = getattr(request, "cache_salt", None)
+            wire = getattr(self, "_execution_wire", None)
             if version is None:
+                if wire is not None:
+                    wire.register_local(transfer_id, direction, None, cache_salt)
                 return create()
             drain = self._execution_drain
             if drain is None:
                 raise RuntimeError("tagged KV session requires execution drain tracking")
             table = self._execution_authority
-            if table is None:
+            if table is None or wire is None:
                 raise RuntimeError("tagged KV session requires execution authority")
             if table.drain_tracker is not drain:
                 raise RuntimeError("execution authority drain tracker changed")
@@ -4705,9 +4761,22 @@ class TransferWorker:
             # construction can block, so it runs after that lock is released.
             claim = table.admit_resource(request.py_request_id, version, f"kv-{direction}-session")
             try:
+                wire.register_local(transfer_id, direction, version, cache_salt)
+            except Exception:
+                # No constructor or native publication has run. This exact
+                # claim can be retired without releasing any existing session.
+                try:
+                    drain.release_resource(claim)
+                except Exception as error:
+                    drain.fail(error)
+                    raise
+                raise
+            try:
                 session = create()
                 if (
                     not session._enforce_physical_ownership
+                    or session.disagg_request_id != transfer_id
+                    or getattr(request, "cache_salt", None) != cache_salt
                     or session.request_id != claim.request_id
                     or request.py_request_id != claim.request_id
                     or request.py_execution_version != version
@@ -4816,6 +4885,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                execution_wire=self._execution_wire,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
@@ -4823,6 +4893,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                execution_wire=self._execution_wire,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint

@@ -9,6 +9,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.native.execution_wire import (
+    ExecutionTransferWire,
+    TransferIdentityError,
+)
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
@@ -26,6 +30,7 @@ def _worker():
     worker._execution_session_lock = threading.Lock()
     worker._execution_drain = None
     worker._execution_authority = None
+    worker._execution_wire = ExecutionTransferWire()
     worker._sessions_started = False
     worker._config = TransferWorkerConfig(
         kv_cache_manager=Mock(),
@@ -413,3 +418,66 @@ def test_authority_binding_is_fixed_before_session_admission():
     assert _create(untagged, "send", _request(None)).close()
     with pytest.raises(RuntimeError, match="after session admission"):
         untagged.bind_execution_authority(table)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+def test_reused_exchange_releases_only_unpublished_claim(direction):
+    worker, drain = _worker(), RequestDrainTracker()
+    _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    original = _create(worker, direction, _request())
+    original_claims = set(drain._resources)
+    with pytest.raises(TransferIdentityError, match="reused"):
+        _create(worker, direction, _request())
+    assert set(drain._resources) == original_claims
+    _peer(worker, direction).setup_session.assert_called_once()
+    drain.complete(41, VERSION)
+    assert not drain.drained(VERSION)
+    assert original.close()
+    assert drain.drained(VERSION)
+    # Cleanup does not permit a delayed message to target a recycled ID.
+    drain.enqueue(VERSION, lambda: 42)
+    successor = _request()
+    successor.py_request_id = 42
+    with pytest.raises(TransferIdentityError, match="reused"):
+        _create(worker, direction, successor)
+    drain.complete(42, VERSION)
+    assert drain.drained(VERSION)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("field", ["cache_salt", "disagg_request_id"])
+def test_native_construction_cannot_change_bound_wire_identity(direction, field):
+    worker, drain = _worker(), RequestDrainTracker()
+    _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    request = _request()
+    request.cache_salt = "original"
+
+    def mutate(_session):
+        if field == "cache_salt":
+            request.cache_salt = "changed"
+        else:
+            request.py_disaggregated_params.disagg_request_id = 100
+
+    _peer(worker, direction).setup_session.side_effect = mutate
+    with pytest.raises(RuntimeError, match="ownership changed"):
+        _create(worker, direction, request)
+    drain.complete(41, VERSION)
+    with pytest.raises(RuntimeError, match="drain is unknown"):
+        drain.drained(VERSION)
+
+
+@pytest.mark.parametrize("direction", ["send", "receive"])
+@pytest.mark.parametrize("context_id", [None, 98])
+def test_wire_uses_session_id_fallback_before_publication(direction, context_id):
+    worker, drain = _worker(), RequestDrainTracker()
+    _bind(worker, drain)
+    drain.enqueue(VERSION, lambda: 41)
+    request = _request(wire_id=None)
+    request.py_disaggregated_params.ctx_request_id = context_id
+    session = _create(worker, direction, request)
+    assert session.disagg_request_id == (41 if context_id is None else context_id)
+    assert session.close()
+    drain.complete(41, VERSION)
+    assert drain.drained(VERSION)

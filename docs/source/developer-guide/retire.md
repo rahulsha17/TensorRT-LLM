@@ -663,8 +663,27 @@ ordinary rejection does not poison drain. If the claim wins, publication can
 continue while session construction runs. That claim keeps FENCE pending until
 physical cleanup, even if the request is canceled during construction. A pending
 ALIGN/RESUME cannot admit a session. Binding only a drain tracker is insufficient
-for tagged sessions. Transfer messages and per-operation dispatch still need their
-own version validation before the disaggregated path can be enabled.
+for tagged sessions.
+
+The native Python transfer worker also binds each exchange to an immutable wire
+identity: authority session, tenant, scope, epoch, transfer ID and cache salt.
+Requests, KV and auxiliary results, cancellation and quiescence messages carry
+that identity. A listener rejects a mismatched or stripped identity before
+dispatch. Peer requests may arrive before the local session; later local admission
+must match the peer's binding. Both endpoints must support the envelope.
+
+Matching old completion and cancellation messages remain usable after revocation
+or authority shutdown. They identify the old transfer and can help it drain;
+they cannot restore authority. The worker retains bindings after session cleanup
+and forbids reusing a local transfer ID in the same direction. This prevents a
+delayed message from reaching a different allocation. These bindings currently
+last for the worker's lifetime and are not compacted. They identify exchanges
+within the trusted control plane; they do not authenticate a network peer.
+
+Per-operation admission still needs current-authority checks before destination
+publication and backend submission. Wire identity alone does not reject new work
+on a session that was admitted before revocation. The disaggregated feature
+guards remain in place until that integration and physical qualification finish.
 
 These claims account for resource lifetime; they do not publish authority or
 validate transferred content. End-to-end disaggregated RETIRE still needs shared
