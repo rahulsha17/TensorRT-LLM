@@ -54,10 +54,15 @@ def test_reuse_limit_must_cover_minimum_and_transfer():
         )
 
 
-@pytest.mark.parametrize("limit,acquired", [(0, 0), (2, 0), (2, 2), (4, 3)])
-def test_bounded_resume_enforces_actual_acquired_prefix_through_ipc(setup, limit, acquired):
+@pytest.mark.parametrize(
+    "limit,acquired,attached",
+    [(0, 0, 0), (2, 0, 0), (2, 0, 2), (2, 2, 2), (4, 3, 3), (4, 3, 4), (35, 32, 32)],
+)
+def test_bounded_resume_allows_lookup_between_reservation_and_runtime_bound(
+    setup, limit, acquired, attached
+):
     controller, _, _, state, reserve, _ = setup
-    revised = replace(INPUT, max_reuse_tokens=limit)
+    revised = replace(INPUT, input_token_ids=tuple(range(limit + 2)), max_reuse_tokens=limit)
     hold = Mock(num_tokens=acquired)
     reserve.side_effect = lambda _: hold
     advance = controller.advance(REVISION, alignment=revised)
@@ -67,14 +72,57 @@ def test_bounded_resume_enforces_actual_acquired_prefix_through_ipc(setup, limit
     assert receipt.reusable_prefix_length == acquired
     controller.resume(receipt).wait()
     controller.resume(receipt).wait()
-    assert state.claim(NEW, 10, revised.input_token_ids, revised.cache_salt, None) == acquired
-    # A longer ordinary cache hit must not silently cross the agreed boundary,
-    # even when it would still fit beneath the runtime's upper bound.
-    with pytest.raises(RuntimeError, match="agreed KV prefix"):
-        state.confirm_attachment(NEW, 10, acquired + 1)
+    assert state.claim(NEW, 10, revised.input_token_ids, revised.cache_salt, None) == limit
+    # Newly available compatible entries are allowed only inside the runtime's
+    # boundary. The native reservation still guarantees its acquired floor.
+    with pytest.raises(RuntimeError, match="runtime bound"):
+        state.confirm_attachment(NEW, 10, limit + 1)
+    if acquired:
+        with pytest.raises(RuntimeError, match="aligned KV prefix"):
+            state.confirm_attachment(NEW, 10, acquired - 1)
     hold.close.assert_not_called()
-    state.confirm_attachment(NEW, 10, acquired)
+    state.confirm_attachment(NEW, 10, attached)
     hold.close.assert_called_once()
+
+
+@pytest.mark.parametrize("limit,acquired,agreed", [(0, 0, 0), (4, 3, 0), (4, 3, 2), (4, 3, 3)])
+def test_explicit_bounded_resume_keeps_exact_attachment(limit, acquired, agreed):
+    revised = replace(INPUT, max_reuse_tokens=limit)
+    request = AlignmentRequest("session", REVISION, revised)
+    hold = Mock(num_tokens=acquired)
+    state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    receipt = state.poll(request)
+    state.authorize_resume(receipt, agreed)
+    state.authorize_resume(receipt, agreed)
+    assert state.claim(NEW, 10, revised.input_token_ids, revised.cache_salt, None) == agreed
+    with pytest.raises(RuntimeError, match="agreed KV prefix"):
+        state.confirm_attachment(NEW, 10, agreed + 1)
+    if agreed:
+        with pytest.raises(RuntimeError, match="agreed KV prefix"):
+            state.confirm_attachment(NEW, 10, agreed - 1)
+    hold.close.assert_not_called()
+    state.confirm_attachment(NEW, 10, agreed)
+    hold.close.assert_called_once()
+    state.close()
+    state.process()
+
+
+def test_default_bounded_resume_cannot_be_changed_to_exact_on_retry():
+    revised = replace(INPUT, max_reuse_tokens=4)
+    request = AlignmentRequest("session", REVISION, revised)
+    state = WorkerAlignmentState(lambda _: Mock(num_tokens=3), lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    receipt = state.poll(request)
+    state.authorize_resume(receipt)
+    state.authorize_resume(receipt)
+    with pytest.raises(RuntimeError, match="cannot change"):
+        state.authorize_resume(receipt, 3)
+    assert state.claim(NEW, 10, revised.input_token_ids, revised.cache_salt, None) == 4
+    state.close()
+    state.process()
 
 
 def test_over_limit_reservation_is_rejected_and_reclaimed():

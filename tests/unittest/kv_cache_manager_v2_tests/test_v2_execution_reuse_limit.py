@@ -7,6 +7,10 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor.execution_alignment import _Reservation
+from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentRequest, WorkerAlignmentState
+from tensorrt_llm.execution_authority import Revision
+from tensorrt_llm.execution_version import ExecutionVersion
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -150,3 +154,73 @@ def test_reuse_limit_preserves_backoff_evidence(cache_fixture, limit):
     owner.commit(tokens)
     successor = create(tokens, max_reuse_tokens=limit)
     assert successor.num_committed_tokens == limit
+
+
+@pytest.mark.parametrize("limit", [0, 8, 10, 12])
+@pytest.mark.parametrize("exact", [False, True], ids=["runtime-bound", "exact-common-prefix"])
+def test_alignment_can_acquire_later_committed_pages_within_runtime_bound(
+    cache_fixture, limit, exact
+):
+    core, create, _ = cache_fixture
+    tokens = list(range(12))
+    owner = create()
+    _fill(core, owner, 11)
+    owner.commit(tokens[:8])
+    old = ExecutionVersion("tenant", "scope", 0)
+    new = ExecutionVersion("tenant", "scope", 1)
+    revised = AlignmentInput(tuple(range(13)), max_reuse_tokens=limit)
+    request = AlignmentRequest("session", Revision("edit", old, new), revised)
+
+    def reserve(revised_input):
+        held = create(tokens[: revised_input.reuse_limit], max_reuse_tokens=limit)
+        return _Reservation(int(held.num_committed_tokens), held.close, torch.cuda.synchronize)
+
+    state = WorkerAlignmentState(reserve, lambda: None)
+    try:
+        state.observe(new, request)
+        state.process()
+        receipt = state.poll(request)
+        acquired = min(limit, 8)
+        assert receipt.reusable_prefix_length == acquired
+
+        # Another native owner completes additional compatible pages while the
+        # ALIGN hold remains live. Its bytes are committed before successor lookup.
+        producer = create(tokens[:8])
+        _fill(core, producer, 17, start_token=8)
+        producer.commit(tokens[8:])
+        _, produced_pages = _pages(core, producer)
+        state.authorize_resume(receipt, acquired if exact else None)
+        permitted = state.claim(new, 42, revised.input_token_ids, None, None)
+        expected = acquired if exact else limit
+        assert permitted == expected
+        successor = create(tokens, max_reuse_tokens=permitted)
+        assert successor.num_committed_tokens == expected
+        state.confirm_attachment(new, 42, successor.num_committed_tokens)
+        assert state.snapshot()["held_count"] == 0
+
+        _fill(core, successor, 29, start_token=expected)
+        _, private_pages = _pages(core, successor)
+        successor.commit(tokens[expected:])
+        _, actual_pages = _pages(core, successor)
+        complete_blocks = expected // 4
+        assert actual_pages[:complete_blocks] == produced_pages[:complete_blocks]
+        assert actual_pages[complete_blocks:] == private_pages[complete_blocks:]
+        assert all(
+            page != produced
+            for page, produced in zip(
+                actual_pages[complete_blocks:], produced_pages[complete_blocks:]
+            )
+        )
+        actual = _read(core, successor).reshape(-1)
+        bytes_per_token = actual.size // 12
+        first = min(expected, 8) * bytes_per_token
+        end = expected * bytes_per_token
+        assert np.all(actual[:first] == 11)
+        assert np.all(actual[first:end] == 17)
+        assert np.all(actual[end:] == 29)
+        original = _read(core, producer).reshape(-1)
+        assert np.all(original[: 8 * bytes_per_token] == 11)
+        assert np.all(original[8 * bytes_per_token :] == 17)
+    finally:
+        state.close()
+        state.process()

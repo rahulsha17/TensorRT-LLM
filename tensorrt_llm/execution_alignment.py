@@ -414,10 +414,6 @@ class WorkerAlignmentState:
         with self._lock:
             if self.poll(receipt.request) != receipt:
                 raise RuntimeError("RESUME does not match the live ALIGN reservation")
-            if prefix_length is None and receipt.request.revised_input.max_reuse_tokens is not None:
-                # Bind single-worker admission too: a later cache hit must not
-                # extend a numerically bounded reservation into its suffix.
-                prefix_length = receipt.reusable_prefix_length
             if prefix_length is not None and (
                 type(prefix_length) is not int
                 or not receipt.request.revised_input.required_prefix_length
@@ -470,7 +466,7 @@ class WorkerAlignmentState:
         cache_salt: str | None,
         lora_task_id: int | None,
     ) -> int | None:
-        """Bind one physical request and return its agreed cache-lookup limit."""
+        """Bind one physical request and return its permitted cache-lookup limit."""
         with self._lock:
             record = self._record_for_version(version)
             if record is None:
@@ -487,7 +483,14 @@ class WorkerAlignmentState:
             if record.request_id is not None and record.request_id != request_id:
                 raise RuntimeError("RESUME already belongs to another request")
             record.request_id = request_id
-            return record.resume_prefix_length
+            # Collective RESUME fixes an exact common prefix. Otherwise the
+            # reservation guarantees a floor, while the runtime's bound also
+            # permits compatible cache entries acquired after ALIGN.
+            return (
+                record.resume_prefix_length
+                if record.resume_prefix_length is not None
+                else revised.max_reuse_tokens
+            )
 
     def confirm_attachment(
         self, version: ExecutionVersion, request_id: int, reused_tokens: int
@@ -512,6 +515,8 @@ class WorkerAlignmentState:
                     record.receipt is None or reused_tokens < record.receipt.reusable_prefix_length
                 ):
                     raise RuntimeError("successor did not acquire the aligned KV prefix")
+                elif reused_tokens > record.request.revised_input.reuse_limit:
+                    raise RuntimeError("successor cache reuse exceeds the runtime bound")
                 record.attached = True
             self._reclaim(record, settle=True)
 
