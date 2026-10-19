@@ -1292,6 +1292,36 @@ revision-to-first-token, no-revision overhead, and live-neighbor latency. The
 older post-prefill campaign does not measure these new hooks, and its speedup
 numbers must not be presented as validation of this change.
 
+## Explicit Torch BLAS preference
+
+Cached and cold computation can use different matrix shapes even with identical
+prefix tokens. A model whose output contract requires exact cold equivalence
+must validate those shapes on its actual software and hardware configuration.
+Changing the BLAS preference is one explicit configuration choice; it does not
+certify numerical equivalence or replace the reuse ceiling.
+
+The experimental PyTorch option is:
+
+```yaml
+torch_blas_preference: cublaslt
+```
+
+The default is `None`, which leaves Torch's existing preference unchanged. An
+explicit preference is assigned before model construction and checked after
+configuration resolution, at warmup and on the execution thread. It preserves
+the BF16 reduction and split-K settings, which must both be enabled. Unsupported
+Torch readbacks or a subsequent change to protected settings fail initialization
+or execution rather than silently using a different policy.
+
+The option currently requires a fresh local TP1 decoder worker without Torch
+compilation, speculative decoding, encoder-only execution or a KV connector.
+It cannot attach to an existing worker. Since the preference is process-wide,
+explicit and unset policies cannot share a worker process; a failed explicit
+initialization requires a fresh process. A preference does not guarantee the
+library or kernel selected for every operation. Keep the same declared policy
+in native and RETIRE comparisons, and separately validate the complete model,
+revision and output contract before interpreting performance measurements.
+
 ## Testing
 
 ### Native attention predicates

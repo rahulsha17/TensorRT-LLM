@@ -56,6 +56,10 @@ from .hang_diagnostics import monitor_executor_initialization
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .torch_blas_policy import (initialize_torch_blas_policy,
+                                mark_torch_blas_policy_failed,
+                                validate_torch_blas_policy_scope,
+                                verify_torch_blas_policy)
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -421,6 +425,12 @@ def create_encoder_executor(
     Returns:
         An EncoderExecutor instance ready for batch_forward() calls.
     """
+    if llm_args.torch_blas_preference is not None:
+        raise ValueError(
+            "Explicit Torch BLAS preference is unsupported for encoder-only execution"
+        )
+    initialize_torch_blas_policy(None)
+
     from .encoder_executor import EncoderExecutor
 
     llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
@@ -536,6 +546,9 @@ def _create_py_executor(
                        creation_metrics):
         llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
+
+    validate_torch_blas_policy_scope(llm_args)
+    verify_torch_blas_policy(llm_args.torch_blas_preference, "resolved_config")
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -1318,6 +1331,8 @@ def create_py_executor(
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
     try:
+        validate_torch_blas_policy_scope(llm_args)
+        initialize_torch_blas_policy(llm_args.torch_blas_preference)
         with monitor_executor_initialization(), _StartupTimer(
                 "executor_creation") as startup_timer:
             return _create_py_executor_impl(
@@ -1329,6 +1344,7 @@ def create_py_executor(
                 resource_governor_queue=resource_governor_queue,
             )
     except BaseException:
+        mark_torch_blas_policy_failed(llm_args.torch_blas_preference)
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):

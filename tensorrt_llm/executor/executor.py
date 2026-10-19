@@ -611,6 +611,10 @@ class GenerationExecutor(ExecutionControlMixin, ABC):
         # frontend processes).
         attach_env = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
         if attach_env:
+            if getattr(llm_args, "torch_blas_preference", None) is not None:
+                raise ValueError(
+                    "An explicit Torch BLAS preference cannot attach to an existing worker"
+                )
             attach_info = json.loads(attach_env)
             # Consumed: it carries the HMAC keys and must not leak into
             # descendant processes.

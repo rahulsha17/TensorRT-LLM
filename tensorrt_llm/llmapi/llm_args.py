@@ -5862,6 +5862,16 @@ TORCH_LLMARGS_REMOVED_ARGS = frozenset(_TORCH_LLMARGS_REMOVED_ARG_CHECKS)
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
+    torch_blas_preference: Optional[Literal["cublaslt"]] = Field(
+        default=None,
+        description=(
+            "Experimental process-wide Torch BLAS preference. None preserves "
+            "the existing preference without assigning it. Explicit cublaslt "
+            "requires a fresh compatible worker process and does not change "
+            "the BF16 reduction/split-K pair. A preference does not guarantee "
+            "vendor dispatch or numerical equivalence."),
+        status="prototype")
+
     generation_config: Literal["auto", "trtllm"] = Field(
         default="trtllm",
         description=

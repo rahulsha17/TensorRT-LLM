@@ -123,6 +123,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, count_retiring_requests
+from .torch_blas_policy import verify_torch_blas_policy
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -867,6 +868,7 @@ class PyExecutor:
         # Run warmup on the execution_stream for proper synchronization with
         # KVCacheTransferManager's onboard/offload operations.
         self.is_warmup = True
+        verify_torch_blas_policy(self.llm_args.torch_blas_preference, "warmup")
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream), \
@@ -1388,6 +1390,8 @@ class PyExecutor:
         crashed = False
         self._event_loop_completed = False
         try:
+            verify_torch_blas_policy(self.llm_args.torch_blas_preference,
+                                     "execution_thread")
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
             enable_profiler = bool(os.environ.get(
