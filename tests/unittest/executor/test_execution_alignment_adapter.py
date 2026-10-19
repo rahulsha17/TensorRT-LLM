@@ -24,6 +24,10 @@ def assert_v1_release(manager):
 @pytest.fixture
 def engine():
     manager = Mock(enable_block_reuse=True, tokens_per_block=4)
+    manager.impl.tokens_per_block = 4
+    manager.impl.cache_tier_list = [0, 1]
+    manager.impl.get_life_cycle_pool_group_indices.return_value = [0]
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=16)]
     manager._derive_reuse_salt.return_value = 42
     manager.probe_prefix_match_length.return_value = 12
     executor = SimpleNamespace(
@@ -180,3 +184,188 @@ def test_reclaim_waits_on_manager_copy_stream(engine, v2):
         manager.impl.create_kv_cache.return_value.close.assert_called_once()
     else:
         assert_v1_release(manager)
+
+
+def test_v2_reservation_pressure_limits_new_promise_and_releases_budget(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=4)]
+    caches = [Mock(num_committed_tokens=n) for n in (7, 8, 8)]
+    manager.impl.create_kv_cache.side_effect = caches
+    adapter = KVAlignmentAdapter(engine)
+    first = adapter.reserve(INPUT)
+    second = adapter.reserve(INPUT)
+    assert (first.num_tokens, second.num_tokens) == (7, 8)
+    assert manager.impl.create_kv_cache.call_args.args[1] == list(INPUT.input_token_ids[:8])
+    assert adapter.reserve(INPUT).num_tokens == 0
+    assert manager.impl.create_kv_cache.call_count == 2
+    caches[0].close.assert_not_called()
+    caches[1].close.assert_not_called()
+    first.close()
+    first.close()
+    third = adapter.reserve(INPUT)
+    assert third.num_tokens == 8
+    second.close()
+    third.close()
+    assert adapter._reserved_v2_blocks == 0
+    for cache in caches:
+        cache.close.assert_called_once()
+
+
+def test_v2_capacity_accounts_for_lifecycles_sharing_each_pool(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.get_life_cycle_pool_group_indices.return_value = [0, 0, 1]
+    manager.impl.get_storage_statistics.return_value = [
+        SimpleNamespace(total=6),
+        SimpleNamespace(total=5),
+    ]
+    manager.impl.create_kv_cache.return_value = Mock(num_committed_tokens=12)
+    adapter = KVAlignmentAdapter(engine)
+    hold = adapter.reserve(INPUT)
+    assert hold.num_tokens == 12
+    assert manager.impl.create_kv_cache.call_args.args[1] == list(INPUT.input_token_ids[:12])
+    assert adapter.reserve(INPUT).num_tokens == 0
+    hold.close()
+
+
+@pytest.mark.parametrize("limit", [1, 3, 4, 7, 8, 16])
+def test_v2_capacity_and_runtime_limit_both_bound_reservation(engine, limit):
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=2)]
+    expected = min(limit, 8)
+    cache = Mock(num_committed_tokens=expected)
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+    hold = adapter.reserve(replace(INPUT, max_reuse_tokens=limit))
+    assert hold.num_tokens == expected
+    assert manager.impl.create_kv_cache.call_args.args[1] == list(INPUT.input_token_ids[:expected])
+    assert adapter._reserved_v2_blocks == (expected + 3) // 4
+    hold.close()
+    assert adapter._reserved_v2_blocks == 0
+
+
+@pytest.mark.parametrize("capacity", [0, 1])
+def test_v2_required_prefix_is_not_silently_weakened_under_pressure(engine, capacity):
+    engine.kv_cache_manager.impl.get_storage_statistics.return_value = [
+        SimpleNamespace(total=capacity)
+    ]
+    with pytest.raises(RuntimeError, match="required prefix exceeds"):
+        KVAlignmentAdapter(engine).reserve(replace(INPUT, min_reuse_tokens=8))
+    engine.kv_cache_manager.impl.create_kv_cache.assert_not_called()
+
+
+def test_v2_without_backing_tier_does_not_pin_recovery_workspace(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.cache_tier_list = [0]
+    hold = KVAlignmentAdapter(engine).reserve(INPUT)
+    assert hold.num_tokens == 0
+    manager.impl.create_kv_cache.assert_not_called()
+    manager.impl.get_storage_statistics.assert_not_called()
+    hold.settle()
+    hold.close()
+    manager._stream.synchronize.assert_not_called()
+
+
+@pytest.mark.parametrize("totals", [[0], []])
+def test_v2_empty_backing_capacity_does_not_create_a_hold(engine, totals):
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=n) for n in totals]
+    manager.impl.get_life_cycle_pool_group_indices.return_value = list(range(len(totals)))
+    assert KVAlignmentAdapter(engine).reserve(INPUT).num_tokens == 0
+    manager.impl.create_kv_cache.assert_not_called()
+
+
+def test_v2_colder_tier_does_not_expand_intermediate_capacity(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.cache_tier_list = [0, 1, 2]
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=1)]
+    manager.impl.create_kv_cache.return_value = Mock(num_committed_tokens=4)
+    hold = KVAlignmentAdapter(engine).reserve(INPUT)
+    assert hold.num_tokens == 4
+    manager.impl.get_storage_statistics.assert_called_once_with(1)
+    manager.impl.get_life_cycle_pool_group_indices.assert_called_once_with(1)
+    hold.close()
+
+
+def test_v2_cache_miss_does_not_consume_reservation_capacity(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=1)]
+    caches = [Mock(num_committed_tokens=n) for n in (0, 4)]
+    manager.impl.create_kv_cache.side_effect = caches
+    adapter = KVAlignmentAdapter(engine)
+    miss = adapter.reserve(INPUT)
+    hit = adapter.reserve(INPUT)
+    assert (miss.num_tokens, hit.num_tokens) == (0, 4)
+    miss.close()
+    assert adapter._reserved_v2_blocks == 1
+    hit.close()
+    assert adapter._reserved_v2_blocks == 0
+
+
+def test_v2_failed_native_close_does_not_return_capacity(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=2)]
+    cache = Mock(num_committed_tokens=8)
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+    hold = adapter.reserve(INPUT)
+    cache.close.side_effect = RuntimeError("close failed")
+    with pytest.raises(RuntimeError, match="close failed"):
+        hold.close()
+    assert adapter.reserve(INPUT).num_tokens == 0
+    assert adapter._reserved_v2_blocks == 2
+
+
+def test_v2_failed_settle_retains_reservation_capacity(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=2)]
+    cache = Mock(num_committed_tokens=8)
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+    hold = adapter.reserve(INPUT)
+    manager._stream.synchronize.side_effect = RuntimeError("copy completion unknown")
+    with pytest.raises(RuntimeError, match="copy completion unknown"):
+        hold.settle()
+    cache.close.assert_not_called()
+    assert adapter.reserve(INPUT).num_tokens == 0
+    assert adapter._reserved_v2_blocks == 2
+
+
+def test_v2_backing_capacity_shrink_keeps_existing_holds_charged(engine):
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=4)]
+    cache = Mock(num_committed_tokens=12)
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+    hold = adapter.reserve(INPUT)
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=2)]
+    assert adapter.reserve(INPUT).num_tokens == 0
+    assert adapter._reserved_v2_blocks == 3
+    cache.close.assert_not_called()
+    hold.close()
+    manager.impl.create_kv_cache.return_value = Mock(num_committed_tokens=8)
+    smaller = adapter.reserve(INPUT)
+    assert smaller.num_tokens == 8
+    assert manager.impl.create_kv_cache.call_args.args[1] == list(INPUT.input_token_ids[:8])
+    smaller.close()
+    assert adapter._reserved_v2_blocks == 0
+
+
+@pytest.mark.parametrize("count", [-1, 5])
+def test_v2_invalid_native_prefix_is_released_without_charging_capacity(engine, count):
+    manager = engine.kv_cache_manager
+    cache = Mock(num_committed_tokens=count)
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+    with pytest.raises(RuntimeError, match="reservation limit"):
+        adapter.reserve(replace(INPUT, max_reuse_tokens=4))
+    cache.close.assert_called_once()
+    assert adapter._reserved_v2_blocks == 0
+
+
+def test_v2_failed_partial_acquisition_cleanup_is_fatal(engine):
+    manager = engine.kv_cache_manager
+    cache = Mock(num_committed_tokens=5)
+    cache.close.side_effect = RuntimeError("native close failed")
+    manager.impl.create_kv_cache.return_value = cache
+    with pytest.raises(AlignmentSafetyError, match="V2 reservation cleanup is unknown"):
+        KVAlignmentAdapter(engine).reserve(replace(INPUT, max_reuse_tokens=4))

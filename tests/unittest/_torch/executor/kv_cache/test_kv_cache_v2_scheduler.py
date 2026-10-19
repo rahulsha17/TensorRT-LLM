@@ -337,6 +337,7 @@ def make_gen_request(
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
+    req.py_execution_version = None
     req.state_value = GEN_IN_PROGRESS
     req.get_beam_width_by_iter.return_value = beam_width
     req.num_draft_tokens = num_draft_tokens
@@ -365,6 +366,7 @@ def make_ctx_request(
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
+    req.py_execution_version = None
     req.state_value = CONTEXT_INIT
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len or context_remaining_length
@@ -390,6 +392,7 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
+    req.py_execution_version = None
     req.state_value = ENCODER_INIT
     req.encoder_output_len = encoder_output_len
     req.lora_task_id = lora_task_id
@@ -409,6 +412,7 @@ def make_disagg_request(
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
+    req.py_execution_version = None
     req.state_value = DISAGG_GEN_INIT
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len if prompt_len is not None else context_remaining_length
@@ -426,6 +430,7 @@ def make_filtered_request(request_id, state_value=0):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
+    req.py_execution_version = None
     req.state_value = state_value
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
@@ -466,6 +471,7 @@ def make_kv_cache_manager(
     mgr = Mock()
     mgr.kv_connector_manager = None
     mgr.tokens_per_block = tokens_per_block
+    mgr.mapping = Mock(pp_size=1)
     # A real policy, not an auto-created Mock attribute: the prefix-aware skip
     # is gated on ALL_REUSABLE (see _skip_pays_off_under_reuse_policy).
     mgr.block_reuse_policy = block_reuse_policy
@@ -1998,6 +2004,223 @@ class TestContextPreemption:
 # ===========================================================================
 # Deadlock detection
 # ===========================================================================
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("resume_blocked", [False, True])
+@pytest.mark.parametrize("host_full", [False, True])
+@pytest.mark.parametrize("helix", [False, True])
+def test_context_progress_when_other_context_owns_needed_pages(
+    chunked: bool, resume_blocked: bool, host_full: bool, helix: bool
+) -> None:
+    """A lower tier may need suspension or recomputation to admit a context."""
+    held = {99}
+    manager = make_kv_cache_manager(
+        prepare_context_fn=lambda req, reuse_limit=None: (
+            req.py_request_id != 0 or not resume_blocked or not held
+        ),
+        resize_context_fn=lambda req, n: req.py_request_id == 0 and not held,
+        can_evict=True,
+        has_cache_tier_below_gpu=True,
+    )
+
+    def suspend(req):
+        manager.kv_cache_map[req.py_request_id].is_active = False
+        if not host_full:
+            held.discard(req.py_request_id)
+
+    def release(req):
+        held.discard(req.py_request_id)
+        manager.kv_cache_map.pop(req.py_request_id, None)
+
+    manager.suspend_request.side_effect = suspend
+    manager.free_resources.side_effect = release
+    manager._has_cp_helix = helix
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=128,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    blocked = make_ctx_request(0, 128, is_first_context_chunk=False)
+    victim = make_ctx_request(99, 128, is_first_context_chunk=False)
+
+    out = scheduler.schedule_request([blocked, victim], set())
+
+    if helix:
+        # Preserve helix's no-evict policy; that path has no pressure validation.
+        assert out.context_requests == []
+        assert out.paused_requests == []
+        assert out.recompute_paused_requests == []
+        manager.suspend_request.assert_not_called()
+        manager.free_resources.assert_not_called()
+        return
+
+    assert ids(out.context_requests) == [0]
+    assert ids(out.paused_requests) == ([] if host_full else [99])
+    assert ids(out.recompute_paused_requests) == ([99] if host_full else [])
+    if not host_full:
+        manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("resume_blocked", [False, True])
+def test_context_recovery_can_preempt_the_first_blocked_context(
+    chunked: bool, resume_blocked: bool
+) -> None:
+    """A resident successor can progress after the cold queue head gives way."""
+    held = {0}
+    manager = make_kv_cache_manager(
+        prepare_context_fn=lambda req, reuse_limit=None: (
+            req.py_request_id == 0 or not resume_blocked or not held
+        ),
+        resize_context_fn=lambda req, n: req.py_request_id == 1 and not held,
+        can_evict=True,
+        has_cache_tier_below_gpu=True,
+    )
+
+    def suspend(req):
+        manager.kv_cache_map[req.py_request_id].is_active = False
+
+    def release(req):
+        held.discard(req.py_request_id)
+        manager.kv_cache_map.pop(req.py_request_id, None)
+
+    manager.suspend_request.side_effect = suspend
+    manager.free_resources.side_effect = release
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=128,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    cold = make_ctx_request(0, 128, is_first_context_chunk=False)
+    successor = make_ctx_request(1, 128)
+
+    out = scheduler.schedule_request([cold, successor], set())
+
+    assert ids(out.context_requests) == [1]
+    assert ids(out.recompute_paused_requests) == [0]
+    assert out.paused_requests == []
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize(
+    "guard", ["inflight", "pp", "connector", "async_transfer", "transfer_state", "versioned"]
+)
+def test_context_recovery_preserves_unsafe_owners(chunked: bool, guard: str) -> None:
+    manager = make_kv_cache_manager(
+        resize_context_fn=lambda req, n: False,
+        can_evict=True,
+        has_cache_tier_below_gpu=True,
+    )
+    blocked = make_ctx_request(0, 128, is_first_context_chunk=False)
+    victim = make_ctx_request(1, 128, is_first_context_chunk=False)
+    inflight = set()
+    if guard == "inflight":
+        inflight.add(victim.request_id)
+    elif guard == "pp":
+        manager.mapping.pp_size = 2
+    elif guard == "connector":
+        manager.kv_connector_manager = Mock()
+        manager.kv_connector_manager.has_pending_load.return_value = False
+    elif guard == "transfer_state":
+        victim.state_value = DISAGG_CTX_TRANS_IN_PROGRESS
+    elif guard == "versioned":
+        # Neither version's frontier may be reset by an unguarded scheduler replay.
+        blocked.py_execution_version = object()
+        victim.py_execution_version = object()
+    scheduler = make_scheduler(
+        manager,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    if guard == "async_transfer":
+        transfer = Mock()
+        transfer.has_any_inflight_requests.return_value = True
+        scheduler.set_async_transfer_manager(transfer)
+
+    out = scheduler.schedule_request([blocked, victim], inflight)
+
+    assert out.context_requests == []
+    assert out.paused_requests == []
+    assert out.recompute_paused_requests == []
+    manager.suspend_request.assert_not_called()
+    manager.free_resources.assert_not_called()
+
+
+def test_context_recovery_does_not_interrupt_scheduled_work() -> None:
+    manager = make_kv_cache_manager(
+        resize_context_fn=lambda req, n: req.py_request_id == 0,
+        can_evict=True,
+        has_cache_tier_below_gpu=True,
+    )
+    requests = [make_ctx_request(i, 128, is_first_context_chunk=False) for i in range(3)]
+    out = make_scheduler(manager).schedule_request(requests, set())
+    assert ids(out.context_requests) == [0]
+    assert out.paused_requests == []
+    assert out.recompute_paused_requests == []
+    manager.suspend_request.assert_not_called()
+    manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_context_recovery_is_bounded_when_releasing_pages_does_not_help(recompute: bool) -> None:
+    manager = make_kv_cache_manager(
+        resize_context_fn=lambda req, n: False,
+        can_evict=True,
+        has_cache_tier_below_gpu=True,
+    )
+    requests = [make_ctx_request(i, 128, is_first_context_chunk=False) for i in range(2)]
+    for req in requests:
+        manager.kv_cache_map[req.py_request_id]
+    manager.free_resources.side_effect = lambda req: manager.kv_cache_map.pop(req.py_request_id)
+    out = make_scheduler(manager, enable_recompute_pause=recompute).schedule_request(
+        requests, set()
+    )
+    assert out.context_requests == []
+    assert manager.suspend_request.call_count <= 2
+    assert manager.free_resources.call_count == (1 if recompute else 0)
+    assert manager.resize_context.call_count <= 6
+    assert ids(out.recompute_paused_requests) == ([1] if recompute else [])
+
+
+def test_context_recovery_does_not_admit_after_release_failure() -> None:
+    manager = make_kv_cache_manager(
+        resize_context_fn=lambda req, n: False,
+        can_evict=True,
+        has_cache_tier_below_gpu=True,
+    )
+    requests = [make_ctx_request(i, 128, is_first_context_chunk=False) for i in range(2)]
+    manager.free_resources.side_effect = RuntimeError("cache close failed")
+    with pytest.raises(RuntimeError, match="cache close failed"):
+        make_scheduler(manager).schedule_request(requests, set())
+    manager.free_resources.assert_called_once_with(requests[1])
+    # Two original attempts and one retry after suspension, none after failed close.
+    assert manager.resize_context.call_count == 3
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("guard", ["pp", "versioned"])
+def test_context_recovery_prepare_failure_does_not_expand_gpu_only_preemption(
+    chunked: bool, guard: str
+) -> None:
+    manager = make_kv_cache_manager(
+        prepare_context_fn=lambda req, reuse_limit=None: req.py_request_id == 1,
+        has_cache_tier_below_gpu=False,
+    )
+    blocked = make_ctx_request(0, 128, is_first_context_chunk=False)
+    victim = make_ctx_request(1, 128, is_first_context_chunk=False)
+    if guard == "pp":
+        manager.mapping.pp_size = 2
+    else:
+        victim.py_execution_version = object()
+    scheduler = make_scheduler(
+        manager,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    out = scheduler.schedule_request([blocked, victim], set())
+    assert ids(out.context_requests) == ([1] if chunked else [])
+    assert out.recompute_paused_requests == []
+    manager.preempt_request.assert_not_called()
+    manager.free_resources.assert_not_called()
 
 
 class TestDeadlockDetection:

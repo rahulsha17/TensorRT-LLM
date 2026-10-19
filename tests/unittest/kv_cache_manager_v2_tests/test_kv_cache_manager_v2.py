@@ -1423,6 +1423,50 @@ class TestNoBatching(TestKVCacheManagerV2):
                 if cache is not None and cache.status != _KVCache.Status.CLOSED:
                     cache.close()
 
+    def test_full_host_does_not_block_droppable_gpu_pages(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=1 << 20)
+        self.assertEqual(self.manager.get_storage_statistics(GPU_LEVEL)[0].total, 4)
+        self.assertEqual(self.manager.get_storage_statistics(CacheLevel(1))[0].total, 4)
+        caches = []
+        scopes = [ReuseScope(salt=i) for i in range(4)]
+        prompts = [[TokenId(i) for i in range(n)] for n in (16, 8, 8)]
+        try:
+            with TemporaryCudaStream([]) as holder:
+                stream = cast(CudaStream, holder.handle)
+                for index, tokens in enumerate(prompts):
+                    cache = self.manager.create_kv_cache(
+                        scopes[index], custom_priority_callback=lambda ordinal, lifecycle: 0
+                    )
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(stream))
+                    self.assertTrue(cache.resize(len(tokens), len(tokens)))
+                    cache.commit(tokens)
+                    cache.stop_committing()
+                    cache.suspend()
+                # The first cache is now held in host memory. The second is
+                # held ahead of the third in the GPU eviction queue.
+                caches[2].close()
+                host = self.manager.get_storage_statistics(CacheLevel(1))[0]
+                self.assertEqual(host.unavailable, host.total)
+                self.assertEqual(host.available, 0)
+                target = self.manager.create_kv_cache(scopes[3])
+                caches.append(target)
+                self.assertTrue(target.resume(stream))
+                self.assertTrue(target.resize(4, 4))
+                # Only the unowned cache may be dropped to make room.
+                self.assertEqual(self.manager.probe_reuse(scopes[0], prompts[0]), 16)
+                self.assertEqual(self.manager.probe_reuse(scopes[1], prompts[1]), 8)
+                self.assertEqual(caches[0].num_committed_tokens, 16)
+                self.assertEqual(caches[1].num_committed_tokens, 8)
+                target.close()
+                caches[1].close()
+                self.assertTrue(caches[0].resume(stream))
+            holder.take_finish_event().synchronize()
+        finally:
+            for cache in reversed(caches):
+                if cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
     def test_create_kv_cache_accepts_sequence_input_tokens(self) -> None:
         self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
         prompt = [self.next_token() for _ in range(8)]

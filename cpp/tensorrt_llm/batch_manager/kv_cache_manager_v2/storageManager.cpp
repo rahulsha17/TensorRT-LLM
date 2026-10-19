@@ -805,7 +805,58 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
     }
 
     PagesByLifeCycle fallenPages(numLifeCycles());
-    _prepareFreeSlots(goals, level, fallenPages, migrationRecorder, dropRecorder);
+    try
+    {
+        _prepareFreeSlots(goals, level, fallenPages, migrationRecorder, dropRecorder);
+    }
+    catch (OutOfPagesError const&)
+    {
+        // A full lower tier can block migration of held pages at the front of
+        // the queue, even when later pages in this tier can be dropped safely.
+        auto& controller = mLevels.at(level).controller;
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> droppable(numPoolGroups(level));
+        for (PoolGroupIndex pgIdx{0}; pgIdx < requirements.size(); ++pgIdx)
+        {
+            SlotCount const free = poolGroup(level, pgIdx).numFreeSlots();
+            SlotCount const needed = std::max(requirements.at(pgIdx) - free, SlotCount{0});
+            auto nextPage = controller.pageGenerator(pgIdx);
+            auto& selected = droppable.at(pgIdx);
+            while (slotCountValueFromSize(selected.size()) < needed)
+            {
+                auto const* page = nextPage();
+                if (page == nullptr)
+                {
+                    // No fallback eviction until every pool can satisfy its goal.
+                    throw;
+                }
+                if ((*page)->status() == PageStatus::DROPPABLE)
+                {
+                    selected.push_back(*page);
+                }
+            }
+        }
+
+        // Record first: if a callback throws, every page keeps its exact queue
+        // position. Re-inserting selected non-front pages with the ordinary
+        // rollback guard would reorder them ahead of unrelated held pages.
+        if (dropRecorder)
+        {
+            for (auto const& pages : droppable)
+            {
+                if (!pages.empty())
+                {
+                    dropRecorder(pages, level);
+                }
+            }
+        }
+        for (auto const& pages : droppable)
+        {
+            for (auto const& page : pages)
+            {
+                excludeFromEviction(*page);
+            }
+        }
+    }
 }
 
 void StorageManager::forceEvict(

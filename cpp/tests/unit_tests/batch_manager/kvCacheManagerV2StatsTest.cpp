@@ -615,4 +615,207 @@ TEST(KvCacheManagerV2StatsTest, HostDropIsRecordedForAttentionAndSsmLifeCycles)
     EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
+// Direct storage fixtures keep host slots unavailable without adding any
+// droppable host pages. Weak GPU references do not keep dropped slots alive.
+class FullHostPressure
+{
+public:
+    explicit FullHostPressure(KVCacheManagerConfig config)
+        : manager(std::make_shared<KvCacheManager>(std::move(config)))
+    {
+        auto& storage = manager->storage();
+        TypedVec<LifeCycleId, SlotCount> counts(storage.numLifeCycles(), 0);
+        for (LifeCycleId lifeCycle{0}; lifeCycle < counts.size(); ++lifeCycle)
+        {
+            counts[lifeCycle] = storage.numSlots(storage.getPoolGroupIndex(CacheLevel{1}, lifeCycle), CacheLevel{1});
+        }
+        hostSlots = storage.newSlots(CacheLevel{1}, counts);
+    }
+
+    ~FullHostPressure()
+    {
+        for (LifeCycleId lifeCycle{0}; lifeCycle < hostSlots.size(); ++lifeCycle)
+        {
+            for (auto& slot : hostSlots[lifeCycle])
+            {
+                manager->storage().releaseSlot(lifeCycle, CacheLevel{1}, std::move(slot));
+            }
+        }
+    }
+
+    std::vector<WeakPtr<Page>> fillGpu(LifeCycleId lifeCycle, int heldCount, SlotCount freeSlots = 0)
+    {
+        auto& storage = manager->storage();
+        TypedVec<LifeCycleId, SlotCount> counts(storage.numLifeCycles(), 0);
+        counts[lifeCycle] = storage.numSlots(storage.getPoolGroupIndex(kHotLevel, lifeCycle)) - freeSlots;
+        auto slots = storage.newGpuSlots(counts);
+        RootBlock& root = manager->radixTree().addOrGetExisting({});
+        std::vector<WeakPtr<Page>> pages;
+        for (auto& slot : slots[lifeCycle])
+        {
+            std::vector<TokenIdExt> tokens;
+            for (int i = 0; i < manager->tokensPerBlock(); ++i)
+            {
+                tokens.emplace_back(TokenId{nextToken++});
+            }
+            auto block = addOrGetExistingBlock(&root, std::move(tokens), /*knownNoDigest=*/true);
+            auto page = makeShared<CommittedPage>(
+                &storage, block, lifeCycle, kHotLevel, static_cast<int>(block->tokens.size()), kPriorityDefault);
+            page->setSlot(slot);
+            block->storage[lifeCycle] = page.get();
+            if (static_cast<int>(pages.size()) < heldCount)
+            {
+                holds.push_back(page->hold());
+            }
+            storage.scheduleForEviction(*page);
+            pages.emplace_back(page);
+        }
+        return pages;
+    }
+
+    std::shared_ptr<KvCacheManager> manager;
+    TypedVec<LifeCycleId, std::vector<Slot>> hostSlots;
+    std::vector<SharedPtr<PageHolder>> holds;
+    int nextToken = 0;
+};
+
+TEST(KvCacheManagerV2StatsTest, FullHostDropsLaterUnheldGpuPage)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    FullHostPressure fixture(makeTieredConfig());
+    auto& storage = fixture.manager->storage();
+    auto pages = fixture.fillGpu(LifeCycleId{0}, 1);
+    ASSERT_EQ(pages.size(), 2);
+    int drops = 0;
+    auto slots = storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1), {},
+        [&](std::vector<SharedPtr<Page>> const& dropped, CacheLevel level)
+        {
+            ASSERT_EQ(dropped.size(), 1);
+            EXPECT_EQ(dropped.front(), pages[1].lock());
+            EXPECT_EQ(level, kHotLevel);
+            ++drops;
+        });
+    EXPECT_EQ(drops, 1);
+    EXPECT_TRUE(pages[1].expired());
+    EXPECT_EQ(pages[0].lock()->status(), PageStatus::HELD);
+    EXPECT_EQ(pages[0].lock()->cacheLevel, kHotLevel);
+    storage.releaseSlot(LifeCycleId{0}, kHotLevel, std::move(slots[LifeCycleId{0}].front()));
+}
+
+TEST(KvCacheManagerV2StatsTest, FullHostFallbackRequiresEveryPoolBeforeDropping)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    FullHostPressure fixture(makeHybridTieredConfig());
+    auto& storage = fixture.manager->storage();
+    auto attention = fixture.fillGpu(LifeCycleId{0}, 1);
+    auto ssm = fixture.fillGpu(LifeCycleId{1}, 1);
+    ASSERT_EQ(storage.numPoolGroups(kHotLevel), PoolGroupIndex{2});
+    ASSERT_GT(attention.size(), 1);
+    ASSERT_EQ(ssm.size(), 1);
+    int drops = 0;
+    EXPECT_THROW(storage.newGpuSlots(
+                     TypedVec<LifeCycleId, SlotCount>(LifeCycleId{2}, 1), {}, [&](auto const&, auto) { ++drops; }),
+        OutOfPagesError);
+    EXPECT_EQ(drops, 0);
+    for (auto const& page : attention)
+    {
+        EXPECT_FALSE(page.expired());
+        EXPECT_TRUE(page.lock()->scheduledForEviction());
+        EXPECT_EQ(page.lock()->cacheLevel, kHotLevel);
+    }
+    EXPECT_EQ(ssm[0].lock()->status(), PageStatus::HELD);
+    EXPECT_EQ(storage.getStatistics(kHotLevel).free, 0);
+}
+
+TEST(KvCacheManagerV2StatsTest, FullHostFallbackDropsOnePagePerRequiredPool)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    FullHostPressure fixture(makeHybridTieredConfig());
+    auto& storage = fixture.manager->storage();
+    auto attention = fixture.fillGpu(LifeCycleId{0}, 1, /*freeSlots=*/1);
+    auto ssm = fixture.fillGpu(LifeCycleId{1}, 0);
+    int drops = 0;
+    TypedVec<LifeCycleId, SlotCount> requirements(LifeCycleId{2}, 1);
+    requirements[LifeCycleId{0}] = 2;
+    // One attention slot is already free; only the shortage may be dropped.
+    auto slots = storage.newGpuSlots(requirements, {},
+        [&](std::vector<SharedPtr<Page>> const& dropped, CacheLevel level)
+        {
+            EXPECT_EQ(dropped.size(), 1);
+            EXPECT_EQ(level, kHotLevel);
+            ++drops;
+        });
+    EXPECT_EQ(drops, 2);
+    EXPECT_FALSE(attention[0].expired());
+    EXPECT_TRUE(attention[1].expired());
+    EXPECT_TRUE(ssm[0].expired());
+    for (LifeCycleId lifeCycle{0}; lifeCycle < slots.size(); ++lifeCycle)
+    {
+        EXPECT_EQ(slots[lifeCycle].size(), static_cast<size_t>(requirements[lifeCycle]));
+        for (auto& slot : slots[lifeCycle])
+        {
+            storage.releaseSlot(lifeCycle, kHotLevel, std::move(slot));
+        }
+    }
+}
+
+TEST(KvCacheManagerV2StatsTest, FullHostFallbackNeverDropsHeldOrLockedPages)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    FullHostPressure fixture(makeTieredConfig());
+    auto& storage = fixture.manager->storage();
+    auto pages = fixture.fillGpu(LifeCycleId{0}, 2);
+    auto locked = makeShared<UniqPageLock>(fixture.holds[1]);
+    storage.excludeFromEviction(*pages[1].lock());
+    fixture.holds[1]->uniqLock = locked;
+    int drops = 0;
+    EXPECT_THROW(storage.newGpuSlots(
+                     TypedVec<LifeCycleId, SlotCount>(LifeCycleId{1}, 1), {}, [&](auto const&, auto) { ++drops; }),
+        OutOfPagesError);
+    EXPECT_EQ(drops, 0);
+    EXPECT_EQ(pages[0].lock()->status(), PageStatus::HELD);
+    EXPECT_EQ(pages[1].lock()->status(), PageStatus::LOCKED);
+    EXPECT_EQ(pages[1].lock()->cacheLevel, kHotLevel);
+    EXPECT_FALSE(pages[1].lock()->scheduledForEviction());
+}
+
+TEST(KvCacheManagerV2StatsTest, FullHostDropRecorderFailurePreservesQueueOrder)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    FullHostPressure fixture(makeHybridTieredConfig());
+    auto& storage = fixture.manager->storage();
+    auto pages = fixture.fillGpu(LifeCycleId{0}, 1);
+    auto ssm = fixture.fillGpu(LifeCycleId{1}, 0);
+    int calls = 0;
+    EXPECT_THROW(storage.newGpuSlots(TypedVec<LifeCycleId, SlotCount>(LifeCycleId{2}, 1), {},
+                     [&](auto const&, auto)
+                     {
+                         if (++calls == 2)
+                         {
+                             throw LogicError("recorder failure");
+                         }
+                     }),
+        LogicError);
+    EXPECT_EQ(calls, 2);
+    EXPECT_FALSE(pages[1].expired());
+    EXPECT_FALSE(ssm[0].expired());
+    EXPECT_TRUE(pages[0].lock()->scheduledForEviction());
+    EXPECT_TRUE(pages[1].lock()->scheduledForEviction());
+    EXPECT_TRUE(ssm[0].lock()->scheduledForEviction());
+
+    // Once migration is possible, the original held LRU page must still lead
+    // the queue. A rollback that re-inserted the later candidate at the front
+    // would instead migrate that unowned page. The first recorder already ran,
+    // but neither pool may have lost a page when the second recorder fails.
+    auto& host = fixture.hostSlots[LifeCycleId{0}];
+    storage.releaseSlot(LifeCycleId{0}, CacheLevel{1}, std::move(host.back()));
+    host.pop_back();
+    TypedVec<PoolGroupIndex, SlotCount> eviction(storage.numPoolGroups(kHotLevel), 0);
+    eviction[storage.getPoolGroupIndex(kHotLevel, LifeCycleId{0})] = 1;
+    storage.forceEvict(kHotLevel, eviction);
+    EXPECT_EQ(pages[0].lock()->cacheLevel, CacheLevel{1});
+    EXPECT_EQ(pages[1].lock()->cacheLevel, kHotLevel);
+    EXPECT_EQ(ssm[0].lock()->cacheLevel, kHotLevel);
+}
+
 } // namespace

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Engine-thread adapters that own real KV while a RETIRE successor is pending."""
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ class KVAlignmentAdapter:
     def __init__(self, executor: "PyExecutor") -> None:
         self._executor = executor
         self._manager = executor.kv_cache_manager
+        self._reserved_v2_blocks = 0
 
     def reserve(self, revised: AlignmentInput) -> PrefixReservation:
         """Return actual ownership, never merely a prefix probe or raw block IDs."""
@@ -48,25 +50,59 @@ class KVAlignmentAdapter:
             return self._reserve_v2(revised)
         return self._reserve_v1(revised)
 
+    def _v2_reservation_block_limit(self) -> int:
+        """Bound ALIGN holds by the first backing tier's logical-block capacity.
+
+        A held page can migrate but cannot be dropped. Charge every lifecycle
+        even when pages are shared or outside a sliding window, so ALIGN cannot
+        promise more held pages than that tier can accommodate. Colder tiers
+        do not increase this budget: migration still needs the intermediate
+        tier. The budget does not claim that these pages currently reside there.
+        """
+        impl = self._manager.impl
+        if len(impl.cache_tier_list) < 2:
+            return 0
+        groups = Counter(impl.get_life_cycle_pool_group_indices(1))
+        stats = impl.get_storage_statistics(1)
+        return min((stats[group].total // count for group, count in groups.items()), default=0)
+
     def _reserve_v2(self, revised: AlignmentInput) -> PrefixReservation:
         from ...runtime.kv_cache_manager_v2 import ReuseScope
 
         manager = self._manager
+        block_size = manager.impl.tokens_per_block
+        available = max(0, self._v2_reservation_block_limit() - self._reserved_v2_blocks)
+        limit = min(revised.reuse_limit, available * block_size)
+        if limit < revised.required_prefix_length:
+            raise RuntimeError("ALIGN required prefix exceeds recovery-safe reservation capacity")
+        if limit == 0:
+            return _Reservation(0, lambda: None)
         cache = manager.impl.create_kv_cache(
             ReuseScope(
                 lora_id=revised.lora_task_id, salt=manager._derive_reuse_salt(revised.cache_salt)
             ),
-            list(revised.input_token_ids[: revised.reuse_limit]),
+            list(revised.input_token_ids[:limit]),
             expected_prompt_length=len(revised.input_token_ids),
         )
         # Suspended caches retain native PageHolders without occupying an
         # executor slot. Pages may migrate between tiers but cannot be dropped.
         try:
-            return _Reservation(
-                int(cache.num_committed_tokens), cache.close, manager._stream.synchronize
-            )
+            count = int(cache.num_committed_tokens)
+            if not 0 <= count <= limit:
+                raise RuntimeError("ALIGN acquired prefix exceeds its reservation limit")
+            blocks = (count + block_size - 1) // block_size
+            self._reserved_v2_blocks += blocks
+
+            def release() -> None:
+                cache.close()
+                self._reserved_v2_blocks -= blocks
+
+            return _Reservation(count, release, manager._stream.synchronize)
         except Exception:
-            cache.close()
+            try:
+                cache.close()
+            except Exception as cleanup_error:
+                raise AlignmentSafetyError("V2 reservation cleanup is unknown") from cleanup_error
             raise
 
     def _reserve_v1(self, revised: AlignmentInput) -> PrefixReservation:
