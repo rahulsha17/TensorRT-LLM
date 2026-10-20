@@ -2451,6 +2451,7 @@ def test_distributed_error_invalidates_evidence_with_watchdog_armed(guard, monke
 
     local.execution_failed = invalidate
     executor = SimpleNamespace(
+        llm_args=SimpleNamespace(torch_blas_preference=None),
         _execution_guard=local,
         _event_loop_error=None,
         _event_loop_error_delivered=Event(),
