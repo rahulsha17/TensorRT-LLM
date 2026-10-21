@@ -710,3 +710,71 @@ def test_server_close_is_a_noop_without_a_global_executor(
     MPINodeState._global_comm_executor = None
     # Must not touch MPI at all (no abort callable is even constructed).
     RemoteMpiCommSessionServer._close_global_comm_executor(grace=0.1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("state", ["closed", "missing"])
+def test_mpi_pool_destructor_closed_or_missing_pool(
+        monkeypatch: pytest.MonkeyPatch, state: Literal["closed",
+                                                        "missing"]) -> None:
+    from unittest.mock import Mock
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    session = object.__new__(MpiPoolSession)
+    pool = Mock()
+    if state == "closed":
+        session.n_workers = 1
+        session._wait_shutdown = False
+        session.mpi_pool = pool
+        session.shutdown()
+        pool.shutdown.assert_called_once_with(wait=True)
+        assert session.mpi_pool is None
+    try:
+        with monkeypatch.context() as cleared:
+            for name in ("sys", "logger", "threading", "Future"):
+                cleared.setattr(mpi_session, name, None)
+            if state == "closed":
+                session.shutdown()
+            session.__del__()
+            session.__del__()
+        if state == "closed":
+            pool.shutdown.assert_called_once_with(wait=True)
+    finally:
+        session.mpi_pool = None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("truthy", [True, False])
+def test_mpi_pool_destructor_active_pool_error(monkeypatch: pytest.MonkeyPatch,
+                                               truthy: bool) -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi import mpi_session
+
+    calls = []
+    error = RuntimeError("pool shutdown failed")
+
+    class Pool:
+
+        def __bool__(self) -> bool:
+            return truthy
+
+        def shutdown(self, wait: bool = True) -> None:
+            calls.append(wait)
+            raise error
+
+    session = object.__new__(MpiPoolSession)
+    session.n_workers = 1
+    session._wait_shutdown = False
+    session.mpi_pool = Pool()
+    monkeypatch.setattr(mpi_session, "sys",
+                        SimpleNamespace(is_finalizing=lambda: True))
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            session.__del__()
+        assert caught.value is error
+        assert calls == [False]
+        assert session.mpi_pool is not None
+    finally:
+        session.mpi_pool = None

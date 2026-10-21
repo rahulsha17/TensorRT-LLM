@@ -575,8 +575,9 @@ class MpiPoolSession(MpiSession):
                                         env=env,
                                         python_args=python_args)
 
-    def __del__(self):
-        self.shutdown_abort()
+    def __del__(self) -> None:
+        if getattr(self, 'mpi_pool', None) is not None:
+            self.shutdown_abort()
 
     def __reduce__(self):
         raise TypeError('cannot pickle MPI session')
