@@ -2106,7 +2106,9 @@ def test_context_recovery_can_preempt_the_first_blocked_context(
 @pytest.mark.parametrize(
     "guard", ["inflight", "pp", "connector", "async_transfer", "transfer_state", "versioned"]
 )
-def test_context_recovery_preserves_unsafe_owners(chunked: bool, guard: str) -> None:
+def test_context_recovery_preserves_unsafe_owners(
+    chunked: bool, guard: str, owner_bound: bool = False
+) -> None:
     manager = make_kv_cache_manager(
         resize_context_fn=lambda req, n: False,
         can_evict=True,
@@ -2132,6 +2134,11 @@ def test_context_recovery_preserves_unsafe_owners(chunked: bool, guard: str) -> 
         manager,
         ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
     )
+    owner = Mock()
+    if owner_bound:
+        blocked.py_execution_version = object()
+        victim.py_execution_version = object()
+        scheduler.set_execution_suspend_guard(owner)
     if guard == "async_transfer":
         transfer = Mock()
         transfer.has_any_inflight_requests.return_value = True
@@ -2144,6 +2151,132 @@ def test_context_recovery_preserves_unsafe_owners(chunked: bool, guard: str) -> 
     assert out.recompute_paused_requests == []
     manager.suspend_request.assert_not_called()
     manager.free_resources.assert_not_called()
+    owner.assert_not_called()
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize(
+    "guard", ["inflight", "pp", "connector", "async_transfer", "transfer_state"]
+)
+def test_context_recovery_preserves_unsafe_owners_with_execution_guard(
+    chunked: bool, guard: str
+) -> None:
+    test_context_recovery_preserves_unsafe_owners(chunked, guard, owner_bound=True)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("resume_blocked", [False, True])
+def test_versioned_context_recovery_drains_before_lossless_suspension(
+    chunked: bool, resume_blocked: bool
+) -> None:
+    held = {87}
+    order = []
+    manager = make_kv_cache_manager(
+        prepare_context_fn=lambda req, reuse_limit=None: (
+            req.py_request_id != 86 or not resume_blocked or not held
+        ),
+        resize_context_fn=lambda req, n: req.py_request_id == 86 and not held,
+        can_evict=True,
+        has_cache_tier_below_gpu=True,
+    )
+    blocked = make_ctx_request(86, 128, is_first_context_chunk=False)
+    victim = make_ctx_request(87, 128, is_first_context_chunk=False)
+    for req, position in ((blocked, 20832), (victim, 11200)):
+        req.py_execution_version = object()
+        req.context_current_position = position
+        req.py_seq_slot = req.py_request_id
+        req.py_batch_idx = 3
+    version = victim.py_execution_version
+
+    def drain(req: Mock) -> None:
+        assert req is victim
+        assert req.py_batch_idx == 3
+        order.append("wait")
+
+    def suspend(req: Mock) -> None:
+        assert order == ["wait"]
+        order.append("suspend")
+        manager.kv_cache_map[req.py_request_id].is_active = False
+        held.remove(req.py_request_id)
+
+    manager.suspend_request.side_effect = suspend
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=128,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    scheduler.set_execution_suspend_guard(drain)
+    out = scheduler.schedule_request([blocked, victim], set())
+
+    assert ids(out.context_requests) == [86]
+    assert ids(out.paused_requests) == [87]
+    assert out.recompute_paused_requests == []
+    assert order == ["wait", "suspend"]
+    assert victim.context_current_position == 11200
+    assert victim.py_execution_version is version
+    assert victim.py_seq_slot == 87
+    assert victim.py_batch_idx is None
+    manager.free_resources.assert_not_called()
+
+
+def test_versioned_context_recovery_does_not_mutate_after_failed_owner_wait() -> None:
+    manager = make_kv_cache_manager(
+        resize_context_fn=lambda req, n: False,
+        can_evict=True,
+    )
+    requests = [make_ctx_request(i, 128, is_first_context_chunk=False) for i in (86, 87)]
+    for req in requests:
+        req.py_execution_version = object()
+        req.py_batch_idx = 3
+    scheduler = make_scheduler(manager)
+    scheduler.set_execution_suspend_guard(Mock(side_effect=TimeoutError("GPU use pending")))
+
+    with pytest.raises(TimeoutError, match="GPU use pending"):
+        scheduler.schedule_request(requests, set())
+
+    assert all(req.py_batch_idx == 3 for req in requests)
+    manager.suspend_request.assert_not_called()
+    manager.free_resources.assert_not_called()
+    assert manager.resize_context.call_count == 2
+
+
+@pytest.mark.parametrize("owner_bound", [False, True])
+def test_versioned_context_recovery_cannot_hide_a_full_backing_tier(owner_bound: bool) -> None:
+    """A resume/suspend cycle without admission must still fail within the bound."""
+    manager = make_kv_cache_manager(
+        resize_context_fn=lambda req, n: False,
+        can_evict=True,
+    )
+    requests = [make_ctx_request(i, 128, is_first_context_chunk=False) for i in (86, 87)]
+    for req in requests:
+        req.py_execution_version = object()
+
+    def resume(req: Mock, reuse_limit: int | None = None) -> bool:
+        manager.kv_cache_map[req.py_request_id].is_active = True
+        return True
+
+    manager.prepare_context.side_effect = resume
+    scheduler = make_scheduler(manager)
+    scheduler._DEADLOCK_STALL_ITERS = 3
+    if owner_bound:
+        scheduler.set_execution_suspend_guard(Mock())
+    for _ in range(2):
+        out = scheduler.schedule_request(requests, set())
+        assert out.context_requests == []
+        assert out.recompute_paused_requests == []
+    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        scheduler.schedule_request(requests, set())
+    manager.free_resources.assert_not_called()
+    assert manager.suspend_request.call_count == (3 if owner_bound else 0)
+
+
+def test_execution_suspend_guard_cannot_be_replaced() -> None:
+    scheduler = make_scheduler(make_kv_cache_manager())
+    owner = Mock()
+    scheduler.set_execution_suspend_guard(owner)
+    scheduler.set_execution_suspend_guard(owner)
+    with pytest.raises(RuntimeError, match="already has an execution suspension guard"):
+        scheduler.set_execution_suspend_guard(Mock())
 
 
 def test_context_recovery_does_not_interrupt_scheduled_work() -> None:

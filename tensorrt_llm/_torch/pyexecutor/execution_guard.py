@@ -708,6 +708,17 @@ class ExecutionDeviceGuard:
             )
             self._kv_manager.stop_request_committing(request)
 
+    def before_suspend(self, request: LlmRequest) -> None:
+        """Drain a started V2 request before a lossless cache-pressure pause.
+
+        The request stays admitted: preserve its use record, accepted frontier,
+        alignment ownership and ability to commit future context. The scheduler
+        may change page residency only after this wait succeeds.
+        """
+        if self._kv_manager is None or self._rank_consensus is not None:
+            raise RuntimeError("execution suspension requires single-rank KV cache V2")
+        self._wait_for_use(request, required=True)
+
     def before_release(self, request: LlmRequest) -> None:
         """Settle this request's latest submitted use before ordinary cleanup.
 

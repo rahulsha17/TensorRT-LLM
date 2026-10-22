@@ -119,7 +119,7 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
-from .scheduler import (RequestScheduler, ScheduledRequests,
+from .scheduler import (KVCacheV2Scheduler, RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, count_retiring_requests
@@ -4071,6 +4071,9 @@ class PyExecutor:
             transceiver = getattr(self, 'kv_cache_transceiver', None)
             if transceiver is not None:
                 transceiver.bind_execution_authority(table)
+            if (isinstance(self.scheduler, KVCacheV2Scheduler)
+                    and rank_consensus is None):
+                self.scheduler.set_execution_suspend_guard(guard.before_suspend)
         except Exception as error:
             guard.execution_failed(error)
             raise

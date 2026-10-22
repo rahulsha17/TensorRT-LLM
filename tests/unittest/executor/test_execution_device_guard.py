@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.execution_consensus import ExecutionStepConsensus
 from tensorrt_llm.execution_fence import RequestDrainTracker
@@ -109,7 +110,10 @@ def test_authority_installation_binds_transfer_drain_or_fails_closed(
     table = WorkerVersionTable("session")
     tracker = RequestDrainTracker()
     guard = SimpleNamespace(
-        table=table, _rank_consensus=None, execution_failed=Mock(side_effect=tracker.fail)
+        table=table,
+        _rank_consensus=None,
+        execution_failed=Mock(side_effect=tracker.fail),
+        before_suspend=Mock(),
     )
 
     def make_guard(executor, installed_table, consensus):
@@ -123,7 +127,10 @@ def test_authority_installation_binds_transfer_drain_or_fails_closed(
     transfers = Mock()
     transceiver = Mock() if has_transceiver else None
     executor = SimpleNamespace(
-        _execution_guard=None, async_transfer_manager=transfers, kv_cache_transceiver=transceiver
+        _execution_guard=None,
+        async_transfer_manager=transfers,
+        kv_cache_transceiver=transceiver,
+        scheduler=Mock(),
     )
     if binding_failure:
         owner = transfers if binding_failure == "manager" else transceiver
@@ -442,6 +449,111 @@ def test_release_waits_for_latest_overlap_reader_before_freezing_v2(guard) -> No
     guard.before_release(request)
     assert order == [("wait", latest), ("freeze", request)]
     assert id(request) not in guard._uses
+
+
+def test_lossless_suspension_waits_for_latest_use_and_preserves_ownership(guard) -> None:
+    request = _request()
+    with guard.forward(_batch(request)):
+        pass
+    previous = guard._uses[id(request)]
+    with guard.sampling(_batch(request)):
+        pass
+    latest = guard._uses[id(request)]
+    assert latest.event is not previous.event
+    guard._kv_frontiers[id(request)] = 64
+    alignment = Mock(reservation=object())
+    tracker = RequestDrainTracker()
+    tracker.enqueue(VERSION, lambda: request.py_request_id)
+    guard.table.alignment_state = alignment
+    guard.table.drain_tracker = tracker
+
+    guard.before_suspend(request)
+
+    guard.device.wait_event.assert_called_once_with(latest.event)
+    assert guard._uses[id(request)] is latest
+    assert guard._kv_frontiers[id(request)] == 64
+    assert guard.table.alignment_state is alignment
+    assert guard.table.drain_tracker is tracker
+    assert alignment.mock_calls == []
+    assert not tracker.drained(VERSION)
+    assert request.py_execution_version == VERSION
+    assert request.py_seq_slot == 2
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    guard._kv_manager.stop_request_committing.assert_not_called()
+    # Event ownership survives a pause, including a revision while suspended.
+    guard.table.apply(VersionUpdate("session", 2, NEXT))
+    guard.before_release(request)
+    assert id(request) not in guard._uses
+    assert id(request) not in guard._kv_frontiers
+    guard._kv_manager.preserve_execution_prefix.assert_called_once_with(request, 64)
+    guard._kv_manager.stop_request_committing.assert_called_once_with(request)
+    assert not tracker.drained(VERSION)
+
+
+@pytest.mark.parametrize("failure", ["missing", "wrong_request", "eventless", "wait"])
+def test_lossless_suspension_fails_closed_without_completion(guard, failure: str) -> None:
+    request = _request()
+    with guard.forward(_batch(request)):
+        pass
+    guard._kv_frontiers[id(request)] = 64
+    if failure == "missing":
+        guard._uses.clear()
+    elif failure == "wrong_request":
+        guard._uses[id(request)].request = _request()
+    elif failure == "eventless":
+        guard._uses[id(request)].event = None
+    else:
+        guard.device.wait_event.side_effect = TimeoutError("still running")
+    uses = dict(guard._uses)
+
+    with pytest.raises((RuntimeError, TimeoutError)):
+        guard.before_suspend(request)
+
+    assert guard._uses == uses
+    assert guard._kv_frontiers == {id(request): 64}
+    assert guard._kv_manager.mock_calls == []
+
+
+@pytest.mark.parametrize("unsupported", ["v1", "distributed"])
+def test_lossless_suspension_rejects_unsupported_owner(guard, unsupported: str) -> None:
+    if unsupported == "v1":
+        guard._kv_manager = None
+    else:
+        guard._rank_consensus = Mock()
+    with pytest.raises(RuntimeError, match="single-rank KV cache V2"):
+        guard.before_suspend(_request())
+    guard.device.wait_event.assert_not_called()
+
+
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("distributed", [False, True])
+def test_authority_binds_lossless_suspension_only_to_single_rank_v2(
+    monkeypatch, v2: bool, distributed: bool
+) -> None:
+    table = WorkerVersionTable("session")
+    table.drain_tracker = RequestDrainTracker()
+    consensus = Mock() if distributed else None
+    owner = SimpleNamespace(table=table, _rank_consensus=consensus, before_suspend=Mock())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.execution_guard.ExecutionDeviceGuard",
+        lambda *_: owner,
+    )
+    scheduler = object.__new__(KVCacheV2Scheduler) if v2 else SimpleNamespace()
+    scheduler._execution_suspend_guard = None
+    executor = SimpleNamespace(
+        _execution_guard=None,
+        async_transfer_manager=Mock(),
+        kv_cache_transceiver=None,
+        scheduler=scheduler,
+    )
+
+    PyExecutor.configure_execution_authority(executor, table, consensus)
+    PyExecutor.configure_execution_authority(executor, table, consensus)
+
+    assert executor._execution_guard is owner
+    assert scheduler._execution_suspend_guard is (
+        owner.before_suspend if v2 and not distributed else None
+    )
 
 
 def test_wait_failure_retains_ownership_and_never_closes_cache(guard) -> None:

@@ -259,6 +259,18 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+        self._execution_suspend_guard: Callable[[LlmRequest], None] | None = None
+
+    def set_execution_suspend_guard(self, guard: Callable[[LlmRequest], None]) -> None:
+        """Bind the execution owner's completion check for lossless suspension.
+
+        The owner must drain outstanding device uses without releasing version
+        ownership or resetting accepted progress. A failed check must raise
+        before the scheduler mutates the request or its cache.
+        """
+        if self._execution_suspend_guard is not None and self._execution_suspend_guard != guard:
+            raise RuntimeError("scheduler already has an execution suspension guard")
+        self._execution_suspend_guard = guard
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -570,6 +582,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        context_recovery_attempted = False
         if (
             blocked_ctx
             and self.kv_cache_manager.has_cache_tier_below_gpu
@@ -589,6 +602,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or inflight_request_ids
             )
         ):
+            context_recovery_attempted = True
             for req in blocked_ctx:
                 # A cold partial context can itself occupy the space needed by
                 # a later cache-backed successor. Try the other blocked rows
@@ -618,7 +632,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or scheduled_ctx
                 or scheduled_encoder
                 or disagg_candidates
-                or evicted
+                # Suspension alone can repeat if the backing tier is full.
+                # Recovery must admit work to reset the stall detector.
+                or (evicted and not context_recovery_attempted)
                 or recompute_paused
                 or deferred_behind_contributor
             ),
@@ -1507,18 +1523,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             return ScheduleAction.SKIP, 0, False
 
-        # The scheduler cannot settle a version's outstanding uses or rewind its
-        # committed frontier. Leave those requests to the execution owner.
-        candidates = [
-            candidate
-            for candidate in reversed(requests_list)
-            if candidate is not req and candidate.py_execution_version is None
-        ]
+        candidates = [candidate for candidate in reversed(requests_list) if candidate is not req]
         for victim in candidates:
             if victim.state_value == self._gen_to_complete_state_value:
                 continue
             if not self._is_evictable(victim, inflight_request_ids):
                 continue
+            if victim.py_execution_version is not None:
+                if self._execution_suspend_guard is None:
+                    continue
+                self._execution_suspend_guard(victim)
             self._suspend_request(victim)
             evicted.append(victim)
             result = self._try_schedule_context(req, budget, lambda _: False)
@@ -1527,6 +1541,10 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if self.enable_recompute_pause:
             for victim in candidates:
+                # Lossless suspension keeps the accepted frontier. Destructive
+                # replay would rewind it and is not authorized by the owner.
+                if victim.py_execution_version is not None:
+                    continue
                 if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
                     continue
                 if victim.py_request_id not in self.kv_cache_manager.kv_cache_map:
@@ -1761,8 +1779,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
         raise RuntimeError(
             f"V2 scheduler deadlock: {num_gen_candidates} generation and "
-            f"{num_ctx_candidates} context request(s) active but none could "
-            f"be scheduled, suspended or preempted in "
+            f"{num_ctx_candidates} context request(s) active with no forward progress in "
             f"{self._stalled_schedules} consecutive attempts. The KV cache "
             f"pool is likely exhausted. {remedy}"
         )
