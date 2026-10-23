@@ -97,7 +97,9 @@ class KVAlignmentAdapter:
                 cache.close()
                 self._reserved_v2_blocks -= blocks
 
-            return _Reservation(count, release, manager._stream.synchronize)
+            # This cache never resumes or acquires a CUDA stream. Its native
+            # PageHolders retain ownership without enqueuing reservation work.
+            return _Reservation(count, release)
         except Exception:
             try:
                 cache.close()

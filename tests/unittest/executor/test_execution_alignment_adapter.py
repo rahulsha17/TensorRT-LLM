@@ -9,7 +9,14 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.execution_alignment import KVAlignmentAdapter
-from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentSafetyError
+from tensorrt_llm.execution_alignment import (
+    AlignmentInput,
+    AlignmentRequest,
+    AlignmentSafetyError,
+    WorkerAlignmentState,
+)
+from tensorrt_llm.execution_authority import Revision
+from tensorrt_llm.execution_version import ExecutionVersion
 
 pytestmark = pytest.mark.cpu_only
 INPUT = AlignmentInput(tuple(range(17)), cache_salt="shared", lora_task_id=3)
@@ -169,21 +176,39 @@ def test_manager_limit_used_when_executor_limit_is_unset(engine):
         KVAlignmentAdapter(engine).reserve(INPUT)
 
 
-@pytest.mark.parametrize("v2", [False, True])
-def test_reclaim_waits_on_manager_copy_stream(engine, v2):
-    engine._is_kv_manager_v2 = v2
+def test_v1_reclaim_waits_on_manager_copy_stream(engine: SimpleNamespace) -> None:
+    engine._is_kv_manager_v2 = False
     manager = engine.kv_cache_manager
-    manager.impl.create_kv_cache.return_value = Mock(num_committed_tokens=7)
     hold = KVAlignmentAdapter(engine).reserve(INPUT)
     manager._stream.synchronize.reset_mock()
     hold.settle()
     manager._stream.synchronize.assert_called_once()
     hold.close()
     hold.close()
-    if v2:
-        manager.impl.create_kv_cache.return_value.close.assert_called_once()
-    else:
-        assert_v1_release(manager)
+    assert_v1_release(manager)
+
+
+@pytest.mark.parametrize("count", [0, 7, 8])
+def test_v2_settle_does_not_wait_on_unrelated_manager_work(
+    engine: SimpleNamespace, count: int
+) -> None:
+    manager = engine.kv_cache_manager
+    cache = Mock(num_committed_tokens=count)
+    manager.impl.create_kv_cache.return_value = cache
+    manager._stream.synchronize.side_effect = RuntimeError("unrelated manager work")
+    adapter = KVAlignmentAdapter(engine)
+    hold = adapter.reserve(INPUT)
+    hold.settle()
+    hold.settle()
+    manager._stream.synchronize.assert_not_called()
+    cache.resume.assert_not_called()
+    cache.close.assert_not_called()
+    assert hold.num_tokens == count
+    assert adapter._reserved_v2_blocks == (count + 3) // 4
+    hold.close()
+    hold.close()
+    cache.close.assert_called_once()
+    assert adapter._reserved_v2_blocks == 0
 
 
 def test_v2_reservation_pressure_limits_new_promise_and_releases_budget(engine):
@@ -301,21 +326,24 @@ def test_v2_cache_miss_does_not_consume_reservation_capacity(engine):
     assert adapter._reserved_v2_blocks == 0
 
 
-def test_v2_failed_native_close_does_not_return_capacity(engine):
+def test_v2_failed_native_close_does_not_return_capacity(engine: SimpleNamespace) -> None:
     manager = engine.kv_cache_manager
     manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=2)]
     cache = Mock(num_committed_tokens=8)
     manager.impl.create_kv_cache.return_value = cache
     adapter = KVAlignmentAdapter(engine)
     hold = adapter.reserve(INPUT)
+    hold.settle()
     cache.close.side_effect = RuntimeError("close failed")
     with pytest.raises(RuntimeError, match="close failed"):
         hold.close()
     assert adapter.reserve(INPUT).num_tokens == 0
     assert adapter._reserved_v2_blocks == 2
+    cache.close.assert_called_once()
+    manager._stream.synchronize.assert_not_called()
 
 
-def test_v2_failed_settle_retains_reservation_capacity(engine):
+def test_v2_settle_retains_capacity_until_native_close(engine: SimpleNamespace) -> None:
     manager = engine.kv_cache_manager
     manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=2)]
     cache = Mock(num_committed_tokens=8)
@@ -323,11 +351,56 @@ def test_v2_failed_settle_retains_reservation_capacity(engine):
     adapter = KVAlignmentAdapter(engine)
     hold = adapter.reserve(INPUT)
     manager._stream.synchronize.side_effect = RuntimeError("copy completion unknown")
-    with pytest.raises(RuntimeError, match="copy completion unknown"):
-        hold.settle()
+    hold.settle()
+    manager._stream.synchronize.assert_not_called()
+    cache.resume.assert_not_called()
     cache.close.assert_not_called()
     assert adapter.reserve(INPUT).num_tokens == 0
     assert adapter._reserved_v2_blocks == 2
+    hold.close()
+    assert adapter._reserved_v2_blocks == 0
+    cache.close.assert_called_once()
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_v2_reclaim_preserves_transfer_drain_and_close_failure_ownership(
+    engine: SimpleNamespace, close_fails: bool
+) -> None:
+    manager = engine.kv_cache_manager
+    cache = Mock(num_committed_tokens=8)
+    manager.impl.create_kv_cache.return_value = cache
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=2)]
+    adapter = KVAlignmentAdapter(engine)
+    state = WorkerAlignmentState(adapter.reserve, lambda: None)
+    old = ExecutionVersion("tenant", "scope", 0)
+    new = ExecutionVersion("tenant", "scope", 1)
+    request = AlignmentRequest("session", Revision("edit", old, new), INPUT)
+    state.observe(new, request)
+    state.process()
+    receipt = state.poll(request)
+    drained = Mock(return_value=False)
+    state.retain_transfer(request, drained)
+    state.authorize_resume(receipt, 8)
+    assert state.claim(new, 42, INPUT.input_token_ids, INPUT.cache_salt, INPUT.lora_task_id) == 8
+    state.confirm_attachment(new, 42, 8)
+    cache.close.assert_not_called()
+    assert adapter._reserved_v2_blocks == 2
+    drained.return_value = True
+    if close_fails:
+        cache.close.side_effect = RuntimeError("native close completion unknown")
+        with pytest.raises(AlignmentSafetyError, match="RECLAIM completion is unknown"):
+            state.confirm_attachment(new, 42, 8)
+        assert adapter._reserved_v2_blocks == 2
+        assert adapter.reserve(INPUT).num_tokens == 0
+        with pytest.raises(AlignmentSafetyError):
+            state.process()
+    else:
+        state.confirm_attachment(new, 42, 8)
+        state.confirm_attachment(new, 42, 8)
+        assert adapter._reserved_v2_blocks == 0
+    cache.close.assert_called_once()
+    manager._stream.synchronize.assert_not_called()
+    cache.resume.assert_not_called()
 
 
 def test_v2_backing_capacity_shrink_keeps_existing_holds_charged(engine):
