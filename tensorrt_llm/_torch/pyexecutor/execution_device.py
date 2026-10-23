@@ -230,13 +230,16 @@ class DeviceExecutionAuthority:
         # No authority lock is held while waiting: the publisher must be able
         # to revoke a version even while its model stream is occupied.
         deadline = time.monotonic() + timeout
+        delay = 0.00001
         try:
             assert use.event is not None
             while not use.event.query():
                 self._healthy()
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise TimeoutError("device authority guard did not complete")
-                time.sleep(0.001)
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 0.001)
             self._healthy()
         except BaseException as error:
             with self._lock:
