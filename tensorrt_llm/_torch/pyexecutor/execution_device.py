@@ -394,7 +394,9 @@ class DeviceExecutionAuthority:
     def check(self, versions: list[ExecutionVersion | None]) -> list[bool]:
         """Observe device authority at a batch-entry boundary."""
         if not versions or all(version is None for version in versions):
-            return [True] * len(versions)
+            with self._lock:
+                self._healthy()
+                return [True] * len(versions)
         with self._lock, torch.cuda.device(self.device):
             self._healthy()
             use = self._start_use([])

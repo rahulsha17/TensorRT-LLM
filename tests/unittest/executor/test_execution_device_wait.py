@@ -57,6 +57,26 @@ def authority() -> device.DeviceExecutionAuthority:
     return value
 
 
+@pytest.mark.parametrize("versions", [[], [None], [None, None]])
+def test_untagged_check_without_cuda_state(
+    authority: device.DeviceExecutionAuthority, versions: list[None]
+) -> None:
+    assert authority.check(versions) == [True] * len(versions)
+    assert authority._pending == [] and authority._failure is None
+
+
+@pytest.mark.parametrize("versions", [[], [None], [None, None]])
+def test_untagged_check_rejects_poison_before_cuda_access(
+    authority: device.DeviceExecutionAuthority, versions: list[None]
+) -> None:
+    failure = TimeoutError("submitted device work remains pending")
+    authority._failure = failure
+    with pytest.raises(RuntimeError, match="restart required") as later:
+        authority.check(versions)
+    assert later.value.__cause__ is failure
+    assert authority._failure is failure and authority._pending == []
+
+
 @pytest.mark.parametrize("timeout", [-1.0, 0.0, 5.0])
 def test_ready_query_precedes_deadline_and_never_sleeps(
     authority: device.DeviceExecutionAuthority, clock: Clock, timeout: float
