@@ -82,6 +82,15 @@ class _PendingUse:
     event: torch.cuda.Event | None = None
 
 
+@dataclass(frozen=True)
+class _TokenCommitMetadata:
+    key: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+    slots: torch.Tensor
+    expected: torch.Tensor
+    sequence_slots: torch.Tensor
+    ready: torch.cuda.Event
+
+
 @dataclass
 class DeviceAttentionRows:
     """Stable graph inputs, refreshed on one model submission stream.
@@ -156,6 +165,7 @@ class DeviceExecutionAuthority:
         self._published: dict[tuple[str, str], tuple[int, torch.cuda.Event]] = {}
         self._pending: list[_PendingUse] = []
         self._failure: BaseException | None = None
+        self._token_commit_metadata: _TokenCommitMetadata | None = None
         with torch.cuda.device(self.device):
             self._stream = torch.cuda.Stream(device=self.device, priority=-1)
             with torch.cuda.stream(self._stream):
@@ -297,6 +307,36 @@ class DeviceExecutionAuthority:
         slots, epochs = self._input_values(versions)
         return self._upload(slots, torch.int32, use), self._upload(epochs, torch.int64, use)
 
+    def _token_commit_inputs(
+        self,
+        versions: list[ExecutionVersion | None],
+        sequence_slots: list[int],
+        use: _PendingUse,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Publication waits and unknown-scope checks are fresh on every use.
+        slots, epochs = self._input_values(versions)
+        key = (tuple(slots), tuple(epochs), tuple(sequence_slots))
+        stream = torch.cuda.current_stream(self.device)
+        cached = self._token_commit_metadata
+        if cached is not None and cached.key == key and cached.ready.query():
+            tensors = (cached.slots, cached.expected, cached.sequence_slots)
+            use.tensors.extend(tensors)
+            stream.wait_event(cached.ready)
+            for tensor in tensors:
+                # Also protect reuse if all tickets and the authority are dropped.
+                tensor.record_stream(stream)
+            return tensors
+        # Do not join another stream's queued work for a metadata cache hit.
+        slots_device = self._upload(slots, torch.int32, use)
+        expected_device = self._upload(epochs, torch.int64, use)
+        sequence_slots_device = self._upload(sequence_slots, torch.int32, use)
+        ready = torch.cuda.Event()
+        ready.record(stream)
+        self._token_commit_metadata = _TokenCommitMetadata(
+            key, slots_device, expected_device, sequence_slots_device, ready
+        )
+        return slots_device, expected_device, sequence_slots_device
+
     def create_attention_rows(self, capacity: int) -> DeviceAttentionRows:
         """Allocate before capture; addresses remain fixed across row reuse."""
         if type(capacity) is not int or capacity <= 0:
@@ -428,8 +468,9 @@ class DeviceExecutionAuthority:
                 )
             use = self._start_use([candidates])
             try:
-                slots, expected = self._inputs(versions, use)
-                sequence_slots_device = self._upload(sequence_slots, torch.int32, use)
+                slots, expected, sequence_slots_device = self._token_commit_inputs(
+                    versions, sequence_slots, use
+                )
                 committed = torch.zeros_like(candidates)
                 allowed = torch.empty(len(versions), dtype=torch.bool, device=self.device)
                 use.tensors.extend([committed, allowed])
