@@ -813,6 +813,19 @@ class PyTorchModelEngine(ModelEngine):
         return getattr(self._runner, "execution_attention", None)
 
     @property
+    def forward_may_capture(self) -> bool:
+        """Whether a forward needs exclusion from concurrent CUDA allocation."""
+        if (type(self) is not PyTorchModelEngine
+                or type(self._runner) is not DecoderRunner):
+            return True
+        return (self.is_warmup or self.torch_compile_config is not None
+                or self._runner._torch_compile_backend is not None
+                or self._runner.breakable_cuda_graph_runner is not None
+                or self._runner.cuda_graph_runner is None
+                or self._runner.cuda_graph_runner._capture_allowed
+                or self._runner.forward_pass_callable is not None)
+
+    @property
     def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
         # PyExecutor suspends the padding dummies around a KV pool rebalance.
         if not isinstance(self._runner, DecoderRunner):

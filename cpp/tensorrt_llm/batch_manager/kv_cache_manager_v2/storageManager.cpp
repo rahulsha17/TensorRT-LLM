@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/batchedPageCopy.h"
+#include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -744,7 +745,15 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 {
     PageStatus s = page.status();
     CacheLevel lvl = level.value_or(page.cacheLevel);
-    return (s == PageStatus::DROPPABLE && page.isCommitted()) || (s == PageStatus::HELD && lvl < numCacheLevels() - 1);
+    if (s == PageStatus::HELD)
+        return lvl < numCacheLevels() - 1;
+    if (s != PageStatus::DROPPABLE || !page.isCommitted())
+        return false;
+    // Evicting an ancestor can detach a descendant while a migration batch
+    // still owns its page. Do not resurrect that unreachable page in an LRU:
+    // no tree walk can reclaim it, and it would pin storage until more pressure.
+    auto const& committed = static_cast<CommittedPage const&>(page);
+    return committed.block != nullptr && !committed.block->isOrphan() && committed.block->holdsPage(committed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,10 +1139,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             for (auto const& page : pages)
             {
-                if (!isLast || page->status() != PageStatus::HELD)
-                {
-                    lvl.controller.scheduleForEviction(*page);
-                }
+                scheduleForEviction(*page);
             }
         }
     }

@@ -244,7 +244,11 @@ public:
     // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
     // after decode admission. Set true when admitting a suspended request directly to decode.
     // Returns false if utilization too high or out of memory.
-    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt);
+    // capacityHint rejects dense, single-beam resumes that cannot also fit this
+    // capacity. It neither allocates the tail nor guarantees a later resize: backing-tier
+    // constraints and intervening owners can still prevent allocation. Other layouts ignore it.
+    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
+        std::optional<int> capacityHint = std::nullopt);
 
     // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
     // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
@@ -573,6 +577,9 @@ private:
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
+
+    // Necessary capacity bound only; caller holds the exclusive manager lock.
+    bool _canFitDenseCapacity(int capacity) const;
 
     // Release active locks and scratch slots without recording a scheduler suspension.
     void _deactivate();

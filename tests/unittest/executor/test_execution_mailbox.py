@@ -368,3 +368,119 @@ def test_resource_admission_releases_host_gate_handle_without_completing_the_res
     assert not table.drain_tracker.drained(VERSION)
     table.drain_tracker.release_resource(claim)
     assert table.drain_tracker.drained(VERSION)
+
+
+class _VirtualPollingQueue:
+    """Account for requested idle time without depending on wall-clock timing."""
+
+    def __init__(self):
+        from queue import Queue
+
+        self.queue = Queue()
+        self.elapsed = 0.0
+        self.ready = False
+        self.idle_calls = 0
+        self.inject = None
+
+    def put(self, item):
+        self.queue.put(item)
+
+    def get(self, timeout=None):
+        from queue import Empty
+
+        if not self.queue.empty():
+            return self.queue.get_nowait()
+        self.idle_calls += 1
+        assert self.idle_calls < 2000, "Lifecycle polling made no bounded progress"
+        if self.inject is not None and self.ready:
+            inject, self.inject = self.inject, None
+            inject()
+            return self.queue.get_nowait()
+        if timeout is None:
+            return None
+        self.elapsed += timeout
+        self.ready = True
+        raise Empty
+
+
+def _run_lifecycle_backlog(
+    monkeypatch, *, aligned=False, delayed=0.0, fail_one=False, inject=False
+):
+    import tensorrt_llm.execution_mailbox as mailbox
+    from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentReceipt
+    from tensorrt_llm.execution_fence import FenceReceipt
+
+    queue = _VirtualPollingQueue()
+
+    class Transport:
+        closed = False
+        injection_remaining = None
+
+        def publish(self, update, stop):
+            if update.version.scope_id == "urgent":
+                self.injection_remaining = len(controller._pending_fences)
+            return PublicationReceipt(update, update.version)
+
+        def poll_fence(self, request, stop):
+            if not queue.ready or queue.elapsed < delayed:
+                return None
+            if fail_one and request.revision.expected_version.scope_id == "scope-7":
+                raise ValueError("synthetic fence failure")
+            return FenceReceipt(request)
+
+        def poll_alignment(self, request, stop):
+            if not queue.ready or queue.elapsed < delayed:
+                return None
+            return AlignmentReceipt(request, "held-" + request.revision.revision_id, 0)
+
+        def close(self):
+            self.closed = True
+
+    transport = Transport()
+    with monkeypatch.context() as patch:
+        patch.setattr(mailbox.Thread, "start", lambda self: None)
+        patch.setattr(mailbox, "Queue", lambda: queue)
+        controller = ExecutionController("session", transport)
+    results = []
+    for index in range(32):
+        old = replace(VERSION, scope_id=f"scope-{index}")
+        controller.register(old)
+        results.append(
+            controller.advance(
+                Revision(f"edit-{index}", old, replace(old, epoch=old.epoch + 1)),
+                alignment=AlignmentInput((1, 2, 3)) if aligned else None,
+            )
+        )
+    if inject:
+        queue.inject = lambda: controller.register(replace(VERSION, scope_id="urgent"))
+    controller._run()
+    assert transport.closed
+    assert not controller._pending_fences
+    assert not controller._pending_alignments
+    for index, result in enumerate(results):
+        if fail_one and index == 7:
+            with pytest.raises(ValueError, match="synthetic fence failure"):
+                result.fence.wait(0)
+        else:
+            assert result.fence.wait(0).request.revision == result.advance_receipt.revision
+        if aligned:
+            assert result.alignment.wait(0).request.revision == result.advance_receipt.revision
+    return queue, transport
+
+
+@pytest.mark.parametrize("aligned", [False, True])
+@pytest.mark.parametrize("fail_one", [False, True])
+def test_ready_lifecycle_backlog_does_not_sleep_per_receipt(monkeypatch, aligned, fail_one):
+    queue, _ = _run_lifecycle_backlog(monkeypatch, aligned=aligned, fail_one=fail_one)
+    assert queue.elapsed <= 0.02
+
+
+def test_pending_lifecycle_backlog_sleeps_and_checks_all_scopes(monkeypatch):
+    queue, _ = _run_lifecycle_backlog(monkeypatch, aligned=True, delayed=0.05)
+    assert 0.05 <= queue.elapsed <= 0.07
+    assert queue.idle_calls < 200
+
+
+def test_ready_lifecycle_backlog_does_not_starve_new_publication(monkeypatch):
+    _, transport = _run_lifecycle_backlog(monkeypatch, aligned=True, inject=True)
+    assert transport.injection_remaining >= 30

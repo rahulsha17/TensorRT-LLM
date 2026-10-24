@@ -3,7 +3,7 @@
 """Device authority and asynchronous token-commit guards for RETIRE execution."""
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import RLock
@@ -21,6 +21,7 @@ __all__ = [
     "DeviceExecutionAuthority",
     "DeviceTokenCommit",
     "DeviceTokenCommitTicket",
+    "DeviceVersionCheckTicket",
 ]
 
 
@@ -50,9 +51,11 @@ def _commit_tokens(
     candidates,
     committed,
     allowed,
+    compact_tokens,
     STEPS: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
     BLOCK: tl.constexpr,
+    COMPACT: tl.constexpr,
 ):
     row = tl.program_id(0)
     slot = tl.load(slots + row)
@@ -69,6 +72,10 @@ def _commit_tokens(
         offset = step * NUM_SLOTS + sequence_slot
         token = tl.load(candidates + offset, step < STEPS, other=0)
         tl.store(committed + offset, token, step < STEPS)
+        if COMPACT:
+            tl.store(compact_tokens + row, tl.sum(token, 0))
+    elif COMPACT:
+        tl.store(compact_tokens + row, 0)
 
 
 def _epoch_word(epoch: int) -> int:
@@ -166,8 +173,36 @@ class DeviceTokenCommitTicket:
         return self._use.event
 
     def wait(self) -> DeviceTokenCommit:
-        self.authority._wait(self._use)
+        self.authority._wait(self._use, timeout=None)
         return DeviceTokenCommit(self.tokens_device, self.tokens_host, self.allowed_host.tolist())
+
+
+@dataclass(frozen=True)
+class DeviceVersionCheckTicket:
+    """Retain an authority observation ordered after the caller's GPU work.
+
+    Its verdict is a receipt for that stream position, not permission for later
+    writes. Publication after the observation cannot change the retained result.
+    The host verdict must only be read through wait(), after completion.
+    """
+
+    authority: "DeviceExecutionAuthority"
+    versions: tuple[ExecutionVersion | None, ...]
+    _allowed_host: torch.Tensor
+    _use: _PendingUse
+
+    @property
+    def event(self) -> torch.cuda.Event:
+        assert self._use.event is not None
+        return self._use.event
+
+    def query(self) -> bool:
+        """Inspect completion without reading the pending host transfer."""
+        return self.authority._query(self._use)
+
+    def wait(self) -> list[bool]:
+        self.authority._wait(self._use, timeout=None)
+        return self._allowed_host.tolist()
 
 
 class DeviceExecutionAuthority:
@@ -211,15 +246,23 @@ class DeviceExecutionAuthority:
             ) from self._failure
 
     @contextmanager
-    def submission(self) -> Iterator[None]:
+    def submission(self, *, capture_possible: bool = True) -> Iterator[None]:
         """Exclude publisher CUDA allocations during model capture/compilation.
 
         This protects CPU submission only, never GPU completion. Once the
         forward is enqueued, the publisher can run while its kernels execute.
         No worker-table lock may be acquired from inside this context.
         """
-        with self._lock:
-            self._healthy()
+        if capture_possible:
+            with self._lock:
+                self._healthy()
+                yield
+        else:
+            # Eager execution and replay cannot start a capture. Metadata
+            # operations still take their own locks; publication can proceed
+            # while the model submits its kernels.
+            with self._lock:
+                self._healthy()
             yield
 
     def _collect_completed(self) -> None:
@@ -257,19 +300,19 @@ class DeviceExecutionAuthority:
         self._table.record_stream(stream)
         self._collect_completed()
 
-    def _wait(self, use: _PendingUse, timeout: float = 5.0) -> None:
+    def _wait(self, use: _PendingUse, timeout: float | None = 5.0) -> None:
         # No authority lock is held while waiting: the publisher must be able
         # to revoke a version even while its model stream is occupied.
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         delay = 0.00001
         try:
             assert use.event is not None
             while not use.event.query():
                 self._healthy()
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
                     raise TimeoutError("device authority guard did not complete")
-                time.sleep(min(delay, remaining))
+                time.sleep(delay if remaining is None else min(delay, remaining))
                 delay = min(delay * 2, 0.001)
             self._healthy()
         except BaseException as error:
@@ -279,7 +322,17 @@ class DeviceExecutionAuthority:
 
     def wait_event(self, event: torch.cuda.Event) -> None:
         """Wait for a request's submitted readers without holding authority locks."""
-        self._wait(_PendingUse([], event))
+        self._wait(_PendingUse([], event), timeout=None)
+
+    def _query(self, use: _PendingUse) -> bool:
+        try:
+            self._healthy()
+            assert use.event is not None
+            return use.event.query()
+        except BaseException as error:
+            with self._lock:
+                self._failure = error
+            raise
 
     def publish(self, version: ExecutionVersion) -> None:
         """Queue one atomic epoch write without joining the execution stream."""
@@ -315,7 +368,9 @@ class DeviceExecutionAuthority:
                 self._failure = error
                 raise
 
-    def _input_values(self, versions: list[ExecutionVersion | None]) -> tuple[list[int], list[int]]:
+    def _input_values(
+        self, versions: Sequence[ExecutionVersion | None]
+    ) -> tuple[list[int], list[int]]:
         # Called with _lock held, on the caller's CUDA stream.
         stream = torch.cuda.current_stream(self.device)
         stream.wait_event(self._ready)
@@ -336,7 +391,7 @@ class DeviceExecutionAuthority:
         return slots, epochs
 
     def _inputs(
-        self, versions: list[ExecutionVersion | None], use: _PendingUse
+        self, versions: Sequence[ExecutionVersion | None], use: _PendingUse
     ) -> tuple[torch.Tensor, torch.Tensor]:
         slots, epochs = self._input_values(versions)
         return self._upload(slots, torch.int32, use), self._upload(epochs, torch.int64, use)
@@ -394,9 +449,10 @@ class DeviceExecutionAuthority:
     ) -> None:
         """Stage immutable host inputs before a forward or graph replay.
 
-        Padding is always reset to the untagged sentinel. Stream ordering keeps
-        a later batch from overwriting identities used by earlier model work.
-        The temporary upload storage remains held until its copy completes.
+        Padding uses the untagged sentinel. Stable batches keep their expected
+        identities while every call joins the latest authority publication.
+        Stream ordering keeps a later batch from overwriting identities used by
+        earlier model work; upload storage stays held until its copy completes.
         """
         if rows.authority is not self:
             raise ValueError("attention rows belong to another authority")
@@ -446,25 +502,36 @@ class DeviceExecutionAuthority:
             with self._lock:
                 self._healthy()
                 return [True] * len(versions)
+        return self.enqueue_check(versions).wait()
+
+    def enqueue_check(self, versions: list[ExecutionVersion | None]) -> DeviceVersionCheckTicket:
+        """Queue a retained authority receipt without waiting for model work.
+
+        Call on the stream whose preceding work the receipt describes. This
+        operation observes authority; it neither accepts a request cursor nor
+        publishes or releases any KV allocation.
+        """
+        if not versions:
+            raise ValueError("an authority receipt requires at least one row")
+        identities = tuple(versions)
         with self._lock, torch.cuda.device(self.device):
             self._healthy()
             use = self._start_use([])
             try:
-                slots, expected = self._inputs(versions, use)
-                allowed = torch.empty(len(versions), dtype=torch.bool, device=self.device)
+                slots, expected = self._inputs(identities, use)
+                allowed = torch.empty(len(identities), dtype=torch.bool, device=self.device)
                 use.tensors.append(allowed)
-                _check_versions[(triton.cdiv(len(versions), 128),)](
-                    self._table, slots, expected, allowed, len(versions), 128
+                _check_versions[(triton.cdiv(len(identities), 128),)](
+                    self._table, slots, expected, allowed, len(identities), 128
                 )
-                host = torch.empty(len(versions), dtype=torch.bool, pin_memory=prefer_pinned())
+                host = torch.empty(len(identities), dtype=torch.bool, pin_memory=prefer_pinned())
                 use.tensors.append(host)
                 host.copy_(allowed, non_blocking=True)
                 self._record(use, torch.cuda.current_stream(self.device))
             except BaseException as error:
                 self._failure = error
                 raise
-        self._wait(use)
-        return host.tolist()
+        return DeviceVersionCheckTicket(self, identities, host, use)
 
     def commit_tokens(
         self,
@@ -526,7 +593,20 @@ class DeviceExecutionAuthority:
                     versions, sequence_slots, use
                 )
                 committed = torch.zeros_like(candidates)
-                allowed = torch.empty(len(versions), dtype=torch.bool, device=self.device)
+                if compact:
+                    # One packed transfer carries tokens in request order and
+                    # their verdicts. Each ticket owns its storage until the
+                    # completion event; later batches cannot overwrite it.
+                    token_bytes = len(versions) * candidates.element_size()
+                    packed = torch.empty(
+                        token_bytes + len(versions), dtype=torch.uint8, device=self.device
+                    )
+                    tokens = packed[:token_bytes].view(candidates.dtype)
+                    allowed = packed[token_bytes:].view(torch.bool)
+                    use.tensors.append(packed)
+                else:
+                    tokens = committed
+                    allowed = torch.empty(len(versions), dtype=torch.bool, device=self.device)
                 use.tensors.extend([committed, allowed])
                 _commit_tokens[(len(versions),)](
                     self._table,
@@ -536,17 +616,31 @@ class DeviceExecutionAuthority:
                     candidates,
                     committed,
                     allowed,
+                    tokens,
                     candidates.shape[0],
                     candidates.shape[1],
                     triton.next_power_of_2(candidates.shape[0]),
+                    compact,
                     num_warps=1,
                 )
-                tokens = committed[0, sequence_slots_device, 0] if compact else committed
-                host = torch.empty(tokens.shape, dtype=tokens.dtype, pin_memory=prefer_pinned())
-                accepted = torch.empty(len(versions), dtype=torch.bool, pin_memory=prefer_pinned())
+                if compact:
+                    packed_host = torch.empty(
+                        packed.shape, dtype=torch.uint8, pin_memory=prefer_pinned()
+                    )
+                    use.tensors.append(packed_host)
+                    host = packed_host[:token_bytes].view(candidates.dtype)
+                    accepted = packed_host[token_bytes:].view(torch.bool)
+                else:
+                    host = torch.empty(tokens.shape, dtype=tokens.dtype, pin_memory=prefer_pinned())
+                    accepted = torch.empty(
+                        len(versions), dtype=torch.bool, pin_memory=prefer_pinned()
+                    )
                 use.tensors.extend([tokens, host, accepted])
-                host.copy_(tokens, non_blocking=True)
-                accepted.copy_(allowed, non_blocking=True)
+                if compact:
+                    packed_host.copy_(packed, non_blocking=True)
+                else:
+                    host.copy_(tokens, non_blocking=True)
+                    accepted.copy_(allowed, non_blocking=True)
                 self._record(use, torch.cuda.current_stream(self.device))
             except BaseException as error:
                 self._failure = error

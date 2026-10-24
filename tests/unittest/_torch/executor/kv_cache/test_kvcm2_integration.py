@@ -1341,6 +1341,74 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     assert kv_cache.stopped_committing
 
 
+def _async_context_publication_fixture():
+    request = SimpleNamespace(
+        py_request_id=1,
+        is_dummy_request=False,
+        prompt_len=12,
+        context_current_position=12,
+        context_remaining_length=0,
+    )
+    allocation = _FakeKVCache(num_committed_tokens=4)
+    allocation.capacity = 16
+    manager = object.__new__(KVCacheManagerV2)
+    manager.supports_execution_context_overlap = lambda: True
+    manager.kv_cache_map = {1: allocation}
+    manager._reuse_token_source = lambda request: list(range(12))
+    manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    return manager, request, allocation
+
+
+@pytest.mark.parametrize("frontier", [4, 7, 8, 12])
+def test_async_context_publication_uses_receipt_instead_of_speculative_cursor(frontier):
+    manager, request, allocation = _async_context_publication_fixture()
+    assert manager.preserve_execution_context(request, frontier, allocation)
+    assert allocation.num_committed_tokens == frontier
+    assert allocation.published_keys == list(range(4, frontier))
+    assert not allocation.stopped_committing
+    assert allocation.enable_swa_scratch_reuse is (frontier != request.prompt_len)
+    assert manager.preserve_execution_context(request, frontier, allocation)
+    assert allocation.published_keys == list(range(4, frontier))
+
+
+@pytest.mark.parametrize("frontier", [-1, 13, True, 3.5])
+def test_async_context_publication_rejects_an_invalid_receipt_frontier(frontier):
+    manager, request, allocation = _async_context_publication_fixture()
+    with pytest.raises(ValueError, match="completed context frontier"):
+        manager.preserve_execution_context(request, frontier, allocation)
+    assert allocation.num_committed_tokens == 4 and not allocation.published_keys
+
+
+@pytest.mark.parametrize("state", ["replaced", "released", "suspended", "frozen"])
+def test_async_context_publication_cannot_retarget_or_restore_an_allocation(state):
+    manager, request, allocation = _async_context_publication_fixture()
+    if state == "replaced":
+        replacement = _FakeKVCache(num_committed_tokens=0)
+        manager.kv_cache_map[1] = replacement
+    elif state == "released":
+        manager.kv_cache_map.clear()
+    elif state == "suspended":
+        allocation.is_active = False
+    else:
+        allocation.stop_committing()
+    assert not manager.preserve_execution_context(request, 12, allocation)
+    assert allocation.num_committed_tokens == 4 and not allocation.published_keys
+    if state == "replaced":
+        assert replacement.num_committed_tokens == 0 and not replacement.published_keys
+
+
+@pytest.mark.parametrize("constraint", ["none", "layout", "policy", "publication", "drop_plan"])
+def test_async_context_publication_eligibility_preserves_history_fallbacks(constraint):
+    manager = object.__new__(KVCacheManagerV2)
+    manager._supports_dense_resume_capacity = lambda: constraint != "layout"
+    manager._can_publish_block_reuse = constraint != "publication"
+    manager.block_reuse_policy = (
+        BlockReusePolicy.PER_REQUEST if constraint == "policy" else BlockReusePolicy.ALL_REUSABLE
+    )
+    manager.conversation_manager = object() if constraint == "drop_plan" else None
+    assert manager.supports_execution_context_overlap() is (constraint == "none")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_retire_recovers_completed_context_before_stopping_native_cache() -> None:
     torch.cuda.init()
@@ -1441,11 +1509,26 @@ def test_retire_common_prefix_caps_native_v2_claim(limit) -> None:
             return successor
 
         manager._create_kv_cache = create
-        request = _ContextRequest(1, prompt, len(prompt), "conv", execution_reuse_limit=limit)
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=4,
+            input_tokens=prompt,
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+        request.execution_reuse_limit = limit
         assert manager.prepare_context_cache(request) == limit
         assert successor.num_committed_tokens == limit
         assert owner.num_committed_tokens == 12
         assert core.probe_reuse(None, prompt) == 12
+        # Releasing the handoff hold does not relax the runtime's reuse ceiling.
+        # A replacement allocation must enforce it during lookup and rebasing.
+        successor.close()
+        successor = None
+        manager.kv_cache_map.clear()
+        assert manager.prepare_context_cache(request) == limit
+        assert successor.num_committed_tokens == limit
+        assert request.execution_reuse_limit == limit
     finally:
         for cache in (successor, owner):
             if cache is not None:
@@ -1518,6 +1601,286 @@ def test_retire_native_decode_commit_survives_owner_close(prompt_length, frontie
         assert successor.num_committed_tokens == frontier
     finally:
         for cache in (successor, reservation, owner):
+            if cache is not None:
+                cache.close()
+        core.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "pressure,frontier,context_grace",
+    [
+        (False, 15, False),
+        (False, 16, False),
+        (True, 15, False),
+        (True, 16, False),
+        (True, 15, True),
+        (True, 16, True),
+    ],
+)
+def test_retire_resident_handoff_preserves_native_pages_and_yields_for_admission(
+    pressure, frontier, context_grace
+):
+    from tensorrt_llm._torch.pyexecutor.execution_alignment import KVAlignmentAdapter
+    from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+    from tensorrt_llm.execution_alignment import AlignmentInput
+
+    stream = torch.cuda.current_stream()
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(16 << 20), HostCacheTierConfig(16 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    0, [BufferConfig("key", 1 << 20), BufferConfig("value", 1 << 20)]
+                )
+            ],
+            max_util_for_resume=1.0,
+        )
+    )
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = core
+    manager._stream = stream
+    manager.enable_block_reuse = True
+    manager.max_seq_len = 64
+    manager._derive_reuse_salt = lambda salt: 11
+    manager._supports_dense_resume_capacity = lambda: True
+    manager._has_cp_helix = False
+    manager.num_extra_kv_tokens = 0
+    manager._connector_reservations_enabled = lambda: False
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    executor = SimpleNamespace(kv_cache_manager=manager, max_seq_len=64, _is_kv_manager_v2=True)
+    adapter = KVAlignmentAdapter(executor, keep_resident=True)
+    owner = consumer = successor = hold = None
+    tokens = list(range(frontier))
+    revised = AlignmentInput(tuple(tokens + [99, 98, 97, 96]), cache_salt="scope")
+    scope = ReuseScope(salt=11)
+
+    def page_views(cache):
+        for role_index, role in enumerate((Role.KEY, Role.VALUE)):
+            (desc,) = core.get_aggregated_pages([BufferId(LayerId(0), role)])
+            for ordinal, index in enumerate(cache.get_aggregated_page_indices(desc.layer_group_id)):
+                assert index >= 0
+                view = convert_to_torch_tensor(
+                    TensorWrapper(desc.base + desc.stride * index, torch.uint8, (desc.size,))
+                )
+                yield ordinal, role_index, view
+
+    try:
+        owner = core.create_kv_cache(scope, expected_prompt_length=frontier)
+        assert owner.resume(stream.cuda_stream) and owner.resize(frontier)
+        for ordinal, role_index, view in page_views(owner):
+            view.fill_(17 * (ordinal + 1) + role_index)
+        stream.synchronize()
+        owner.commit(tokens)
+        owner.stop_committing()
+        hold = adapter.reserve(revised)
+        assert hold.num_tokens == frontier and len(adapter._resident_v2) == 1
+        (reserved,) = adapter._resident_v2.values()
+        assert reserved.num_committed_tokens == frontier // 4 * 4
+        owner.close()
+        owner = None
+        assert reserved.is_active
+        assert _introspection.active_page_stats(reserved)[0] == [frontier // 4, 0]
+
+        consumer = core.create_kv_cache(ReuseScope(salt=12), expected_prompt_length=24)
+        assert consumer.resume(stream.cuda_stream)
+        manager.kv_cache_map = {2: consumer}
+        request = SimpleNamespace(
+            py_request_id=2,
+            context_current_position=0,
+            is_disagg_generation_init_state=False,
+            is_first_context_chunk=True,
+        )
+        admitted = manager.resize_context(request, 24 if pressure else 8)
+        if pressure:
+            assert not admitted and manager.has_execution_residency
+            assert reserved.is_active
+            assert _introspection.active_page_stats(reserved)[0] == [frontier // 4, 0]
+            assert manager.defer_execution_residency_recovery()
+            assert reserved.is_active
+            assert _introspection.active_page_stats(reserved)[0] == [frontier // 4, 0]
+            assert not manager.defer_execution_residency_recovery()
+            if context_grace:
+                assert not manager._yield_context_execution_residency()
+                manager.advance_execution_residency()
+                assert manager._yield_context_execution_residency()
+            else:
+                # No successor arrived during the one queue-poll opportunity.
+                assert manager._yield_execution_residency()
+            assert consumer.resume(stream.cuda_stream)
+            assert manager.resize_context(request, 24)
+        else:
+            assert admitted
+        assert hold.num_tokens == frontier
+        assert core.probe_reuse(scope, list(revised.input_token_ids)) == frontier
+        assert core.probe_reuse(ReuseScope(salt=12), list(revised.input_token_ids)) == 0
+        assert bool(adapter._resident_v2) is not pressure
+        counts = _introspection.active_page_stats(reserved)[0]
+        assert sum(counts) == frontier // 4
+        assert (counts[1] > 0) is pressure
+        for _, _, view in page_views(consumer):
+            view.fill_(231)
+        consumer.close()
+        consumer = None
+
+        successor = core.create_kv_cache(scope, list(revised.input_token_ids))
+        assert successor.num_committed_tokens == frontier
+        assert successor.resume(stream.cuda_stream)
+        assert _introspection.active_page_stats(successor)[0] == [4, 0]
+        for ordinal, role_index, view in page_views(successor):
+            valid_bytes = view.numel() * min(4, frontier - 4 * ordinal) // 4
+            assert torch.all(view[:valid_bytes] == 17 * (ordinal + 1) + role_index)
+        # Activating the whole-block hold must not privatize the canonical tail.
+        assert core.probe_reuse(scope, list(revised.input_token_ids)) == frontier
+        hold.settle()
+        hold.close()
+        hold = None
+        assert successor.is_active and successor.num_committed_tokens == frontier
+        assert not adapter._resident_v2 and adapter._reserved_v2_blocks == 0
+    finally:
+        if hold is not None:
+            hold.close()
+        for cache in (successor, consumer, owner):
+            if cache is not None:
+                cache.close()
+        stream.synchronize()
+        core.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("frontier", [7, 8])
+@pytest.mark.parametrize("revision", ["after_receipt", "pending_receipt", "replacement"])
+def test_async_context_native_preserves_only_authorized_bytes(frontier, revision):
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.pyexecutor.execution_device import DeviceExecutionAuthority
+    from tensorrt_llm._torch.pyexecutor.execution_guard import ExecutionDeviceGuard
+    from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+    from tensorrt_llm.execution_mailbox import VersionUpdate, WorkerVersionTable
+    from tensorrt_llm.execution_version import ExecutionVersion
+
+    stream = torch.cuda.Stream()
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(16 << 20), HostCacheTierConfig(16 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    0, [BufferConfig("key", 1 << 20), BufferConfig("value", 1 << 20)]
+                )
+            ],
+            max_util_for_resume=1.0,
+        )
+    )
+    version = ExecutionVersion("tenant", "scope", 7)
+    table = WorkerVersionTable("session")
+    device = DeviceExecutionAuthority(torch.cuda.current_device())
+    table.bind_device_publisher(device)
+    table.apply(VersionUpdate("session", 1, version))
+    manager = object.__new__(KVCacheManagerV2)
+    manager.supports_execution_context_overlap = lambda: True
+    manager.enable_block_reuse = manager._can_publish_block_reuse = True
+    manager.tokens_per_block = 4
+    tokens = list(range(12))
+    manager._reuse_token_source = lambda request: tokens
+    manager._augment_tokens_for_block_reuse = lambda source, request, start, end: source[start:end]
+    guard = object.__new__(ExecutionDeviceGuard)
+    guard.table, guard.device = table, device
+    guard._kv_manager, guard._v1_manager = manager, None
+    guard._rank_consensus = None
+    guard._model_engine = SimpleNamespace(forward_may_capture=False)
+    guard._async_context = guard._native_kv_guards = guard._early_exit_enabled = True
+    guard._uses, guard._kv_frontiers = {}, {}
+    guard._context_owners, guard._context_chunks = {}, {}
+    request = SimpleNamespace(
+        py_request_id=1,
+        py_execution_version=version,
+        prepopulated_prompt_len=0,
+        prompt_len=12,
+        context_current_position=0,
+        context_chunk_size=frontier,
+        context_remaining_length=12,
+        is_dummy_request=False,
+        is_finished=False,
+        state=LlmRequestState.CONTEXT_INIT,
+        py_decoding_iter=0,
+    )
+
+    def finish(reason):
+        request.state = LlmRequestState.GENERATION_COMPLETE
+        request.is_finished = True
+
+    request.finish_by_reason = finish
+    batch = ScheduledRequests()
+    batch.context_requests_chunking = [request]
+    scope = ReuseScope(salt=11)
+    owner = replacement = successor = None
+
+    def page_views(cache):
+        for role_index, role in enumerate((Role.KEY, Role.VALUE)):
+            (desc,) = core.get_aggregated_pages([BufferId(LayerId(0), role)])
+            for ordinal, index in enumerate(cache.get_aggregated_page_indices(desc.layer_group_id)):
+                assert index >= 0
+                yield (
+                    ordinal,
+                    role_index,
+                    convert_to_torch_tensor(
+                        TensorWrapper(desc.base + desc.stride * index, torch.uint8, (desc.size,))
+                    ),
+                )
+
+    try:
+        owner = core.create_kv_cache(scope, expected_prompt_length=12)
+        assert owner.resume(stream.cuda_stream) and owner.resize(12)
+        manager.kv_cache_map = {1: owner}
+        with torch.cuda.stream(stream):
+            # Compile the receipt before testing the pending-device boundary.
+            assert device.check([version]) == [True]
+            with guard.forward(batch):
+                if revision == "pending_receipt":
+                    torch.cuda._sleep(1_000_000_000)
+                for ordinal, role_index, view in page_views(owner):
+                    view.fill_(17 * (ordinal + 1) + role_index)
+            with guard.context_commit(batch) as accepted:
+                assert accepted.context_requests == [request]
+                request.context_current_position = frontier
+                request.context_remaining_length = 12 - frontier
+            assert owner.num_committed_tokens == 0
+            assert guard._kv_frontiers[id(request)] == 0
+            receipt = guard._context_chunks[id(request)][0].ticket
+            if revision == "pending_receipt":
+                assert not receipt.query()
+            else:
+                assert receipt.wait() == [True]
+            if revision == "replacement":
+                replacement = core.create_kv_cache(ReuseScope(salt=12), expected_prompt_length=12)
+                assert replacement.resume(stream.cuda_stream) and replacement.resize(4)
+                manager.kv_cache_map[1] = replacement
+            table.apply(VersionUpdate("session", 2, replace(version, epoch=8)))
+            guard.before_release(request)
+            expected = frontier if revision == "after_receipt" else 0
+            assert owner.num_committed_tokens == expected
+            assert core.probe_reuse(scope, tokens) == expected
+            assert core.probe_reuse(ReuseScope(salt=12), tokens) == 0
+            if replacement is not None:
+                assert replacement.is_commit_allowed and replacement.num_committed_tokens == 0
+                replacement.close()
+                replacement = None
+            successor = core.create_kv_cache(scope, tokens[:frontier] + [99, 98, 97, 96])
+            assert successor.num_committed_tokens == expected
+            owner.close()
+            owner = None
+            if expected:
+                assert successor.resume(stream.cuda_stream)
+                stream.synchronize()
+                for ordinal, role_index, view in page_views(successor):
+                    valid_bytes = view.numel() * min(4, expected - 4 * ordinal) // 4
+                    assert torch.all(view[:valid_bytes] == 17 * (ordinal + 1) + role_index)
+    finally:
+        stream.synchronize()
+        for cache in (successor, replacement, owner):
             if cache is not None:
                 cache.close()
         core.shutdown()
@@ -1650,7 +2013,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     observed_progress_views = []
 
-    def resume_and_restore(request_id, current_cache):
+    def resume_and_restore(request_id, current_cache, *, capacity_hint=None, yield_residency=True):
         assert (request_id, current_cache) == (request.py_request_id, kv_cache)
         observed_progress_views.append(request.use_draft_model)
         return True
@@ -2146,6 +2509,225 @@ def test_per_conversation_policy_delays_commit_until_last_context_chunk(
         _free_if_active(manager, request)
 
 
+@pytest.mark.parametrize("retained", [False, True])
+def test_first_context_capacity_does_not_publish_unwritten_prompt(retained: bool) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=True,
+            max_gpu_total_bytes=1 << 20,
+            host_cache_size=1 << 20,
+            block_reuse_config=BlockReuseConfig(policy=BlockReusePolicy.ALL_REUSABLE),
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=16,
+        tokens_per_block=4,
+        max_seq_len=16,
+        max_batch_size=2,
+        max_num_tokens=4,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+    )
+    prompt = list(range(16))
+    request = _ContextRequest(1, prompt, 16, "unused", use_conversation_params=False)
+    request.py_execution_recovery_tokens = 4 if retained else 0
+    source = None
+    try:
+        source = manager.impl.create_kv_cache(ReuseScope(), expected_prompt_length=16)
+        assert source.resume(manager._stream.cuda_stream)
+        assert source.resize(4)
+        source.commit(prompt[:4])
+        source.close()
+        source = None
+
+        assert manager.prepare_context(request, prefill_token_budget=4, prefill_chunk_unit=4)
+        assert request.context_current_position == 4
+        assert manager.resize_context(request, num_tokens=4)
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.capacity == 8
+        assert cache.num_committed_tokens == 4
+        assert manager.impl.probe_reuse(ReuseScope(), prompt) == 4
+
+        request.context_current_position = 8
+        request.context_remaining_length = 8
+        manager.update_context_resources(_context_batch(request))
+        assert cache.capacity == 8
+        assert manager.impl.probe_reuse(ReuseScope(), prompt) == 8
+    finally:
+        if source is not None:
+            source.close()
+        _free_if_active(manager, request)
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_context_continuation_rejects_before_host_restore(published: bool) -> None:
+    """Do not onboard a suspended chunk when its next chunk cannot fit."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    # Native driver allocations need an active context even in an isolated test.
+    torch.empty(1, device="cuda")
+    config = KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[GpuCacheTierConfig(quota=8 << 20), HostCacheTierConfig(quota=8 << 20)],
+        layers=[AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=2 << 20)])],
+    )
+    core = KVCacheManager(config)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = core
+    manager.kv_cache_manager_py_config = config
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.is_disagg = False
+    manager._has_cp_helix = False
+    manager.kv_connector_manager = None
+    manager.max_beam_width = 1
+    manager.max_draft_len = 0
+    manager.num_extra_kv_tokens = 0
+    manager.kv_compression_manages_history = False
+    manager.max_seq_len = 16
+    manager._stream = torch.cuda.Stream()
+    manager._restore_page_index_bufs = Mock()
+    cache = core.create_kv_cache(ReuseScope(salt=1))
+    blocker = core.create_kv_cache(ReuseScope(salt=2))
+    manager.kv_cache_map = {1: cache}
+    request = _ContextRequest(
+        1,
+        list(range(16)),
+        8,
+        "unused",
+        use_conversation_params=False,
+        is_first_context_chunk=False,
+        context_current_position=8,
+    )
+    try:
+        assert core.get_storage_statistics(CacheLevel(0))[0].total == 4
+        assert cache.resume(manager._stream.cuda_stream)
+        assert cache.resize(8, 8)
+        if published:
+            cache.commit(list(range(8)))
+        cache.suspend()
+        assert blocker.resume(manager._stream.cuda_stream)
+        assert blocker.resize(16)
+        assert blocker.resize(8)
+        core.get_and_reset_iteration_stats()
+
+        reused = manager.prepare_context_cache(
+            request, prefill_token_budget=4, prefill_chunk_unit=4
+        )
+        stats = core.get_and_reset_iteration_stats()
+        onboard = sum(row.iter_onboard_bytes for row in stats.values())
+        assert reused is None, {"onboard_bytes": onboard, "unexpected_reuse": reused}
+        assert onboard == 0
+        assert sum(row.iter_offload_bytes for row in stats.values()) == 0
+        assert not cache.is_active
+        assert cache.capacity == 8
+        assert cache.num_committed_tokens == (8 if published else 0)
+        assert request.context_current_position == 8
+        manager._restore_page_index_bufs.assert_not_called()
+
+        assert blocker.resize(4)
+        assert manager.prepare_context_cache(
+            request, prefill_token_budget=4, prefill_chunk_unit=4
+        ) == (8 if published else 0)
+        assert cache.is_active
+        assert cache.capacity == 8
+        assert cache.resize(12)
+        assert cache.num_committed_tokens == (8 if published else 0)
+        manager._restore_page_index_bufs.assert_called_once_with(1, cache)
+    finally:
+        cache.close()
+        blocker.close()
+        manager._stream.synchronize()
+        core.shutdown()
+
+
+@pytest.mark.parametrize("published", [False, True])
+@pytest.mark.parametrize("already_decoding", [False, True])
+def test_generation_resume_rejects_before_host_restore(
+    published: bool, already_decoding: bool
+) -> None:
+    """Keep the cache suspended when its next decode token cannot fit."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    torch.empty(1, device="cuda")
+    config = KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[GpuCacheTierConfig(quota=8 << 20), HostCacheTierConfig(quota=8 << 20)],
+        layers=[AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=2 << 20)])],
+    )
+    core = KVCacheManager(config)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = core
+    manager.kv_cache_manager_py_config = config
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.is_disagg = False
+    manager._has_cp_helix = False
+    manager.kv_connector_manager = None
+    manager.max_beam_width = 1
+    manager.max_draft_len = 0
+    manager.num_extra_kv_tokens = 0
+    manager.kv_compression_manages_history = False
+    manager.max_seq_len = 16
+    manager._stream = torch.cuda.Stream()
+    manager._restore_page_index_bufs = Mock()
+    manager._ensure_generation_beam_width = Mock(return_value=True)
+    manager._generation_draft_slots = Mock(return_value=0)
+    manager._allocated_draft_lens = {}
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    cache = core.create_kv_cache(ReuseScope(salt=1))
+    blocker = core.create_kv_cache(ReuseScope(salt=2))
+    manager.kv_cache_map = {1: cache}
+    request = SimpleNamespace(py_request_id=1, py_multimodal_data=None)
+    try:
+        assert core.get_storage_statistics(CacheLevel(0))[0].total == 4
+        assert cache.resume(manager._stream.cuda_stream)
+        assert cache.resize(8, 8)
+        if published:
+            cache.commit(list(range(8)))
+        if already_decoding:
+            assert cache.enter_decode()
+        cache.suspend()
+        assert blocker.resume(manager._stream.cuda_stream)
+        assert blocker.resize(16)
+        assert blocker.resize(8)
+        core.get_and_reset_iteration_stats()
+
+        assert not manager.try_allocate_generation(request)
+        stats = core.get_and_reset_iteration_stats()
+        onboard = sum(row.iter_onboard_bytes for row in stats.values())
+        assert onboard == 0, {"onboard_bytes": onboard}
+        assert sum(row.iter_offload_bytes for row in stats.values()) == 0
+        assert not cache.is_active
+        assert cache.is_decoding == already_decoding
+        assert cache.capacity == 8
+        assert cache.num_committed_tokens == (8 if published else 0)
+        assert manager._allocated_draft_lens == {}
+        manager._restore_page_index_bufs.assert_not_called()
+        manager._ensure_generation_beam_width.assert_not_called()
+
+        assert blocker.resize(4)
+        assert manager.try_allocate_generation(request)
+        assert cache.is_active and cache.is_decoding
+        assert cache.capacity == 9
+        assert cache.num_committed_tokens == (8 if published else 0)
+        assert manager._allocated_draft_lens == {1: 0}
+        manager._restore_page_index_bufs.assert_called_once_with(1, cache)
+    finally:
+        cache.close()
+        blocker.close()
+        manager._stream.synchronize()
+        core.shutdown()
+
+
 def test_per_conversation_policy_without_params_uses_per_request_commit(
     manager: KVCacheManagerV2,
 ) -> None:
@@ -2607,7 +3189,9 @@ def _make_admission_manager(
     manager.is_estimating_kv_cache = is_estimating_kv_cache
     manager._spec_recompute_tail = 0
     manager._disagg_transfer_overwrites_whole_cached_prefix = lambda: overwrites_whole_cached_prefix
-    manager._resume_and_restore = lambda _req_id, _kv_cache: True
+    manager._resume_and_restore = (
+        lambda _req_id, _kv_cache, *, capacity_hint=None, yield_residency=True: True
+    )
     kv_cache = SimpleNamespace(
         num_committed_tokens=7,
         enable_swa_scratch_reuse=True,

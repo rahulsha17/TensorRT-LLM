@@ -249,24 +249,17 @@ PageHolder::~PageHolder()
             page->holder.reset(); // clear back-reference
             auto const manager = page->manager;
 
-            // If it's a committed page, schedule for eviction (if evictable).
-            if (page->isCommitted())
+            // Reuse owns only reachable committed pages. An orphan, replaced
+            // snapshot, or uncommitted page must lose any LRU reference once
+            // its last holder is gone, including after a failed migration.
+            if (manager->isEvictable(*page))
             {
                 if (!page->scheduledForEviction())
                     manager->scheduleForEviction(*page);
-
-                // A page that no longer sits in its block's slot (orphaned block, or replaced by a
-                // page with a larger recorded token count) is unreachable for reuse, so keeping it
-                // in the eviction LRU would just pin a slot until memory pressure hits.
-                auto* cp = static_cast<CommittedPage*>(page.get());
-                if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
-                    manager->excludeFromEviction(*page);
             }
-            else
+            else if (page->scheduledForEviction())
             {
-                // Uncommitted page: if scheduled for eviction, remove it.
-                if (page->scheduledForEviction())
-                    manager->excludeFromEviction(*page);
+                manager->excludeFromEviction(*page);
             }
         });
 }
@@ -609,7 +602,61 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         for (auto const& page : pages)
             if (page->cacheLevel != level)
                 ++requirements[storeMgr->getPoolGroupIndex(level, page->lifeCycle)];
-        storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+        try
+        {
+            storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+        }
+        catch (OutOfPagesError const&)
+        {
+            // In a dense two-tier pool, cold targets can occupy the host slots
+            // needed to evict other held GPU pages. Promote a fitting subset
+            // first to release those host slots. All targets stay excluded
+            // from eviction until the final locks or the rollback guard.
+            if (level != kHotLevel || storeMgr->numCacheLevels() != CacheLevel{2}
+                || storeMgr->numPoolGroups(level) != PoolGroupIndex{1}
+                || storeMgr->numPoolGroups(CacheLevel{1}) != PoolGroupIndex{1} || !lockedHostPages.empty())
+            {
+                throw;
+            }
+
+            while (requirements[PoolGroupIndex{0}] > 0)
+            {
+                SlotCount chunk = requirements[PoolGroupIndex{0}];
+                while (true)
+                {
+                    auto partialRequirements = requirements;
+                    partialRequirements[PoolGroupIndex{0}] = chunk;
+                    try
+                    {
+                        storeMgr->prepareFreeSlots(level, partialRequirements, migrationRecorder, dropRecorder);
+                        break;
+                    }
+                    catch (OutOfPagesError const&)
+                    {
+                        if (chunk == 1)
+                        {
+                            throw;
+                        }
+                        chunk = (chunk + 1) / 2;
+                    }
+                }
+                std::vector<SharedPtr<Page>> partialPages;
+                for (auto const& page : pages)
+                {
+                    if (page->cacheLevel != level)
+                    {
+                        partialPages.push_back(page);
+                        if (slotCountValueFromSize(partialPages.size()) == chunk)
+                        {
+                            break;
+                        }
+                    }
+                }
+                TLLM_CHECK_DEBUG(slotCountValueFromSize(partialPages.size()) == chunk);
+                storeMgr->batchedMigrate(level, partialPages, migrationRecorder);
+                requirements[PoolGroupIndex{0}] -= chunk;
+            }
+        }
         if (level == kHotLevel && !lockedHostPages.empty())
         {
             storeMgr->promoteSparsePages(kvCache.cudaStream(), lockedHostPages, migrationRecorder, dropRecorder);

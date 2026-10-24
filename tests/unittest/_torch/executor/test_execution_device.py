@@ -13,6 +13,48 @@ from tensorrt_llm.execution_version import ExecutionVersion
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("captured", [False, True])
+def test_stable_attention_rows_reject_revisions_and_refresh_reordered_padding(captured):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "attention-batch", 7)
+    current = replace(old, epoch=8)
+    neighbor = replace(old, scope_id="neighbor")
+    authority.publish(old)
+    authority.publish(neighbor)
+    rows = authority.create_attention_rows(4)
+    allowed = torch.empty(4, dtype=torch.bool, device=authority.device)
+
+    def check():
+        module._check_versions[(1,)](authority._table, rows.slots, rows.expected, allowed, 4, 128)
+
+    authority.prepare_attention_rows(rows, [old, neighbor])
+    check()
+    assert allowed.tolist() == [True, True, True, True]
+    graph = torch.cuda.CUDAGraph() if captured else None
+    if graph is not None:
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            check()
+    evaluate = graph.replay if graph is not None else check
+    identities = rows._layout
+    authority.publish(current)
+    authority.prepare_attention_rows(rows, [old, neighbor])
+    assert rows._layout is identities
+    evaluate()
+    assert allowed.tolist() == [False, True, True, True]
+    for versions, verdict in (
+        ([neighbor, old, current], [True, False, True, True]),
+        ([current], [True, True, True, True]),
+        ([None, old], [True, False, True, True]),
+    ):
+        authority.prepare_attention_rows(rows, versions)
+        evaluate()
+        assert allowed.tolist() == verdict
+    assert rows.slots.tolist() == [-1, authority._slots[("tenant", "attention-batch")], -1, -1]
+
+
 def test_device_epoch_preserves_all_uint64_bits_and_scope_isolation() -> None:
     authority = DeviceExecutionAuthority(torch.cuda.current_device())
     previous = None
@@ -29,6 +71,120 @@ def test_device_epoch_preserves_all_uint64_bits_and_scope_isolation() -> None:
     authority.publish(other_tenant)
     authority.publish(replace(other_scope, epoch=1))
     assert authority.check([previous, other_scope, other_tenant]) == [True, False, True]
+
+
+def test_async_context_receipt_follows_model_work_without_waiting_for_it():
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "context-receipt-order", 7)
+    new = replace(old, epoch=8)
+    authority.publish(old)
+    assert authority.check([old]) == [True]
+    stream = torch.cuda.Stream()
+    ticket = None
+    try:
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(1_000_000_000)
+            ticket = authority.enqueue_check([old])
+        assert not ticket.query(), "receipt submission waited for the model stream"
+        authority.publish(new)
+        assert authority.check([new]) == [True]
+        assert ticket.wait() == [False]
+        assert ticket.query()
+    finally:
+        stream.synchronize()
+
+
+def test_async_context_receipt_retains_an_earlier_verdict_after_publication():
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "context-receipt-retention", 7)
+    new = replace(old, epoch=8)
+    authority.publish(old)
+    before = authority.enqueue_check([old, None, old])
+    assert before.wait() == [True, True, True]
+    authority.publish(new)
+    after = authority.enqueue_check([old, new, None])
+    assert after.wait() == [False, True, True]
+    assert before.wait() == [True, True, True]
+    assert before._allowed_host.data_ptr() != after._allowed_host.data_ptr()
+    assert before.event is not after.event
+
+
+def test_async_context_receipt_snapshots_input_identity_and_row_order():
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "context-receipt-identity", (1 << 64) - 2)
+    new = replace(old, epoch=(1 << 64) - 1)
+    neighbor = replace(old, scope_id="neighbor")
+    authority.publish(new)
+    authority.publish(neighbor)
+    identities = [neighbor, old, None, new]
+    ticket = authority.enqueue_check(identities)
+    identities[:] = [new]
+    assert ticket.versions == (neighbor, old, None, new)
+    assert ticket.wait() == [True, False, True, True]
+
+
+def test_async_context_receipt_requires_rows_and_accepts_untagged_rows():
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    with pytest.raises(ValueError, match="at least one row"):
+        authority.enqueue_check([])
+    assert authority.check([]) == []
+    assert authority.enqueue_check([None, None]).wait() == [True, True]
+
+
+def test_async_context_receipt_retains_buffers_on_copy_submission_failure(monkeypatch):
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    version = ExecutionVersion("tenant", "context-receipt-copy-failure", 7)
+    authority.publish(version)
+    original = torch.Tensor.copy_
+    error = RuntimeError("injected context receipt copy failure")
+    copies = []
+
+    def fail_after_copy(destination, source, *args, **kwargs):
+        result = original(destination, source, *args, **kwargs)
+        if destination.device.type == "cpu" and source.device.type == "cuda":
+            copies.append((destination, source))
+            raise error
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_after_copy)
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            authority.enqueue_check([version, None])
+        assert raised.value is error and authority._failure is error
+        assert len(copies) == 1
+        pending = [use for use in authority._pending if use.event is None]
+        assert len(pending) == 1
+        for tensor in copies[0]:
+            assert any(
+                owned.device == tensor.device
+                and owned.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+                for owned in pending[0].tensors
+            )
+        with pytest.raises(RuntimeError, match="restart required"):
+            authority.enqueue_check([version])
+    finally:
+        torch.cuda.synchronize()
+
+
+def test_async_context_receipt_query_failure_poisoning_preserves_ownership(monkeypatch):
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    version = ExecutionVersion("tenant", "context-receipt-query-failure", 7)
+    authority.publish(version)
+    ticket = authority.enqueue_check([version])
+    assert ticket.wait() == [True]
+    retained = tuple(ticket._use.tensors)
+    error = RuntimeError("injected context receipt completion failure")
+
+    def fail_query():
+        raise error
+
+    monkeypatch.setattr(ticket.event, "query", fail_query)
+    with pytest.raises(RuntimeError) as raised:
+        ticket.query()
+    assert raised.value is error and authority._failure is error
+    assert all(left is right for left, right in zip(retained, ticket._use.tensors))
+    with pytest.raises(RuntimeError, match="restart required"):
+        authority.enqueue_check([version])
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -52,6 +208,101 @@ def test_token_commit_rejects_stale_rows_without_changing_candidate_scratch(comp
     successor = authority.commit_tokens([current], [2], candidates, compact)
     assert successor.allowed == [True]
     assert successor.tokens_device[0, 2, 0].item() == 33
+
+
+@pytest.mark.parametrize("count", [1, 3, 17])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_compact_token_commit_preserves_integer_width_and_request_order(count, dtype):
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "compact-width", 7)
+    current = replace(old, epoch=8)
+    authority.publish(current)
+    width = count + 3
+    base = 1 << (40 if dtype == torch.int64 else 29)
+    values = [(-1 if i % 2 else 1) * (base + i) for i in range(width)]
+    candidates = torch.tensor([[[v] for v in values]], dtype=dtype, device=authority.device)
+    slots = list(range(width - 1, width - count - 1, -1))
+    versions = [None if i % 3 == 0 else old if i % 3 == 1 else current for i in range(count)]
+    expected_allowed = [v != old for v in versions]
+    result = authority.enqueue_token_commit(versions, slots, candidates, compact=True).wait()
+
+    assert result.allowed == expected_allowed
+    assert all(type(value) is bool for value in result.allowed)
+    assert result.tokens_host.dtype == dtype
+    assert result.tokens_host.shape == (count,)
+    assert result.tokens_host.tolist() == [
+        values[slot] if allowed else 0 for slot, allowed in zip(slots, expected_allowed)
+    ]
+    expected_device = [0] * width
+    for slot, allowed in zip(slots, expected_allowed):
+        if allowed:
+            expected_device[slot] = values[slot]
+    assert result.tokens_device.flatten().tolist() == expected_device
+    assert candidates.flatten().tolist() == values
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_compact_token_commit_keeps_outstanding_results_across_revision(dtype):
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "compact-overlap", 7)
+    current = replace(old, epoch=8)
+    authority.publish(old)
+    values = torch.tensor([[[101], [-202], [303], [-404]]], dtype=dtype, device=authority.device)
+    first = authority.enqueue_token_commit([old, None], [3, 1], values, compact=True)
+    # Complete the earlier admitted commit before publication, but defer host
+    # consumption until two later tickets have exercised the same allocator.
+    first.event.synchronize()
+    authority.publish(current)
+    stale = authority.enqueue_token_commit([old], [3], values, compact=True)
+    successor = authority.enqueue_token_commit([current, None], [1, 2], values, compact=True)
+    latest = successor.wait()
+    assert latest.allowed == [True, True]
+    assert latest.tokens_host.tolist() == [-202, 303]
+    denied = stale.wait()
+    assert denied.allowed == [False]
+    assert denied.tokens_host.tolist() == [0]
+    original = first.wait()
+    assert original.allowed == [True, True]
+    assert original.tokens_host.tolist() == [-404, -202]
+    assert values.flatten().tolist() == [101, -202, 303, -404]
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_compact_token_commit_retains_buffers_after_copy_submission_failure(monkeypatch, dtype):
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    version = ExecutionVersion("tenant", "compact-copy-failure", 7)
+    authority.publish(version)
+    candidates = torch.ones((1, 4, 1), dtype=dtype, device=authority.device)
+    original = torch.Tensor.copy_
+    error = RuntimeError("injected failure after D2H submission")
+    copies = []
+
+    def fail_after_copy(destination, source, *args, **kwargs):
+        result = original(destination, source, *args, **kwargs)
+        if destination.device.type == "cpu" and source.device.type == "cuda":
+            copies.append((destination, source))
+            raise error
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_after_copy)
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            authority.enqueue_token_commit([version, None], [3, 1], candidates, compact=True)
+        assert raised.value is error
+        assert authority._failure is error
+        assert len(copies) == 1
+        pending = [use for use in authority._pending if use.event is None]
+        assert len(pending) == 1
+        for tensor in copies[0]:
+            assert any(
+                owned.device == tensor.device
+                and owned.untyped_storage().data_ptr() == tensor.untyped_storage().data_ptr()
+                for owned in pending[0].tensors
+            ), "partially submitted transfer lost its owning buffer"
+        with pytest.raises(RuntimeError, match="restart required"):
+            authority.check([version])
+    finally:
+        torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("steps", [2, 5, 9])
@@ -96,6 +347,32 @@ def test_multi_token_commit_cannot_use_compact_single_step_layout():
         authority.enqueue_token_commit([None], [2], candidates, True)
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_cached_token_metadata_rechecks_authority_and_survives_batch_replacement(compact):
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "cached-decode", 7)
+    current = replace(old, epoch=8)
+    authority.publish(old)
+    candidates = torch.tensor([[[11], [22], [33], [44]]], device=authority.device)
+    first = authority.enqueue_token_commit([old, None], [2, 0], candidates, compact)
+    metadata = authority._token_commit_metadata
+    assert first.wait().allowed == [True, True]
+    authority.publish(current)
+    stale = authority.enqueue_token_commit([old, None], [2, 0], candidates + 1, compact)
+    assert authority._token_commit_metadata is metadata
+    # Change both the expected version and sequence slots before consuming the
+    # stale ticket. The old batch's metadata must stay immutable and alive.
+    successor = authority.enqueue_token_commit([current, None], [1, 3], candidates + 2, compact)
+    assert authority._token_commit_metadata is not metadata
+    denied = stale.wait()
+    assert denied.allowed == [False, True]
+    assert denied.tokens_host.flatten().tolist() == ([0, 12] if compact else [12, 0, 0, 0])
+    admitted = successor.wait()
+    assert admitted.allowed == [True, True]
+    assert admitted.tokens_host.flatten().tolist() == ([24, 46] if compact else [0, 24, 0, 46])
+    assert first.tokens_host.flatten().tolist() == ([33, 11] if compact else [11, 0, 33, 0])
+
+
 def test_unknown_scopes_and_capacity_fail_instead_of_aliasing_epoch_zero() -> None:
     authority = DeviceExecutionAuthority(torch.cuda.current_device(), capacity=1)
     version = ExecutionVersion("tenant", "scope", 0)
@@ -128,6 +405,52 @@ def test_publication_does_not_join_an_occupied_model_stream() -> None:
         assert not model_done.query(), "publication unexpectedly waited for model execution"
     finally:
         model_done.synchronize()
+
+
+@pytest.mark.parametrize("captured", [False, True])
+def test_publication_during_non_capturing_submission_rejects_old_tokens(captured):
+    from threading import Thread
+
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "concurrent-submit", 0)
+    new = replace(old, epoch=1)
+    authority.publish(old)
+    candidates = torch.ones((1, 2, 1), dtype=torch.int32, device=authority.device)
+    authority.enqueue_token_commit([old, None], [0, 1], candidates, compact=True).wait()
+    graph = None
+    if captured:
+        graph = torch.cuda.CUDAGraph()
+        with authority.submission(), torch.cuda.graph(graph):
+            candidates.fill_(7)
+
+    errors = []
+
+    def publish():
+        try:
+            authority.publish(new)
+        except BaseException as error:
+            errors.append(error)
+
+    publisher = Thread(target=publish)
+    try:
+        with authority.submission(capture_possible=False):
+            if graph is None:
+                candidates.fill_(7)
+            else:
+                graph.replay()
+            publisher.start()
+            publisher.join(timeout=2)
+            assert not publisher.is_alive(), "publication waited for CPU submission to finish"
+            assert not errors
+            result = authority.enqueue_token_commit(
+                [old, None], [0, 1], candidates, compact=True
+            ).wait()
+            assert result.allowed == [False, True]
+            assert result.tokens_host.tolist() == [0, 7]
+    finally:
+        if publisher.ident is not None:
+            publisher.join(timeout=2)
+        torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize("revoked", [False, True])

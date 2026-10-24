@@ -930,6 +930,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             raise TypeError(
                 "execution_version must be an ExecutionVersion or None")
         self.py_execution_version = execution_version
+        self.py_execution_recovery_pending = False
+        self.py_execution_recovery_tokens = 0
+        self.py_execution_recovery_prefill = False
         self.py_sampling_strategy: "Strategy | None" = None
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",

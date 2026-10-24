@@ -492,21 +492,71 @@ class WorkerAlignmentState:
                 else revised.max_reuse_tokens
             )
 
+    def pending_prefix_length(self, version: ExecutionVersion, request_id: int) -> int:
+        """Return this request's unconsumed prefix promise, or zero when absent."""
+        return self.pending_recovery_prefix(version, request_id) or 0
+
+    def pending_recovery_prefix(self, version: ExecutionVersion, request_id: int) -> int | None:
+        """Return a claimed successor's prefix, including zero; None means no pending handoff."""
+        with self._lock:
+            if self._closed or self._current.get((version.tenant_id, version.scope_id)) != version:
+                return None
+            record = self._record_for_version(version)
+            if (
+                record is None
+                or not record.resumed
+                or record.error is not None
+                or record.request_id != request_id
+                or record.attached
+                or record.reservation is None
+            ):
+                return None
+            assert record.receipt is not None
+            return (
+                record.resume_prefix_length
+                if record.resume_prefix_length is not None
+                else record.receipt.reusable_prefix_length
+            )
+
+    def has_resident_recovery(self, version: ExecutionVersion, request_id: int) -> bool:
+        """Return an engine-thread scheduling hint, never new reuse authority.
+
+        Only a current, claimed, unattached reservation can supply the hint.
+        Backends without optional residency information keep ordinary ordering.
+        """
+        with self._lock:
+            if self._closed or self._current.get((version.tenant_id, version.scope_id)) != version:
+                return False
+            record = self._record_for_version(version)
+            if (
+                record is None
+                or not record.resumed
+                or record.error is not None
+                or record.request_id != request_id
+                or record.attached
+                or record.source_only
+                or record.source_released
+                or record.reservation is None
+            ):
+                return False
+            return getattr(record.reservation, "has_resident_prefix", False) is True
+
     def confirm_attachment(
         self, version: ExecutionVersion, request_id: int, reused_tokens: int
-    ) -> None:
-        """Check normal cache allocation acquired the promised prefix before forward."""
+    ) -> bool:
+        """Validate ownership before forward; report the first successful attachment."""
         with self._lock:
             # A revision can race the scheduler. Stale candidates still pass
             # through the existing device/host fences; do not fail other rows.
             if self._current.get((version.tenant_id, version.scope_id)) != version:
-                return
+                return False
             record = self._record_for_version(version)
             if record is None:
-                return
+                return False
             if not record.resumed or record.request_id != request_id or record.error is not None:
                 raise RuntimeError("request does not own this RESUME")
-            if not record.attached:
+            newly_attached = not record.attached
+            if newly_attached:
                 promised = record.resume_prefix_length
                 if promised is not None:
                     if reused_tokens != promised:
@@ -519,6 +569,7 @@ class WorkerAlignmentState:
                     raise RuntimeError("successor cache reuse exceeds the runtime bound")
                 record.attached = True
             self._reclaim(record, settle=True)
+            return newly_attached
 
     def _reclaim(self, record: _AlignmentRecord, *, settle: bool = True) -> bool:
         # Native calls belong to the engine thread. Preserve ownership and stop

@@ -18,7 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
 
@@ -372,6 +372,9 @@ def make_ctx_request(
     req.prompt_len = prompt_len or context_remaining_length
     req.context_current_position = 0
     req.py_connector_served_position = 0
+    req.py_execution_recovery_pending = False
+    req.py_execution_recovery_tokens = 0
+    req.py_execution_recovery_prefill = False
     req.expect_snapshot_points = []
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
@@ -472,6 +475,9 @@ def make_kv_cache_manager(
     mgr.kv_connector_manager = None
     mgr.tokens_per_block = tokens_per_block
     mgr.mapping = Mock(pp_size=1)
+
+    mgr.impl.cache_tier_list = [0, 1]
+    mgr.impl.get_storage_statistics.return_value = [Mock(free=0, available=8)]
     # A real policy, not an auto-created Mock attribute: the prefix-aware skip
     # is gated on ALL_REUSABLE (see _skip_pays_off_under_reuse_policy).
     mgr.block_reuse_policy = block_reuse_policy
@@ -479,6 +485,11 @@ def make_kv_cache_manager(
     mgr.enable_joint_kv_cache_reuse = enable_joint_kv_cache_reuse
     mgr.enable_block_reuse = enable_block_reuse
     mgr.num_extra_kv_tokens = 0
+    mgr.has_execution_residency = False
+    mgr.has_execution_resident_recovery.return_value = False
+    mgr._yield_execution_residency.return_value = False
+    mgr.defer_execution_residency_recovery.return_value = False
+    mgr._supports_dense_resume_capacity.return_value = False
     # Real scalars, not auto-created Mocks: tests bind the real
     # prepare_context/_prepare_connector_prefix_reservation onto this mock,
     # and both feed _spec_recompute_tail/is_draft into the reuse-claim cap.
@@ -491,7 +502,9 @@ def make_kv_cache_manager(
     # skip never fires and tests that don't care about it are unaffected.
     mgr.probe_first_new_block_key.side_effect = first_new_block_fn or (lambda req: None)
     mgr.kv_cache_map = _KVCacheMap()
-    mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
+    mgr.prepare_context.side_effect = prepare_context_fn or (
+        lambda req, reuse_limit=None, **kwargs: True
+    )
     mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
     # The backoff lives in KVCacheManagerV2; the scheduler only clips the two
     # already-backed-off probe depths against each other.
@@ -933,7 +946,7 @@ class TestKVCacheFailuresGen:
         mgr.free_resources.assert_not_called()
 
     def test_recompute_pause_skips_generation_to_complete_victim(self):
-        """A finalizing request cannot be replayed by destructive pause."""
+        """A finalizing owner drains before another request is suspended."""
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
         sched = make_scheduler(mgr, max_num_tokens=100)
         current = make_gen_request(0)
@@ -946,9 +959,10 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request([current, victim], set())
 
         assert out.generation_requests == []
-        assert ids(out.paused_requests) == [0]
+        assert out.paused_requests == []
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
+        mgr.suspend_request.assert_not_called()
 
     def test_recompute_frontier_survives_ordinary_frontier_shrink(self):
         """Recompute still sees a suspended tail after ordinary eviction skips it."""
@@ -1517,8 +1531,8 @@ class TestKVCacheFailuresCtxChunked:
         managers = (mgr, draft_mgr, cross_mgr)
         for manager in managers:
             manager.kv_cache_map[0] = Mock(is_active=False)
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = lambda req, manager=manager: (
+                manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_scheduler(
             mgr,
@@ -2356,6 +2370,225 @@ def test_context_recovery_prepare_failure_does_not_expand_gpu_only_preemption(
     manager.free_resources.assert_not_called()
 
 
+class TestPendingCompletionCapacity:
+    """Drain the last overlapping sample before evicting other cache owners."""
+
+    @staticmethod
+    def terminal(manager):
+        request = make_gen_request(0)
+        request.state_value = GEN_TO_COMPLETE
+        request.is_generation_to_complete_state = True
+        manager.kv_cache_map[0].is_active = True
+        return request
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("tiered", [False, True])
+    def test_pending_completion_preserves_context_owners(self, chunked, tiered):
+        manager = make_kv_cache_manager(can_evict=tiered, has_cache_tier_below_gpu=tiered)
+        terminal = self.terminal(manager)
+        manager.resize_context.side_effect = lambda req, n: (
+            req.py_request_id == 1 and 0 not in manager.kv_cache_map
+        )
+        scheduler = make_scheduler(
+            manager, max_num_tokens=128, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        blocked = make_ctx_request(1, 128, is_first_context_chunk=False)
+        other = make_ctx_request(2, 128, is_first_context_chunk=False)
+        manager.kv_cache_map[1].is_active = True
+        manager.kv_cache_map[2].is_active = True
+
+        output = scheduler.schedule_request([terminal, other, blocked], set())
+
+        assert not output.context_requests
+        assert not output.paused_requests and not output.recompute_paused_requests
+        manager.suspend_request.assert_not_called()
+        manager.free_resources.assert_not_called()
+        manager.preempt_request.assert_not_called()
+        # The executor consumes the final result and releases only its owner.
+        manager.kv_cache_map.pop(0)
+        output = scheduler.schedule_request([blocked, other], set())
+        assert ids(output.context_requests) == [1]
+        assert 2 in manager.kv_cache_map
+
+    @pytest.mark.parametrize("tiered", [False, True])
+    def test_pending_completion_preserves_generation_owners(self, tiered):
+        manager = make_kv_cache_manager(can_evict=tiered, has_cache_tier_below_gpu=tiered)
+        terminal = self.terminal(manager)
+        manager.try_allocate_generation.side_effect = lambda req: 0 not in manager.kv_cache_map
+        scheduler = make_scheduler(manager)
+        blocked = make_gen_request(1)
+        other = make_ctx_request(2, 128, is_first_context_chunk=False)
+        manager.kv_cache_map[1].is_active = True
+        manager.kv_cache_map[2].is_active = True
+
+        output = scheduler.schedule_request([terminal, blocked, other], set())
+
+        assert not output.generation_requests
+        assert not output.paused_requests and not output.recompute_paused_requests
+        manager.suspend_request.assert_not_called()
+        manager.free_resources.assert_not_called()
+        manager.preempt_request.assert_not_called()
+        manager.kv_cache_map.pop(0)
+        output = scheduler.schedule_request([blocked, other], set())
+        assert ids(output.generation_requests) == [1]
+
+    def test_pending_completion_keeps_runnable_work(self):
+        manager = make_kv_cache_manager()
+        terminal = self.terminal(manager)
+        scheduler = make_scheduler(manager)
+
+        output = scheduler.schedule_request(
+            [terminal, make_gen_request(1), make_ctx_request(2, 64)], set()
+        )
+
+        assert ids(output.generation_requests) == [1]
+        assert ids(output.context_requests) == [2]
+
+    def test_completion_without_cache_does_not_delay_reclamation(self):
+        manager = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        terminal = self.terminal(manager)
+        manager.kv_cache_map.pop(0)
+        blocked = make_gen_request(1)
+        manager.kv_cache_map[1].is_active = True
+        scheduler = make_scheduler(manager)
+
+        output = scheduler.schedule_request([terminal, blocked], set())
+
+        assert output.generation_requests == []
+        assert ids(output.paused_requests) == [1]
+        manager.suspend_request.assert_called_once_with(blocked)
+
+    def test_pending_completion_does_not_hide_permanent_stall(self):
+        manager = make_kv_cache_manager(resize_context_fn=lambda req, n: False)
+        terminal = self.terminal(manager)
+        scheduler = make_scheduler(manager)
+        scheduler._DEADLOCK_STALL_ITERS = 2
+        blocked = make_ctx_request(1, 128)
+
+        scheduler.schedule_request([terminal, blocked], set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            scheduler.schedule_request([terminal, blocked], set())
+
+
+class TestIdleGenerationRecovery:
+    """A full backing tier must not trap decode behind earlier context owners."""
+
+    @staticmethod
+    def _blocked_batch(resume_before_failure: bool = True) -> tuple[Mock, list[Mock]]:
+        manager = make_kv_cache_manager(
+            can_evict=True,
+            prepare_context_fn=lambda req, **kwargs: False,
+            resize_context_fn=lambda req, size: False,
+        )
+        earlier = make_ctx_request(1, 128, prompt_len=256, is_first_context_chunk=False)
+        earlier.context_current_position = 128
+        generation = make_gen_request(2)
+        fresh = make_ctx_request(3, 256)
+        manager.kv_cache_map[1].is_active = False
+        manager.kv_cache_map[2].is_active = False
+
+        def allocate(req: Mock) -> bool:
+            manager.kv_cache_map[req.py_request_id].is_active = resume_before_failure
+            return 1 not in manager.kv_cache_map
+
+        manager.try_allocate_generation.side_effect = allocate
+        manager.free_resources.side_effect = lambda req: manager.kv_cache_map.pop(
+            req.py_request_id, None
+        )
+        return manager, [earlier, generation, fresh]
+
+    @pytest.mark.parametrize("resume_before_failure", [False, True])
+    def test_reclaims_earlier_owner_and_resumes_generation(
+        self, resume_before_failure: bool
+    ) -> None:
+        manager, requests = self._blocked_batch(resume_before_failure)
+        scheduler = make_scheduler(manager, max_num_tokens=128)
+        earlier, generation, _ = requests
+
+        resumed = scheduler.schedule_request(requests, set())
+
+        assert resumed.generation_requests == [generation]
+        assert resumed.context_requests == []
+        assert resumed.recompute_paused_requests == [earlier]
+        assert resumed.paused_requests == []
+        manager.free_resources.assert_called_once_with(earlier)
+        assert generation.py_request_id in manager.kv_cache_map
+        earlier.reset_for_recompute.assert_not_called()
+
+    @pytest.mark.parametrize("owners_needed", [1, 2])
+    def test_reserves_decode_capacity_before_context_can_reenter(self, owners_needed: int) -> None:
+        manager, requests = self._blocked_batch(False)
+        first, generation, fresh = requests
+        second = make_ctx_request(4, 128, prompt_len=256, is_first_context_chunk=False)
+        second.context_current_position = 128
+        manager.kv_cache_map[4].is_active = False
+        owners = {1, 4}
+
+        def allocate(req: Mock) -> bool:
+            available = len(owners - manager.kv_cache_map.keys())
+            return available >= owners_needed
+
+        def prepare(req: Mock, **kwargs: object) -> bool:
+            # A restarted prefill can consume a released slot. Waiting for
+            # another scheduling pass allows it to prevent decode admission.
+            if req.py_request_id not in manager.kv_cache_map:
+                manager.kv_cache_map[req.py_request_id].is_active = True
+                return True
+            return False
+
+        manager.try_allocate_generation.side_effect = allocate
+        manager.prepare_context.side_effect = prepare
+        scheduler = make_scheduler(manager, max_num_tokens=128)
+
+        result = scheduler.schedule_request([first, second, generation, fresh], set())
+
+        assert result.generation_requests == [generation]
+        assert result.context_requests == []
+        assert result.paused_requests == []
+        assert result.recompute_paused_requests == [second, first][:owners_needed]
+        assert manager.free_resources.call_args_list == [call(second), call(first)][:owners_needed]
+        assert generation.py_request_id in manager.kv_cache_map
+        assert (first.py_request_id in manager.kv_cache_map) == (owners_needed == 1)
+
+    @pytest.mark.parametrize(
+        "guard",
+        ["runnable", "inflight", "disabled", "connector", "transfer", "token_budget", "versioned"],
+    )
+    def test_keeps_owners_when_reclamation_is_not_safe_or_needed(self, guard: str) -> None:
+        manager, requests = self._blocked_batch()
+        scheduler = make_scheduler(
+            manager, max_num_tokens=128, enable_recompute_pause=guard != "disabled"
+        )
+        inflight = set()
+        if guard == "runnable":
+            manager.prepare_context.side_effect = lambda req, **kwargs: True
+            manager.resize_context.side_effect = lambda req, size: True
+        elif guard == "inflight":
+            inflight.add(requests[0].request_id)
+        elif guard == "connector":
+            manager.kv_connector_manager = Mock()
+            manager.kv_connector_manager.has_pending_load.side_effect = lambda req: (
+                req is requests[0]
+            )
+        elif guard == "transfer":
+            scheduler._async_transfer_manager = Mock()
+            scheduler._async_transfer_manager.has_any_inflight_requests.return_value = True
+        elif guard == "versioned":
+            requests[0].py_execution_version = object()
+        elif guard == "token_budget":
+            # Stop before context admission so its independent fallback does
+            # not obscure the generation token-budget condition.
+            requests[0] = make_gen_request(1, beam_width=129)
+
+        result = scheduler.schedule_request(requests, inflight)
+
+        assert result.recompute_paused_requests == []
+        manager.free_resources.assert_not_called()
+        assert 1 in manager.kv_cache_map
+        if guard == "runnable":
+            assert result.context_requests == [requests[0]]
+
+
 class TestDeadlockDetection:
     """The scheduler must fail loudly rather than spin scheduling nothing.
 
@@ -2382,14 +2615,31 @@ class TestDeadlockDetection:
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         sched._DEADLOCK_STALL_ITERS = 3
-        # Self-eviction suspends it on the first pass, which counts as
-        # progress. Afterwards it is inactive and nothing can be reclaimed.
+        # Suspension alone does not advance the request or reclaim ownership.
         reqs = [make_gen_request(0)]
 
-        for _ in range(3):
+        for _ in range(2):
             sched.schedule_request(reqs, set())
         with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
             sched.schedule_request(reqs, set())
+
+    def test_resume_suspend_cycle_does_not_hide_a_deadlock(self):
+        manager = make_kv_cache_manager(can_evict=True)
+        scheduler = make_scheduler(manager, max_num_tokens=100)
+        scheduler._DEADLOCK_STALL_ITERS = 3
+        request = make_gen_request(0)
+
+        def failed_growth(req):
+            manager.kv_cache_map[req.py_request_id].is_active = True
+            return False
+
+        manager.try_allocate_generation.side_effect = failed_growth
+        for _ in range(2):
+            result = scheduler.schedule_request([request], set())
+            assert not result.generation_requests
+            assert result.paused_requests == [request]
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            scheduler.schedule_request([request], set())
 
     def test_transient_stall_does_not_raise(self):
         """One bad iteration is normal; the counter has to reset."""
@@ -3579,6 +3829,1401 @@ class TestStateFiltering:
 # ===========================================================================
 # Sorting (LoRA Task ID)
 # ===========================================================================
+
+
+class TestRecoveryAdmission:
+    @staticmethod
+    def recovery_capacity_manager():
+        from types import SimpleNamespace
+
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.enable_block_reuse = True
+        manager.impl = SimpleNamespace(cache_tier_list=[0, 1])
+        manager.is_draft = False
+        manager.is_disagg = False
+        manager._has_cp_helix = False
+        manager.kv_connector_manager = None
+        manager.max_beam_width = 1
+        manager.max_draft_len = 0
+        manager.num_extra_kv_tokens = 0
+        manager.kv_compression_manages_history = False
+        manager.max_seq_len = 1024
+        manager.kv_cache_manager_py_config = SimpleNamespace(
+            layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096)])]
+        )
+        manager._fill_fresh_kv_pages = Mock()
+        manager._log_window_crossing = Mock()
+        cache = Mock(capacity=128)
+        cache.resize.return_value = True
+        manager.kv_cache_map = {2: cache}
+        request = SimpleNamespace(
+            py_request_id=2,
+            py_execution_recovery_tokens=128,
+            is_first_context_chunk=True,
+            is_disagg_generation_init_state=False,
+            context_current_position=128,
+            prompt_len=512,
+        )
+        return manager, request, cache
+
+    @pytest.mark.parametrize(
+        "reused,budget,unit,expected",
+        [
+            (0, 128, 64, 128),
+            (128, 129, 64, 256),
+            (127, 129, 64, 255),
+            (479, 64, 64, 512),
+            (479, 32, 64, 0),
+            (128, 0, 64, 0),
+            (128, 1024, 64, 512),
+            (128, 129, 1, 257),
+        ],
+    )
+    def test_ordinary_first_chunk_preflight_uses_claim_and_chunk_budget(
+        self, reused, budget, unit, expected
+    ):
+        manager, request, cache = self.recovery_capacity_manager()
+        request.py_execution_recovery_tokens = 0
+        assert manager._context_capacity_hint(request, reused, budget, unit) == expected
+        cache.resize.assert_not_called()
+        cache.commit.assert_not_called()
+        assert request.context_current_position == 128
+
+    @pytest.mark.parametrize("variant", ["multimodal", "draft", "connector"])
+    def test_first_chunk_preflight_does_not_guess_specialized_capacity(self, variant):
+        manager, request, _ = self.recovery_capacity_manager()
+        if variant == "multimodal":
+            request.py_multimodal_data = {"mm_bidirectional_blocks": True}
+        elif variant == "draft":
+            manager.max_draft_len = 1
+        else:
+            manager.kv_connector_manager = object()
+        assert manager._context_capacity_hint(request, 128, 128, 64) == 0
+
+    def test_scheduler_passes_remaining_budget_before_restoring_ordinary_prefix(self):
+        manager = make_kv_cache_manager(enable_block_reuse=True)
+        scheduler = make_scheduler(manager, max_num_tokens=130, ctx_chunk_config=(None, 64))
+        generation = make_gen_request(1)
+        request = make_ctx_request(2, 512)
+        request.py_multimodal_data = None
+
+        scheduled = scheduler.schedule_request([generation, request], set())
+
+        assert ids(scheduled.generation_requests) == [1]
+        assert ids(scheduled.context_requests) == [2]
+        manager.prepare_context.assert_called_once_with(
+            request, prefill_token_budget=129, prefill_chunk_unit=64
+        )
+        assert request.context_chunk_size == 128
+
+    def test_scheduler_passes_remaining_budget_before_restoring_context_continuation(self):
+        manager = make_kv_cache_manager(enable_block_reuse=True)
+        scheduler = make_scheduler(manager, max_num_tokens=130, ctx_chunk_config=(None, 64))
+        generation = make_gen_request(1)
+        request = make_ctx_request(2, 384, prompt_len=512, is_first_context_chunk=False)
+        request.context_current_position = 128
+        request.py_multimodal_data = None
+
+        scheduled = scheduler.schedule_request([generation, request], set())
+
+        assert ids(scheduled.generation_requests) == [1]
+        assert ids(scheduled.context_requests) == [2]
+        manager.prepare_context.assert_called_once_with(
+            request, prefill_token_budget=129, prefill_chunk_unit=64
+        )
+        assert request.context_chunk_size == 128
+
+    @pytest.mark.parametrize("active", [False, True])
+    def test_continuation_preflight_uses_cursor_not_published_prefix(self, active):
+        manager, request, cache = self.recovery_capacity_manager()
+        request.is_first_context_chunk = False
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        cache.num_committed_tokens = 0
+        cache.is_active = active
+        cache.resume.return_value = False
+
+        reused = manager.prepare_context_cache(
+            request, prefill_token_budget=129, prefill_chunk_unit=64
+        )
+
+        if active:
+            assert reused == 0
+            cache.resume.assert_not_called()
+        else:
+            assert reused is None
+            cache.resume.assert_called_once_with(17, capacity_hint=256)
+        manager._restore_page_index_bufs.assert_not_called()
+        assert request.context_current_position == 128
+        cache.resize.assert_not_called()
+        cache.commit.assert_not_called()
+
+    def test_capacity_hint_refusal_does_not_restore_page_indices(self):
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        cache.is_active = False
+        cache.resume.return_value = False
+
+        assert not manager._resume_and_restore(request.py_request_id, cache, capacity_hint=512)
+
+        cache.resume.assert_called_once_with(17, capacity_hint=512)
+        manager._restore_page_index_bufs.assert_not_called()
+        cache.resize.assert_not_called()
+        cache.commit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "operation", ["context_resume", "generation_resume", "context_resize", "generation_resize"]
+    )
+    @pytest.mark.parametrize("retry_success", [False, True])
+    def test_admission_yields_handoff_residency_before_a_bounded_retry(
+        self, operation, retry_success
+    ):
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        manager._ensure_generation_beam_width = Mock(return_value=True)
+        manager._generation_draft_slots = Mock(return_value=0)
+        manager._allocated_draft_lens = {}
+        reclaimer = Mock(return_value=True)
+        manager._execution_residency_reclaimer = reclaimer
+        manager._execution_context_residency_reclaimer = reclaimer
+        cache.is_active = "resize" in operation
+        cache.enter_decode.return_value = True
+        failing = cache.resume if "resume" in operation else cache.resize
+        failing.side_effect = [False, retry_success]
+
+        if operation == "context_resume":
+            result = manager._resume_context_and_restore(
+                request.py_request_id, cache, capacity_hint=192
+            )
+            expected_call = call(17, capacity_hint=192)
+        elif operation == "context_resize":
+            request.is_first_context_chunk = False
+            result = manager.resize_context(request, 64)
+            expected_call = call(192)
+        else:
+            result = manager.try_allocate_generation(request)
+            expected_call = (
+                call(17, is_decoding=True, capacity_hint=129)
+                if operation == "generation_resume"
+                else call(129)
+            )
+
+        assert result is retry_success
+        assert failing.call_args_list == [expected_call, expected_call]
+        manager._execution_residency_reclaimer.assert_called_once()
+        cache.commit.assert_not_called()
+        if not retry_success:
+            manager._restore_page_index_bufs.assert_not_called()
+            manager._fill_fresh_kv_pages.assert_not_called()
+
+    @pytest.mark.parametrize("operation", ["resume", "resize"])
+    def test_first_admission_preserves_handoff_residency_for_the_context_scan(self, operation):
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        manager._execution_residency_reclaimer = Mock(return_value=True)
+        cache.is_active = operation == "resize"
+        failing = cache.resume if operation == "resume" else cache.resize
+        failing.return_value = False
+
+        if operation == "resume":
+            result = manager._resume_and_restore(
+                request.py_request_id, cache, capacity_hint=192, yield_residency=False
+            )
+        else:
+            result = manager.resize_context(request, 64)
+
+        assert not result
+        assert failing.call_count == 1
+        manager._execution_residency_reclaimer.assert_not_called()
+        manager._restore_page_index_bufs.assert_not_called()
+        manager._fill_fresh_kv_pages.assert_not_called()
+        cache.commit.assert_not_called()
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("first_chunk", [False, True])
+    def test_resident_handoff_scans_past_failed_ordinary_admission(self, chunked, first_chunk):
+        manager = make_kv_cache_manager()
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        scheduler._recovery_admission_streak = 4
+        cold = make_ctx_request(1, 128, is_first_context_chunk=first_chunk)
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 64
+        manager.prepare_context.side_effect = lambda req: req is successor
+        scheduler._try_preempt_for_pages = Mock(side_effect=AssertionError("premature eviction"))
+
+        result = scheduler.schedule_request([cold, successor], set())
+
+        assert result.context_requests == [successor]
+        assert [item.args[0] for item in manager.prepare_context.call_args_list] == [
+            cold,
+            successor,
+        ]
+        manager._yield_execution_residency.assert_not_called()
+        scheduler._try_preempt_for_pages.assert_not_called()
+        assert not result.paused_requests and not result.recompute_paused_requests
+
+    @pytest.mark.parametrize("first_chunk", [False, True])
+    @pytest.mark.parametrize("operation", ["resume", "resize"])
+    @pytest.mark.parametrize("expired", [False, True])
+    def test_handoff_grace_context_retries_only_expired_holds(
+        self, first_chunk, operation, expired
+    ):
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        manager._execution_context_residency_reclaimer = Mock(return_value=expired)
+        manager._execution_residency_reclaimer = Mock(
+            side_effect=AssertionError("forced early yield")
+        )
+        request.is_first_context_chunk = first_chunk
+        cache.is_active = operation == "resize"
+        failing = cache.resume if operation == "resume" else cache.resize
+        failing.side_effect = [False, True]
+        if operation == "resume":
+            result = manager._resume_context_and_restore(
+                request.py_request_id, cache, capacity_hint=192
+            )
+        else:
+            result = manager.resize_context(request, 64)
+        assert result is expired
+        assert failing.call_count == 1 + int(expired)
+        manager._execution_context_residency_reclaimer.assert_called_once()
+        manager._execution_residency_reclaimer.assert_not_called()
+        cache.commit.assert_not_called()
+        cache.close.assert_not_called()
+
+    @staticmethod
+    def handoff_grace_manager():
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.pyexecutor.execution_alignment import KVAlignmentAdapter
+        from tensorrt_llm.execution_alignment import AlignmentInput
+
+        manager = make_kv_cache_manager()
+        manager._supports_dense_resume_capacity.return_value = True
+        manager.enable_block_reuse = True
+        manager.max_seq_len = 1024
+        manager.impl.tokens_per_block = manager.tokens_per_block
+        manager.impl.get_life_cycle_pool_group_indices.return_value = [0]
+        manager.impl.get_storage_statistics.return_value = [
+            SimpleNamespace(total=64, free=0, available=8)
+        ]
+        manager._derive_reuse_salt.return_value = 0
+        manager._execution_residency_repoll = None
+        cache = Mock(num_committed_tokens=128, cached_tokens_by_level=[128, 0])
+        manager.impl.create_kv_cache.return_value = cache
+        engine = SimpleNamespace(kv_cache_manager=manager, max_seq_len=1024, _is_kv_manager_v2=True)
+        adapter = KVAlignmentAdapter(engine, keep_resident=True)
+        hold = adapter.reserve(AlignmentInput(tuple(range(129))))
+        type(manager).has_execution_residency = PropertyMock(side_effect=adapter.has_residency)
+        manager.advance_execution_residency.side_effect = adapter.advance_residency
+        manager._yield_execution_residency.side_effect = adapter.yield_residency
+        manager.defer_execution_residency_recovery.side_effect = lambda: (
+            KVCacheManagerV2.defer_execution_residency_recovery(manager)
+        )
+        return manager, adapter, cache, hold
+
+    @pytest.mark.parametrize("successor_arrives", [False, True])
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_idle_handoff_repoll_preserves_one_queue_opportunity(self, successor_arrives, chunked):
+        manager, adapter, cache, hold = self.handoff_grace_manager()
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        first, second = make_ctx_request(1, 128), make_ctx_request(2, 128)
+        successor = make_ctx_request(3, 128)
+        successor.py_execution_recovery_tokens = 128
+
+        def prepare(request):
+            if request is successor:
+                assert adapter.has_residency()
+                cache.suspend.assert_not_called()
+                hold.close()
+                return True
+            return not adapter.has_residency()
+
+        manager.prepare_context.side_effect = prepare
+        initial = scheduler.schedule_request([first, second], set())
+        assert not initial.context_requests, "fresh handoff reclaimed before executor queue repoll"
+        assert not initial.paused_requests and not initial.recompute_paused_requests
+        manager.defer_execution_residency_recovery.assert_called_once()
+        cache.suspend.assert_not_called()
+        manager.advance_execution_residency.assert_not_called()
+        assert adapter.has_residency() and hold.num_tokens == 128
+
+        requests = [first, second, successor] if successor_arrives else [first, second]
+        retry = scheduler.schedule_request(requests, set())
+        assert retry.context_requests == ([successor] if successor_arrives else [first])
+        assert cache.suspend.call_count == int(not successor_arrives)
+        assert not retry.paused_requests and not retry.recompute_paused_requests
+        manager.suspend_request.assert_not_called()
+        manager.preempt_request.assert_not_called()
+        hold.close()
+
+    @pytest.mark.parametrize("successor_arrives", [False, True])
+    def test_handoff_grace_started_context_or_successor_progresses_on_next_pass(
+        self, successor_arrives
+    ):
+        manager, adapter, cache, hold = self.handoff_grace_manager()
+        scheduler = make_scheduler(manager, max_batch_size=2)
+        generation = make_gen_request(1)
+        context = make_ctx_request(2, 128, is_first_context_chunk=False)
+        successor = make_ctx_request(3, 128)
+        successor.py_execution_recovery_tokens = 128
+
+        def resize(req, tokens):
+            if req is successor:
+                assert adapter.has_residency()
+                cache.suspend.assert_not_called()
+                hold.close()
+                return True
+            return not adapter.has_residency() or adapter.yield_expired_residency()
+
+        manager.resize_context.side_effect = resize
+        scheduler._try_preempt_for_pages = Mock(side_effect=AssertionError("premature eviction"))
+        first = scheduler.schedule_request([generation, context], set())
+        assert first.generation_requests == [generation] and not first.context_requests
+        assert adapter.has_residency()
+        cache.suspend.assert_not_called()
+        manager.advance_execution_residency.assert_called_once()
+        requests = [generation, context, successor] if successor_arrives else [generation, context]
+        second = scheduler.schedule_request(requests, set())
+        assert second.generation_requests == [generation]
+        assert second.context_requests == ([successor] if successor_arrives else [context])
+        assert cache.suspend.call_count == int(not successor_arrives)
+        assert not second.recompute_paused_requests and not second.paused_requests
+        hold.close()
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_idle_handoff_repoll_replacement_cannot_starve_context(self, chunked):
+        from tensorrt_llm.execution_alignment import AlignmentInput
+
+        manager, adapter, cache, hold = self.handoff_grace_manager()
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        request = make_ctx_request(1, 128)
+        manager.prepare_context.side_effect = lambda req: not adapter.has_residency()
+        initial = scheduler.schedule_request([request], set())
+        assert not initial.context_requests
+        cache.suspend.assert_not_called()
+        hold.close()
+
+        replacement = Mock(num_committed_tokens=128, cached_tokens_by_level=[128, 0])
+        manager.impl.create_kv_cache.return_value = replacement
+        replacement_hold = adapter.reserve(AlignmentInput(tuple(range(129))))
+        retry = scheduler.schedule_request([request], set())
+        assert retry.context_requests == [request], (
+            "replacement handoff renewed idle queue deferral"
+        )
+        replacement.suspend.assert_called_once()
+        manager.defer_execution_residency_recovery.assert_called_once()
+        assert not retry.paused_requests and not retry.recompute_paused_requests
+        replacement_hold.close()
+
+        later = Mock(num_committed_tokens=128, cached_tokens_by_level=[128, 0])
+        manager.impl.create_kv_cache.return_value = later
+        later_hold = adapter.reserve(AlignmentInput(tuple(range(129))))
+        after_progress = scheduler.schedule_request([make_ctx_request(2, 128)], set())
+        assert not after_progress.context_requests
+        later.suspend.assert_not_called()
+        assert manager.defer_execution_residency_recovery.call_count == 2
+        later_hold.close()
+
+    def test_handoff_grace_empty_inflight_poll_does_not_expire_holds(self):
+        manager, adapter, cache, hold = self.handoff_grace_manager()
+        scheduler = make_scheduler(manager)
+        generation = make_gen_request(1)
+        result = scheduler.schedule_request([generation], {1})
+        assert not result.context_requests and not result.generation_requests
+        manager.advance_execution_residency.assert_not_called()
+        assert not adapter.yield_expired_residency()
+        cache.suspend.assert_not_called()
+        hold.close()
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_idle_admission_yields_handoff_residency_before_evicting_an_owner(self, chunked):
+        manager = make_kv_cache_manager()
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        request = make_ctx_request(1, 128)
+        manager.prepare_context.side_effect = lambda req: not manager.has_execution_residency
+
+        def release():
+            manager.has_execution_residency = False
+            return True
+
+        manager._yield_execution_residency.side_effect = release
+        result = scheduler.schedule_request([request], set())
+
+        assert result.context_requests == [request]
+        assert manager.prepare_context.call_count == 2
+        manager._yield_execution_residency.assert_called_once()
+        manager.suspend_request.assert_not_called()
+        manager.preempt_request.assert_not_called()
+        assert not result.paused_requests and not result.recompute_paused_requests
+
+    def test_running_generation_does_not_release_a_pending_handoff_for_new_context(self):
+        manager = make_kv_cache_manager(prepare_context_fn=lambda req: False)
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(manager)
+        generation = make_gen_request(1)
+        context = make_ctx_request(2, 128)
+
+        result = scheduler.schedule_request([generation, context], set())
+
+        assert result.generation_requests == [generation] and not result.context_requests
+        manager._yield_execution_residency.assert_not_called()
+        manager.preempt_request.assert_not_called()
+
+    def test_failed_residency_yield_cannot_admit_or_rewrite_cache(self):
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        manager._execution_residency_reclaimer = Mock(side_effect=RuntimeError("yield failed"))
+        cache.is_active = False
+        cache.resume.return_value = False
+        with pytest.raises(RuntimeError, match="yield failed"):
+            manager._resume_and_restore(request.py_request_id, cache, capacity_hint=192)
+        cache.resume.assert_called_once_with(17, capacity_hint=192)
+        manager._restore_page_index_bufs.assert_not_called()
+        cache.close.assert_not_called()
+
+    def test_generation_resume_rejects_before_restoring_page_indices(self):
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        manager._generation_draft_slots = Mock(return_value=0)
+        cache.is_active = False
+        cache.resume.return_value = False
+
+        assert not manager.try_allocate_generation(request)
+
+        cache.resume.assert_called_once_with(17, is_decoding=True, capacity_hint=129)
+        manager._restore_page_index_bufs.assert_not_called()
+        cache.resize.assert_not_called()
+        cache.commit.assert_not_called()
+
+    def test_active_generation_skips_capacity_preflight(self):
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._supports_dense_resume_capacity = Mock(side_effect=AssertionError)
+        manager._ensure_generation_beam_width = Mock(return_value=True)
+        manager._generation_draft_slots = Mock(return_value=0)
+        manager._allocated_draft_lens = {}
+        cache.is_active = True
+        cache.enter_decode.return_value = True
+
+        assert manager.try_allocate_generation(request)
+
+        manager._supports_dense_resume_capacity.assert_not_called()
+        cache.resume.assert_not_called()
+        cache.resize.assert_called_once_with(129)
+
+    @pytest.mark.parametrize(
+        "variant", ["multimodal", "draft", "connector", "beam", "window", "sparse"]
+    )
+    def test_generation_resume_preserves_specialized_admission(self, variant):
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
+
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        cache.is_active = False
+        cache.resume.return_value = False
+        if variant == "multimodal":
+            request.py_multimodal_data = {}
+        elif variant == "draft":
+            manager.max_draft_len = 1
+        elif variant == "connector":
+            manager.kv_connector_manager = object()
+        elif variant == "beam":
+            manager.max_beam_width = 2
+        else:
+            manager.kv_cache_manager_py_config.layers = [
+                AttentionLayerConfig(
+                    0,
+                    [BufferConfig("key", 4096, is_sparse=variant == "sparse")],
+                    sliding_window_size=256 if variant == "window" else None,
+                )
+            ]
+
+        assert not manager.try_allocate_generation(request)
+
+        cache.resume.assert_called_once_with(17, is_decoding=True)
+        manager._restore_page_index_bufs.assert_not_called()
+        cache.resize.assert_not_called()
+
+    def test_recovery_allocates_only_next_chunk_without_publishing_unwritten_tail(self):
+        manager, request, cache = self.recovery_capacity_manager()
+
+        assert manager.resize_context(request, 64)
+
+        cache.resize.assert_called_once_with(192)
+        cache.commit.assert_not_called()
+        assert request.context_current_position == 128
+        assert request.py_execution_recovery_tokens == 128
+
+    def test_failed_recovery_chunk_allocation_remains_unadmitted(self):
+        manager, request, cache = self.recovery_capacity_manager()
+        cache.resize.return_value = False
+
+        assert not manager.resize_context(request, 64)
+
+        cache.suspend.assert_called_once()
+        cache.commit.assert_not_called()
+        assert request.context_current_position == 128
+        manager._fill_fresh_kv_pages.assert_not_called()
+
+    @pytest.mark.parametrize("retained,first", [(0, True), (128, False)])
+    def test_ordinary_and_continuing_contexts_keep_chunk_allocation(self, retained, first):
+        manager, request, cache = self.recovery_capacity_manager()
+        request.py_execution_recovery_tokens = retained
+        request.is_first_context_chunk = first
+
+        assert manager.resize_context(request, 64)
+
+        cache.resize.assert_called_once_with(192)
+
+    @pytest.mark.parametrize(
+        "attribute,value",
+        [
+            ("enable_block_reuse", False),
+            ("is_draft", True),
+            ("is_disagg", True),
+            ("_has_cp_helix", True),
+            ("kv_connector_manager", object()),
+            ("max_beam_width", 2),
+            ("max_draft_len", 1),
+            ("num_extra_kv_tokens", 1),
+            ("kv_compression_manages_history", True),
+        ],
+    )
+    def test_prefill_hint_keeps_specialized_paths_unchanged(self, attribute, value):
+        manager, request, _ = self.recovery_capacity_manager()
+        setattr(manager, attribute, value)
+        assert manager._context_capacity_hint(request, 128, 64, 64) == 0
+
+    @pytest.mark.parametrize("variant", ["gpu_only", "sliding", "sparse", "ssm"])
+    def test_prefill_hint_requires_tiered_dense_attention(self, variant):
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import SsmLayerConfig
+
+        manager, request, _ = self.recovery_capacity_manager()
+        layer = manager.kv_cache_manager_py_config.layers[0]
+        if variant == "gpu_only":
+            manager.impl.cache_tier_list = [0]
+        elif variant == "sliding":
+            layer.sliding_window_size = 64
+        elif variant == "sparse":
+            layer.buffers[0].is_sparse = True
+        else:
+            manager.kv_cache_manager_py_config.layers = [SsmLayerConfig(0, layer.buffers)]
+        assert manager._context_capacity_hint(request, 128, 64, 64) == 0
+
+    @staticmethod
+    def blocked_successor(*, chunked=False, resize_failure=False):
+        manager = make_kv_cache_manager(enable_block_reuse=True)
+        scheduler = make_scheduler(manager, ctx_chunk_config=(None, 64) if chunked else None)
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 512
+        generation = make_gen_request(1)
+
+        def prepare(req):
+            # A real failed restore/resize can leave an allocation that the
+            # scheduler must release before deferring its next attempt.
+            manager.kv_cache_map[req.py_request_id] = Mock(is_active=resize_failure)
+            return resize_failure
+
+        manager.prepare_context.side_effect = prepare
+        manager.free_resources.side_effect = lambda req: manager.kv_cache_map.pop(
+            req.py_request_id, None
+        )
+        if resize_failure:
+            manager.resize_context.side_effect = lambda req, tokens: False
+        return manager, scheduler, successor, generation
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("resize_failure", [False, True])
+    def test_failed_restore_is_not_repeated_while_other_work_runs(self, chunked, resize_failure):
+        manager, scheduler, successor, generation = self.blocked_successor(
+            chunked=chunked, resize_failure=resize_failure
+        )
+        for _ in range(scheduler._CONTEXT_RETRY_PASSES):
+            result = scheduler.schedule_request([generation, successor], set())
+            assert result.generation_requests == [generation]
+            assert result.context_requests == []
+        assert manager.prepare_context.call_count == 1
+        assert manager.free_resources.call_count == 1
+        assert successor.py_execution_recovery_tokens == 512
+
+        scheduler.schedule_request([generation, successor], set())
+        assert manager.prepare_context.call_count == 2
+
+    def test_idle_engine_retries_without_waiting_for_backoff(self):
+        manager, scheduler, successor, generation = self.blocked_successor()
+        scheduler.schedule_request([generation, successor], set())
+        manager.prepare_context.side_effect = lambda req: True
+
+        result = scheduler.schedule_request([successor], set())
+
+        assert result.context_requests == [successor]
+        assert not scheduler._context_retries
+
+    def test_released_capacity_retries_immediately(self):
+        manager, scheduler, successor, generation = self.blocked_successor()
+        scheduler.schedule_request([generation, successor], set())
+        manager.impl.get_storage_statistics.return_value = [Mock(free=1, available=9)]
+        manager.prepare_context.side_effect = lambda req: True
+
+        result = scheduler.schedule_request([generation, successor], set())
+
+        assert result.context_requests == [successor]
+        assert result.generation_requests == [generation]
+
+    def test_retry_does_not_wait_for_a_residency_change_visible_in_page_counts(self):
+        manager, scheduler, successor, generation = self.blocked_successor()
+        scheduler.schedule_request([generation, successor], set())
+        manager.prepare_context.side_effect = lambda req: True
+        for _ in range(scheduler._CONTEXT_RETRY_PASSES - 1):
+            result = scheduler.schedule_request([generation, successor], set())
+            assert not result.context_requests
+
+        result = scheduler.schedule_request([generation, successor], set())
+
+        assert result.context_requests == [successor]
+        assert not scheduler._context_retries
+
+    def test_recycled_request_id_does_not_inherit_retry_delay(self):
+        manager, scheduler, successor, generation = self.blocked_successor()
+        scheduler.schedule_request([generation, successor], set())
+        replacement = make_ctx_request(successor.py_request_id, 128)
+        replacement.py_execution_recovery_tokens = 512
+        manager.prepare_context.side_effect = lambda req: True
+
+        result = scheduler.schedule_request([generation, replacement], set())
+
+        assert result.context_requests == [replacement]
+
+    def test_removed_successor_drops_retry_metadata(self):
+        _, scheduler, successor, generation = self.blocked_successor()
+        scheduler.schedule_request([generation, successor], set())
+
+        scheduler.schedule_request([generation], set())
+
+        assert not scheduler._context_retries
+
+    def test_unreserved_request_uses_the_same_retry_policy(self):
+        manager, scheduler, successor, generation = self.blocked_successor()
+        successor.py_execution_recovery_tokens = 0
+        for _ in range(scheduler._CONTEXT_RETRY_PASSES):
+            scheduler.schedule_request([generation, successor], set())
+        assert manager.prepare_context.call_count == 1
+        scheduler.schedule_request([generation, successor], set())
+        assert manager.prepare_context.call_count == 2
+
+    @pytest.mark.parametrize("attribute", ["enable_block_reuse", "has_cache_tier_below_gpu"])
+    def test_retry_delay_requires_tiered_reuse(self, attribute):
+        manager, scheduler, successor, generation = self.blocked_successor()
+        setattr(manager, attribute, False)
+        for _ in range(3):
+            scheduler.schedule_request([generation, successor], set())
+        assert manager.prepare_context.call_count == 3
+        manager.impl.get_storage_statistics.assert_not_called()
+
+    def test_inflight_ids_alone_do_not_defer_an_admissible_context(self):
+        manager, scheduler, successor, generation = self.blocked_successor()
+        scheduler.schedule_request([generation, successor], set())
+        manager.prepare_context.side_effect = lambda req: True
+
+        result = scheduler.schedule_request([generation, successor], {generation.py_request_id})
+
+        assert result.context_requests == [successor]
+        assert not scheduler._context_retries
+
+    def test_retained_successor_precedes_cold_context(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        cold = make_ctx_request(1, 128)
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 512
+
+        result = scheduler.schedule_request([cold, successor], set())
+
+        assert result.context_requests == [successor]
+        assert successor.py_execution_recovery_tokens == 0
+
+    def test_zero_prefix_recovery_keeps_priority_until_prefill_finishes(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        ordinary = make_ctx_request(1, 128)
+        successor = make_ctx_request(2, 512)
+        successor.py_execution_recovery_pending = True
+
+        result = scheduler.schedule_request([ordinary, successor], set())
+
+        assert result.context_requests == [successor], (
+            "zero-prefix successor lost recovery priority"
+        )
+        assert not successor.py_execution_recovery_pending
+        assert successor.py_execution_recovery_tokens == 0
+        assert successor.py_execution_recovery_prefill
+        assert scheduler._recovery_admission_streak == 1
+
+        successor.is_first_context_chunk = False
+        successor.context_current_position = 128
+        successor.context_remaining_length = 384
+        retained = make_ctx_request(3, 128)
+        retained.py_execution_recovery_tokens = 64
+        result = scheduler.schedule_request([ordinary, retained, successor], set())
+
+        assert result.context_requests == [successor]
+        assert scheduler._recovery_admission_streak == 1
+        assert retained.py_execution_recovery_tokens == 64
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_zero_prefix_recovery_failed_admission_keeps_pending_handoff(self, chunked):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        ordinary = make_ctx_request(1, 128)
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_pending = True
+        manager.prepare_context.side_effect = lambda req: req is ordinary
+
+        result = scheduler.schedule_request([ordinary, successor], set())
+
+        assert result.context_requests == [ordinary]
+        assert successor.py_execution_recovery_pending
+        assert not successor.py_execution_recovery_prefill
+        assert scheduler._recovery_admission_streak == 0
+
+    def test_zero_prefix_recovery_yields_after_bounded_admissions(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        ordinary = make_ctx_request(1, 128)
+        for index in range(4):
+            successor = make_ctx_request(index + 2, 128)
+            successor.py_execution_recovery_pending = True
+            result = scheduler.schedule_request([ordinary, successor], set())
+            assert result.context_requests == [successor]
+            assert not successor.py_execution_recovery_pending
+        successor = make_ctx_request(6, 128)
+        successor.py_execution_recovery_pending = True
+
+        result = scheduler.schedule_request([ordinary, successor], set())
+
+        assert result.context_requests == [ordinary]
+        assert successor.py_execution_recovery_pending
+        assert scheduler._recovery_admission_streak == 0
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_resident_owner_precedes_cold_recovery_within_the_same_class(self, chunked):
+        manager = make_kv_cache_manager()
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        cold = make_ctx_request(1, 128)
+        resident = make_ctx_request(2, 128)
+        for request in (cold, resident):
+            request.py_execution_recovery_pending = True
+            request.py_execution_recovery_tokens = 64
+        manager.has_execution_resident_recovery.side_effect = lambda req: req is resident
+
+        result = scheduler.schedule_request([cold, resident], set())
+
+        assert result.context_requests == [resident]
+        assert cold.py_execution_recovery_pending
+        assert not resident.py_execution_recovery_pending
+        manager._yield_execution_residency.assert_not_called()
+
+    def test_resident_owner_priority_keeps_the_bounded_ordinary_opportunity(self):
+        manager = make_kv_cache_manager()
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        ordinary = make_ctx_request(1, 128)
+        manager.has_execution_resident_recovery.side_effect = lambda req: req is not ordinary
+        for index in range(4):
+            resident = make_ctx_request(index + 2, 128)
+            resident.py_execution_recovery_pending = True
+            resident.py_execution_recovery_tokens = 64
+            assert scheduler.schedule_request([ordinary, resident], set()).context_requests == [
+                resident
+            ]
+        resident = make_ctx_request(6, 128)
+        resident.py_execution_recovery_pending = True
+        resident.py_execution_recovery_tokens = 64
+
+        result = scheduler.schedule_request([ordinary, resident], set())
+
+        assert result.context_requests == [ordinary]
+        assert resident.py_execution_recovery_pending
+        assert scheduler._recovery_admission_streak == 0
+
+    @pytest.mark.parametrize("streak", [0, 4])
+    def test_resident_owner_priority_keeps_admitted_recovery_continuation_first(self, streak):
+        manager = make_kv_cache_manager()
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        scheduler._recovery_admission_streak = streak
+        continuation = make_ctx_request(1, 384, prompt_len=512, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+        continuation.py_execution_recovery_prefill = True
+        resident = make_ctx_request(2, 128)
+        resident.py_execution_recovery_pending = True
+        resident.py_execution_recovery_tokens = 64
+        manager.has_execution_resident_recovery.side_effect = lambda req: req is resident
+
+        result = scheduler.schedule_request([continuation, resident], set())
+
+        assert result.context_requests == [continuation]
+        assert resident.py_execution_recovery_pending
+        assert scheduler._recovery_admission_streak == streak
+
+    @pytest.mark.parametrize("ordinary_waiting", [False, True])
+    def test_resident_owner_preference_is_bounded_for_a_waiting_cold_successor(
+        self, ordinary_waiting
+    ):
+        manager = make_kv_cache_manager()
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        cold = make_ctx_request(1, 128)
+        cold.py_execution_recovery_pending = True
+        cold.py_execution_recovery_tokens = 64
+        ordinary = make_ctx_request(2, 128)
+        manager.has_execution_resident_recovery.side_effect = lambda req: req.py_request_id > 2
+        for index in range(4):
+            resident = make_ctx_request(index + 3, 128)
+            resident.py_execution_recovery_pending = True
+            resident.py_execution_recovery_tokens = 64
+            pending = [cold, resident] + ([ordinary] if ordinary_waiting else [])
+            assert scheduler.schedule_request(pending, set()).context_requests == [resident]
+            assert cold.py_execution_recovery_pending
+
+        resident = make_ctx_request(7, 128)
+        resident.py_execution_recovery_pending = True
+        resident.py_execution_recovery_tokens = 64
+        if ordinary_waiting:
+            result = scheduler.schedule_request([cold, resident, ordinary], set())
+            assert result.context_requests == [ordinary]
+        result = scheduler.schedule_request([cold, resident], set())
+        assert result.context_requests == [cold]
+        assert not cold.py_execution_recovery_pending
+        assert resident.py_execution_recovery_pending
+        assert scheduler.schedule_request([resident], set()).context_requests == [resident]
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_resident_owner_admission_suspends_another_owner_before_cold_restore(self, chunked):
+        manager = make_kv_cache_manager(can_evict=True)
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        owner = make_ctx_request(1, 64, prompt_len=128, is_first_context_chunk=False)
+        owner.context_current_position = 64
+        manager.kv_cache_map[owner.py_request_id].is_active = True
+        resident = make_ctx_request(2, 128)
+        resident.py_execution_recovery_pending = True
+        resident.py_execution_recovery_tokens = 64
+        manager.has_execution_resident_recovery.side_effect = lambda req: (
+            req is resident and manager.has_execution_residency
+        )
+        cold_restores = []
+
+        def prepare(req):
+            if req is not resident:
+                return False
+            if not manager.has_execution_residency:
+                cold_restores.append(req.py_request_id)
+                return True
+            return not manager.kv_cache_map[owner.py_request_id].is_active
+
+        def yield_residency():
+            manager.has_execution_residency = False
+            return True
+
+        manager.prepare_context.side_effect = prepare
+        manager._yield_execution_residency.side_effect = yield_residency
+
+        result = scheduler.schedule_request([owner, resident], set())
+
+        assert result.context_requests == [resident]
+        assert result.paused_requests == [owner]
+        assert not result.recompute_paused_requests
+        assert manager.has_execution_residency
+        assert not cold_restores
+        manager._yield_execution_residency.assert_not_called()
+
+    @pytest.mark.parametrize("fallback", ["yield", "recompute"])
+    def test_resident_owner_admission_falls_back_when_suspension_cannot_fit(self, fallback):
+        manager = make_kv_cache_manager(can_evict=True)
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(manager, max_batch_size=1, ctx_chunk_config=(None, 64))
+        owner = make_ctx_request(1, 64, prompt_len=128, is_first_context_chunk=False)
+        owner.context_current_position = 64
+        manager.kv_cache_map[owner.py_request_id].is_active = True
+        resident = make_ctx_request(2, 128)
+        resident.py_execution_recovery_pending = True
+        resident.py_execution_recovery_tokens = 64
+        manager.has_execution_resident_recovery.side_effect = lambda req: (
+            req is resident and manager.has_execution_residency
+        )
+        operations = []
+
+        def suspend(req):
+            assert req is owner
+            operations.append("suspend")
+            manager.kv_cache_map[req.py_request_id].is_active = False
+
+        def release(req):
+            if req is owner:
+                operations.append("recompute")
+            manager.kv_cache_map.pop(req.py_request_id, None)
+
+        def yield_residency():
+            operations.append("yield")
+            manager.has_execution_residency = False
+            return True
+
+        def prepare(req):
+            if req is not resident:
+                return False
+            if fallback == "yield":
+                return not manager.has_execution_residency
+            return owner.py_request_id not in manager.kv_cache_map
+
+        manager.suspend_request.side_effect = suspend
+        manager.free_resources.side_effect = release
+        manager.prepare_context.side_effect = prepare
+        manager._yield_execution_residency.side_effect = yield_residency
+
+        result = scheduler.schedule_request([owner, resident], set())
+
+        assert result.context_requests == [resident]
+        assert not resident.py_execution_recovery_pending
+        assert operations == ["suspend", "yield"] + (
+            ["recompute"] if fallback == "recompute" else []
+        )
+        assert result.paused_requests == ([owner] if fallback == "yield" else [])
+        assert result.recompute_paused_requests == ([owner] if fallback == "recompute" else [])
+
+    def test_resident_owner_admission_never_suspends_an_inflight_owner(self):
+        manager = make_kv_cache_manager(can_evict=True, prepare_context_fn=lambda req: False)
+        manager.has_execution_residency = True
+        scheduler = make_scheduler(manager, ctx_chunk_config=(None, 64))
+        owner = make_ctx_request(1, 64, prompt_len=128, is_first_context_chunk=False)
+        owner.context_current_position = 64
+        resident = make_ctx_request(2, 128)
+        resident.py_execution_recovery_pending = True
+        resident.py_execution_recovery_tokens = 64
+        manager.has_execution_resident_recovery.side_effect = lambda req: req is resident
+
+        result = scheduler.schedule_request([owner, resident], {owner.py_request_id})
+
+        assert not result.context_requests
+        assert resident.py_execution_recovery_pending
+        manager.suspend_request.assert_not_called()
+        manager._yield_execution_residency.assert_not_called()
+
+    def test_started_recovery_prefill_precedes_another_recovery(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        continuation = make_ctx_request(1, 384, prompt_len=512, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+        continuation.py_execution_recovery_prefill = True
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 64
+
+        result = scheduler.schedule_request([continuation, successor], set())
+
+        assert result.context_requests == [continuation]
+        assert continuation.context_chunk_size == 128
+        assert successor.py_execution_recovery_tokens == 64
+        assert scheduler._recovery_admission_streak == 0
+
+    @pytest.mark.parametrize("streak", [0, 4])
+    def test_started_recovery_prefill_finishes_before_older_cold_context(self, streak):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        scheduler._recovery_admission_streak = streak
+        cold = make_ctx_request(1, 128)
+        continuation = make_ctx_request(2, 384, prompt_len=512, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+        continuation.py_execution_recovery_prefill = True
+
+        result = scheduler.schedule_request([cold, continuation], set())
+
+        assert result.context_requests == [continuation]
+        assert continuation.context_chunk_size == 128
+        assert scheduler._recovery_admission_streak == streak
+
+    def test_blocked_started_recovery_prefill_does_not_prevent_runnable_cold_context(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        cold = make_ctx_request(1, 128)
+        continuation = make_ctx_request(2, 384, prompt_len=512, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+        continuation.py_execution_recovery_prefill = True
+        manager.prepare_context.side_effect = lambda req, **kwargs: req is cold
+
+        result = scheduler.schedule_request([cold, continuation], set())
+
+        assert result.context_requests == [cold]
+
+    def test_ordinary_continuation_keeps_arrival_order_without_fresh_recovery(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        cold = make_ctx_request(1, 128)
+        continuation = make_ctx_request(2, 384, prompt_len=512, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+
+        result = scheduler.schedule_request([cold, continuation], set())
+
+        assert result.context_requests == [cold]
+
+    def test_blocked_started_recovery_prefill_does_not_prevent_runnable_recovery(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        continuation = make_ctx_request(1, 384, prompt_len=512, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+        continuation.py_execution_recovery_prefill = True
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 64
+        manager.prepare_context.side_effect = lambda req, **kwargs: req is successor
+
+        result = scheduler.schedule_request([continuation, successor], set())
+
+        assert result.context_requests == [successor]
+        assert successor.py_execution_recovery_tokens == 0
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_optional_handoff_release_does_not_enable_active_owner_eviction(self, chunked):
+        manager = make_kv_cache_manager(can_evict=False)
+        manager.has_execution_residency = True
+        manager.prepare_context.side_effect = lambda req, **kwargs: False
+        scheduler = make_scheduler(manager, ctx_chunk_config=(None, 64) if chunked else None)
+        waiting = make_ctx_request(1, 128)
+        owner = make_ctx_request(2, 128, is_first_context_chunk=False)
+
+        def release():
+            held = manager.has_execution_residency
+            manager.has_execution_residency = False
+            return held
+
+        manager._yield_execution_residency.side_effect = release
+        result = scheduler.schedule_request([waiting, owner], set())
+        assert not result.context_requests
+        assert not result.paused_requests and not result.recompute_paused_requests
+        manager._yield_execution_residency.assert_called()
+        assert not manager.has_execution_residency
+        manager.suspend_request.assert_not_called()
+        manager.free_resources.assert_not_called()
+
+    def test_idle_reclamation_retries_started_recovery_prefill_before_new_recovery(self):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
+
+        manager = make_kv_cache_manager(enable_block_reuse=True, can_evict=True)
+        manager.has_cache_tier_below_gpu = True
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        continuation = make_ctx_request(1, 384, prompt_len=512, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+        continuation.py_execution_recovery_prefill = True
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 64
+        manager.prepare_context.side_effect = lambda req, **kwargs: False
+        scheduler._recover_context_admission = Mock(
+            return_value=(ScheduleAction.SCHEDULED, 128, True)
+        )
+
+        result = scheduler.schedule_request([continuation, successor], set())
+
+        assert result.context_requests == [continuation]
+        assert scheduler._recover_context_admission.call_args.args[0] is continuation
+        assert successor.py_execution_recovery_tokens == 64
+
+    def test_ordinary_continuation_does_not_displace_new_recovery(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        ordinary = make_ctx_request(1, 384, prompt_len=512, is_first_context_chunk=False)
+        ordinary.context_current_position = 128
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 64
+
+        result = scheduler.schedule_request([ordinary, successor], set())
+
+        assert result.context_requests == [successor]
+        assert successor.py_execution_recovery_prefill
+        assert not ordinary.py_execution_recovery_prefill
+
+    def test_readmission_without_a_promise_clears_recovery_prefill_priority(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        recomputed = make_ctx_request(1, 128)
+        recomputed.py_execution_recovery_prefill = True
+
+        result = scheduler.schedule_request([recomputed], set())
+
+        assert result.context_requests == [recomputed]
+        assert not recomputed.py_execution_recovery_prefill
+
+    def test_recovery_admissions_yield_to_ordinary_context(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        cold = make_ctx_request(1, 128)
+        for index in range(4):
+            successor = make_ctx_request(index + 2, 128)
+            successor.py_execution_recovery_tokens = 512
+            result = scheduler.schedule_request([cold, successor], set())
+            assert result.context_requests == [successor]
+        successor = make_ctx_request(6, 128)
+        successor.py_execution_recovery_tokens = 512
+
+        result = scheduler.schedule_request([cold, successor], set())
+
+        assert result.context_requests == [cold]
+        assert successor.py_execution_recovery_tokens == 512
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_failed_recovery_does_not_block_runnable_context(self, chunked):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(
+            manager, max_batch_size=1, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        cold = make_ctx_request(1, 128)
+        successor = make_ctx_request(2, 128)
+        successor.py_execution_recovery_tokens = 512
+        manager.prepare_context.side_effect = lambda req: req is cold
+
+        result = scheduler.schedule_request([cold, successor], set())
+
+        assert result.context_requests == [cold]
+        assert successor.py_execution_recovery_tokens == 512
+        assert scheduler._recovery_admission_streak == 0
+        assert not successor.py_execution_recovery_prefill
+
+    @staticmethod
+    def recovery_drain_setup(chunked: bool = False) -> tuple[Mock, object, Mock, Mock, Mock]:
+        manager = make_kv_cache_manager(enable_block_reuse=True)
+        manager.mapping.world_size = 1
+        manager._supports_dense_resume_capacity.return_value = True
+        scheduler = make_scheduler(
+            manager, max_num_tokens=512, ctx_chunk_config=(None, 64) if chunked else None
+        )
+        successor = make_ctx_request(1, 128)
+        successor.py_execution_recovery_pending = True
+        successor.py_execution_recovery_tokens = 64
+        generation = make_gen_request(2)
+        fresh = make_ctx_request(3, 128)
+        manager.prepare_context.side_effect = lambda req: req is not successor
+        return manager, scheduler, successor, generation, fresh
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    @pytest.mark.parametrize("next_promise", [0, 64])
+    def test_recovery_drain_defers_fresh_context_while_decode_progresses(
+        self, chunked: bool, next_promise: int
+    ) -> None:
+        manager, scheduler, successor, generation, fresh = self.recovery_drain_setup(chunked)
+        fresh.py_execution_recovery_tokens = next_promise
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert result.generation_requests == [generation]
+        assert not result.context_requests
+        assert not result.paused_requests and not result.recompute_paused_requests
+        assert scheduler._recovery_drain_passes == 1
+        assert successor.py_execution_recovery_tokens == 64
+        assert fresh.py_execution_recovery_tokens == next_promise
+        manager.prepare_context.assert_called_once_with(successor)
+        manager.preempt_request.assert_not_called()
+        manager.suspend_request.assert_not_called()
+
+    @pytest.mark.parametrize("recovery_prefill", [False, True])
+    def test_recovery_drain_keeps_started_context_progress(self, recovery_prefill: bool) -> None:
+        manager, scheduler, successor, generation, fresh = self.recovery_drain_setup(True)
+        continuation = make_ctx_request(4, 128, prompt_len=256, is_first_context_chunk=False)
+        continuation.context_current_position = 128
+        continuation.py_execution_recovery_prefill = recovery_prefill
+
+        result = scheduler.schedule_request([generation, successor, continuation, fresh], set())
+
+        assert result.generation_requests == [generation]
+        assert result.context_requests == [continuation]
+        assert scheduler._recovery_drain_passes == 1
+        assert not result.paused_requests and not result.recompute_paused_requests
+        assert all(item.args[0] is not fresh for item in manager.prepare_context.call_args_list)
+
+    @pytest.mark.parametrize("inflight", [False, True])
+    def test_recovery_drain_keeps_idle_scan_work_conserving(self, inflight: bool) -> None:
+        _, scheduler, successor, generation, fresh = self.recovery_drain_setup()
+        scheduler.schedule_request([generation, successor, fresh], set())
+        requests = [generation, successor, fresh] if inflight else [successor, fresh]
+
+        result = scheduler.schedule_request(
+            requests, {generation.py_request_id} if inflight else set()
+        )
+
+        assert result.context_requests == [fresh]
+        assert not result.generation_requests
+        assert scheduler._recovery_drain_passes == 0
+
+    def test_recovery_drain_allows_resident_owner_to_release_its_pages(self) -> None:
+        manager, scheduler, successor, generation, fresh = self.recovery_drain_setup()
+        manager.has_execution_residency = True
+        fresh.py_execution_recovery_tokens = 64
+        manager.has_execution_resident_recovery.side_effect = lambda req: req is fresh
+        scheduler._resident_recovery_admission_streak = 4
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert result.context_requests == [fresh]
+        assert result.generation_requests == [generation]
+        assert [item.args[0] for item in manager.prepare_context.call_args_list] == [
+            successor,
+            fresh,
+        ]
+        assert scheduler._recovery_drain_passes == 0
+        manager._yield_execution_residency.assert_not_called()
+
+    def test_recovery_drain_opportunity_is_bounded_without_request_completion(self) -> None:
+        _, scheduler, successor, generation, fresh = self.recovery_drain_setup()
+        scheduler._RECOVERY_DRAIN_PASSES = 3
+        for count in range(3):
+            result = scheduler.schedule_request([generation, successor, fresh], set())
+            assert result.generation_requests == [generation]
+            assert not result.context_requests
+            assert scheduler._recovery_drain_passes == count + 1
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert result.context_requests == [fresh]
+        assert result.generation_requests == [generation]
+        assert scheduler._recovery_drain_passes == 0
+        assert successor.py_execution_recovery_tokens == 64
+
+    def test_recovery_drain_replacement_cannot_renew_the_deferral_bound(self) -> None:
+        manager, scheduler, successor, generation, fresh = self.recovery_drain_setup()
+        scheduler._RECOVERY_DRAIN_PASSES = 2
+        for _ in range(2):
+            manager.prepare_context.side_effect = lambda req: req is fresh
+            result = scheduler.schedule_request([generation, successor, fresh], set())
+            assert not result.context_requests
+            replacement = make_ctx_request(successor.py_request_id, 128)
+            replacement.py_execution_recovery_tokens = 64
+            successor = replacement
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert result.context_requests == [fresh]
+        assert scheduler._recovery_drain_passes == 0
+
+    @pytest.mark.parametrize("change", ["removed", "zero_prefix", "recycled_id"])
+    def test_recovery_drain_drops_obsolete_waiter(self, change: str) -> None:
+        _, scheduler, successor, generation, fresh = self.recovery_drain_setup()
+        scheduler.schedule_request([generation, successor, fresh], set())
+        assert scheduler._recovery_drain_passes == 1
+        requests = [generation, fresh]
+        if change == "zero_prefix":
+            successor.py_execution_recovery_tokens = 0
+            requests.insert(1, successor)
+        elif change == "recycled_id":
+            requests.insert(1, make_ctx_request(successor.py_request_id, 128))
+
+        result = scheduler.schedule_request(requests, set())
+
+        assert fresh in result.context_requests
+        assert scheduler._recovery_drain_passes == 0
+
+    def test_recovery_drain_admits_waiter_when_capacity_becomes_available(self) -> None:
+        manager, scheduler, successor, generation, fresh = self.recovery_drain_setup()
+        scheduler.schedule_request([generation, successor, fresh], set())
+        manager.impl.get_storage_statistics.return_value = [Mock(free=8, available=16)]
+        manager.prepare_context.side_effect = lambda req: True
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert result.context_requests == [successor, fresh]
+        assert not successor.py_execution_recovery_pending
+        assert successor.py_execution_recovery_tokens == 0
+        assert scheduler._recovery_drain_passes == 0
+
+    def test_recovery_drain_token_budget_refusal_does_not_reserve_pages(self) -> None:
+        manager, scheduler, successor, generation, fresh = self.recovery_drain_setup()
+        successor.context_remaining_length = successor.prompt_len = 1024
+        manager.prepare_context.side_effect = lambda req: True
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert result.context_requests == [fresh]
+        assert result.generation_requests == [generation]
+        assert scheduler._recovery_drain_passes == 0
+
+    @pytest.mark.parametrize("chunked", [False, True])
+    def test_recovery_drain_capacity_resize_refusal_also_defers_fresh_context(
+        self, chunked: bool
+    ) -> None:
+        manager, scheduler, successor, generation, fresh = self.recovery_drain_setup(chunked)
+        manager.prepare_context.side_effect = lambda req: True
+        manager.resize_context.side_effect = lambda req, tokens: req is not successor
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert not result.context_requests
+        assert result.generation_requests == [generation]
+        assert scheduler._recovery_drain_passes == 1
+        assert successor.py_execution_recovery_tokens == 64
+
+    @pytest.mark.parametrize(
+        "unsupported",
+        ["multi_rank", "cp", "draft", "cross", "connector", "backend", "gpu_only", "reuse_off"],
+    )
+    def test_recovery_drain_unsupported_modes_keep_existing_admission(
+        self, unsupported: str
+    ) -> None:
+        manager, _, successor, generation, fresh = self.recovery_drain_setup()
+        kwargs = {}
+        if unsupported == "multi_rank":
+            manager.mapping.world_size = 2
+        elif unsupported == "cp":
+            manager._has_cp_helix = True
+        elif unsupported == "draft":
+            kwargs["draft_kv_cache_manager"] = make_kv_cache_manager()
+        elif unsupported == "cross":
+            kwargs["cross_kv_cache_manager"] = make_kv_cache_manager()
+        elif unsupported == "connector":
+            manager.kv_connector_manager = Mock()
+        elif unsupported == "backend":
+            manager._supports_dense_resume_capacity.return_value = False
+        elif unsupported == "gpu_only":
+            manager.has_cache_tier_below_gpu = False
+        elif unsupported == "reuse_off":
+            manager.enable_block_reuse = False
+        scheduler = make_scheduler(manager, max_num_tokens=512, **kwargs)
+
+        result = scheduler.schedule_request([generation, successor, fresh], set())
+
+        assert not scheduler._recovery_drain_enabled
+        assert result.context_requests == [fresh]
+        assert scheduler._recovery_drain_passes == 0
+
+    def test_zero_promise_keeps_arrival_order(self):
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager, max_batch_size=1)
+        cold = make_ctx_request(1, 128)
+        successor = make_ctx_request(2, 128)
+
+        result = scheduler.schedule_request([cold, successor], set())
+
+        assert result.context_requests == [cold]
 
 
 class TestSorting:
