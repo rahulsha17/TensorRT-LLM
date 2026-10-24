@@ -1793,6 +1793,9 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._execution_residency_reclaimer: Callable[[], bool] | None = None
+        self._execution_resident_recovery: Callable[[LlmRequest], bool] | None = None
+        self._execution_residency_repoll: Callable[[], bool] | None = None
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
@@ -3499,7 +3502,24 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         if not kv_cache.is_active:
-            if not kv_cache.resume(self._stream.cuda_stream, is_decoding=True):
+            capacity_hint = (
+                self._required_gen_capacity(req, kv_cache.capacity)
+                if getattr(req, "py_multimodal_data", None) is None
+                and self._supports_dense_resume_capacity()
+                else None
+            )
+            resumed = (
+                kv_cache.resume(
+                    self._stream.cuda_stream, is_decoding=True, capacity_hint=capacity_hint
+                )
+                if capacity_hint is not None
+                else kv_cache.resume(self._stream.cuda_stream, is_decoding=True)
+            )
+            if not resumed and self._yield_execution_residency():
+                resumed = kv_cache.resume(
+                    self._stream.cuda_stream, is_decoding=True, capacity_hint=capacity_hint
+                )
+            if not resumed:
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
         elif not kv_cache.enter_decode():
@@ -3516,7 +3536,10 @@ class KVCacheManagerV2(BaseResourceManager):
             self._set_helix_rank_fields(req)
         pre_capacity = kv_cache.capacity
         new_capacity = pre_capacity + 1 + draft_slots
-        if not kv_cache.resize(new_capacity):
+        resized = kv_cache.resize(new_capacity)
+        if not resized and self._yield_execution_residency():
+            resized = kv_cache.resize(new_capacity)
+        if not resized:
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(req, kv_cache, pre_capacity, new_capacity, "generation")
@@ -3644,14 +3667,77 @@ class KVCacheManagerV2(BaseResourceManager):
             index = self.index_mapper.get_index(request_id)
             self.sparse_metadata_batch.add(kv_cache, index)
 
-    def _resume_and_restore(self, req_id: int, kv_cache) -> bool:
+    @property
+    def has_execution_residency(self) -> bool:
+        """Whether a pending successor still owns optional GPU locks."""
+        pending = getattr(self, "_execution_residency_pending", None)
+        return pending is not None and pending()
+
+    def has_execution_resident_recovery(self, request: LlmRequest) -> bool:
+        """Check this successor's existing optional locks without a radix lookup."""
+        resident = getattr(self, "_execution_resident_recovery", None)
+        return resident is not None and resident(request)
+
+    def _yield_execution_residency(self) -> bool:
+        """Release optional handoff locks once, retaining every prefix promise."""
+        reclaimer = getattr(self, "_execution_residency_reclaimer", None)
+        return reclaimer is not None and reclaimer()
+
+    def _yield_context_execution_residency(self) -> bool:
+        """Reclaim only handoff locks whose productive scheduling grace ended."""
+        reclaimer = getattr(self, "_execution_context_residency_reclaimer", None)
+        return reclaimer is not None and reclaimer()
+
+    def advance_execution_residency(self) -> None:
+        """Account for a scheduled forward, never an empty polling iteration."""
+        advance = getattr(self, "_execution_residency_advance", None)
+        if advance is not None:
+            advance()
+
+    def defer_execution_residency_recovery(self) -> bool:
+        """Allow one queue poll before idle recovery reclaims fresh handoff locks."""
+        repoll = getattr(self, "_execution_residency_repoll", None)
+        return repoll is not None and repoll()
+
+    def _resume_context_and_restore(
+        self, req_id: int, kv_cache, *, capacity_hint: int | None = None
+    ) -> bool:
+        """Give a fresh handoff one scan before context can reclaim its locks."""
+        resumed = self._resume_and_restore(
+            req_id, kv_cache, capacity_hint=capacity_hint, yield_residency=False
+        )
+        if not resumed and self._yield_context_execution_residency():
+            resumed = self._resume_and_restore(
+                req_id, kv_cache, capacity_hint=capacity_hint, yield_residency=False
+            )
+        return resumed
+
+    def _resume_and_restore(
+        self,
+        req_id: int,
+        kv_cache,
+        *,
+        capacity_hint: int | None = None,
+        yield_residency: bool = True,
+    ) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
 
         Returns True if the cache is (or becomes) active, False on failure.
         """
         if kv_cache.is_active:
             return True
-        if not kv_cache.resume(self._stream.cuda_stream):
+        resumed = (
+            kv_cache.resume(self._stream.cuda_stream)
+            if capacity_hint is None
+            else kv_cache.resume(self._stream.cuda_stream, capacity_hint=capacity_hint)
+        )
+        if not resumed and yield_residency and self._yield_execution_residency():
+            resumed = (
+                kv_cache.resume(self._stream.cuda_stream)
+                if capacity_hint is None
+                else kv_cache.resume(self._stream.cuda_stream, capacity_hint=capacity_hint)
+            )
+        if not resumed:
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
@@ -3671,7 +3757,12 @@ class KVCacheManagerV2(BaseResourceManager):
             max(len(all_tokens) - 1, 0) + self.reuse_match_backoff,
         )
         execution_limit = req.execution_reuse_limit
-        if execution_limit is not None:
+        if execution_limit is not None and not getattr(req, "py_execution_reuse_attached", False):
+            # The immutable native field records the initial common agreement.
+            # A standalone V2 guard marks it consumed only after confirming the
+            # first allocation; subsequent recompute may reuse newly committed
+            # KV through the ordinary content/namespace checks. Multi-rank
+            # guards keep applying their coordinated common depth.
             reuse_limit = (
                 execution_limit if reuse_limit is None else min(reuse_limit, execution_limit)
             )
@@ -3702,7 +3793,14 @@ class KVCacheManagerV2(BaseResourceManager):
             self._context_reuse_tokens(req),
         )
 
-    def prepare_context_cache(self, req: LlmRequest, reuse_limit: int | None = None) -> int | None:
+    def prepare_context_cache(
+        self,
+        req: LlmRequest,
+        reuse_limit: int | None = None,
+        *,
+        prefill_token_budget: int | None = None,
+        prefill_chunk_unit: int = 1,
+    ) -> int | None:
         """Create/resume a context cache without touching request cursors. ``reuse_limit``
         caps the claimed depth while retaining its lookahead evidence; the returned
         match lets the scheduler check both pools agree.
@@ -3767,7 +3865,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Connector loads need persistent destination pages; scratch
                 # slots are reserved for local prefill.
                 kv_cache.enable_swa_scratch_reuse = False
-            if not self._resume_and_restore(req.py_request_id, kv_cache):
+            capacity_hint = (
+                self._context_capacity_hint(
+                    req,
+                    kv_cache.num_committed_tokens,
+                    prefill_token_budget,
+                    prefill_chunk_unit,
+                )
+                if prefill_token_budget is not None
+                else 0
+            )
+            resumed = self._resume_context_and_restore(
+                req.py_request_id, kv_cache, capacity_hint=capacity_hint or None
+            )
+            if not resumed:
                 return None
             return kv_cache.num_committed_tokens
 
@@ -3777,11 +3888,27 @@ class KVCacheManagerV2(BaseResourceManager):
         assert kv_cache is not None, (
             f"KV cache missing for non-first context chunk, request {req.py_request_id}"
         )
-        if not self._resume_and_restore(req.py_request_id, kv_cache):
+        capacity_hint = (
+            self._context_capacity_hint(
+                req, req.context_current_position, prefill_token_budget, prefill_chunk_unit
+            )
+            if prefill_token_budget is not None and not kv_cache.is_active
+            else 0
+        )
+        resumed = self._resume_context_and_restore(
+            req.py_request_id, kv_cache, capacity_hint=capacity_hint or None
+        )
+        if not resumed:
             return None
         return kv_cache.num_committed_tokens
 
-    def prepare_context(self, req: LlmRequest) -> bool:
+    def prepare_context(
+        self,
+        req: LlmRequest,
+        *,
+        prefill_token_budget: int | None = None,
+        prefill_chunk_unit: int = 1,
+    ) -> bool:
         """Create/resume the cache and expose local or reserved reuse before budgeting."""
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
@@ -3802,7 +3929,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 tokens_per_block=self.tokens_per_block,
                 is_draft=self.is_draft,
             )
-        reused = self.prepare_context_cache(req, limit)
+        reused = (
+            self.prepare_context_cache(
+                req,
+                limit,
+                prefill_token_budget=prefill_token_budget,
+                prefill_chunk_unit=prefill_chunk_unit,
+            )
+            if prefill_token_budget is not None
+            else self.prepare_context_cache(req, limit)
+        )
         if reused is None:
             return False
         # First chunk only: num_committed_tokens holds at the initial prefix
@@ -3819,6 +3955,73 @@ class KVCacheManagerV2(BaseResourceManager):
         is overwritten. Recurrent-state managers override this.
         """
         return False
+
+    def _supports_dense_resume_capacity(self) -> bool:
+        if (
+            not self.enable_block_reuse
+            or not self.has_cache_tier_below_gpu
+            or self.is_draft
+            or self.is_disagg
+            or self._has_cp_helix
+            or self.kv_connector_manager is not None
+            or self.max_beam_width != 1
+            or self.max_draft_len
+            or self.num_extra_kv_tokens
+            or self.kv_compression_manages_history
+        ):
+            return False
+        layers = self.kv_cache_manager_py_config.layers
+        if not layers or any(
+            not isinstance(layer, AttentionLayerConfig)
+            or (
+                layer.sliding_window_size is not None
+                and layer.sliding_window_size < self.max_seq_len
+            )
+            or any(buffer.is_sparse for buffer in layer.buffers)
+            for layer in layers
+        ):
+            return False
+        return True
+
+    def _context_capacity_hint(
+        self, req: LlmRequest, position: int, token_budget: int, chunk_unit: int
+    ) -> int:
+        """Check the actual next chunk before restoring its cached prefix.
+
+        The scheduler supplies an already capped token budget for ordinary
+        prefix-aware chunking. The first position comes from the existing cache
+        claim; continuations use their accepted context cursor, which can extend
+        beyond the published prefix. Neither needs another radix probe. This is
+        only a necessary bound, not a reservation or a new committed frontier.
+        """
+        if token_budget < 0 or chunk_unit <= 0:
+            raise ValueError("Prefill budget must be nonnegative and chunk unit positive")
+        if (
+            getattr(req, "py_multimodal_data", None) is not None
+            or not self._supports_dense_resume_capacity()
+        ):
+            return 0
+        remaining = req.prompt_len - position
+        if remaining <= 0:
+            return 0
+        chunk = min(remaining, token_budget)
+        if chunk < remaining:
+            chunk = chunk // chunk_unit * chunk_unit
+        return position + chunk if chunk > 0 else 0
+
+    def supports_execution_context_overlap(self) -> bool:
+        """Whether context history can wait for an authorized GPU frontier.
+
+        Dense ALL_REUSABLE caches grow capacity independently of publication.
+        Other layouts/policies can release history or manage additional state at
+        a context boundary and retain the ordinary blocking update path.
+        """
+        return (
+            self._supports_dense_resume_capacity()
+            and self._can_publish_block_reuse
+            and self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
+            and self.conversation_manager is None
+        )
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -3853,6 +4056,12 @@ class KVCacheManagerV2(BaseResourceManager):
         success = (
             kv_cache.resize(capacity, history) if history is not None else kv_cache.resize(capacity)
         )
+        if not success and self._yield_context_execution_residency():
+            success = (
+                kv_cache.resize(capacity, history)
+                if history is not None
+                else kv_cache.resize(capacity)
+            )
         if not success:
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} failed to resize KV cache "
@@ -5506,6 +5715,41 @@ class KVCacheManagerV2(BaseResourceManager):
             and completed_frontier // self.tokens_per_block * self.tokens_per_block
             > cache.num_committed_tokens
         )
+
+    def preserve_execution_context(
+        self, request: LlmRequest, completed_frontier: int, allocation: _KVCache
+    ) -> bool:
+        """Publish an authorized context receipt after its latest reader drains.
+
+        The caller supplies the exact allocation that produced the receipt and
+        must settle every GPU reader before calling. A speculative request
+        cursor is only an upper bound; it never supplies the accepted frontier.
+        Context can retain a trailing partial block, unlike decode publication
+        which excludes the newest sampled token and uses complete blocks.
+        """
+        if type(completed_frontier) is not int or not (
+            0 <= completed_frontier <= min(request.prompt_len, request.context_current_position)
+        ):
+            raise ValueError("completed context frontier exceeds the submitted prompt")
+        if not self.supports_execution_context_overlap() or request.is_dummy_request:
+            raise ValueError("asynchronous context publication requires a dense reusable cache")
+        cache = self.kv_cache_map.get(request.py_request_id)
+        if cache is not allocation or not cache.is_active or not cache.is_commit_allowed:
+            return False
+        if completed_frontier > cache.capacity:
+            raise RuntimeError("completed context frontier exceeds its retained allocation")
+        start = cache.num_committed_tokens
+        if completed_frontier > start:
+            source = self._reuse_token_source(request)
+            if completed_frontier > len(source):
+                raise RuntimeError("completed context frontier exceeds its retained input")
+            tokens = self._augment_tokens_for_block_reuse(
+                source, request, start=start, end=completed_frontier
+            )
+            cache.commit(tokens)
+        if completed_frontier == request.prompt_len:
+            cache.enable_swa_scratch_reuse = False
+        return True
 
     def preserve_execution_prefix(self, request: LlmRequest, completed_frontier: int) -> None:
         """Retain complete blocks from accepted, drained context or decode work.

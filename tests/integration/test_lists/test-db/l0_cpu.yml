@@ -166,6 +166,9 @@ l0_cpu:
   - unittest/executor/test_execution_gate_wiring.py
   - unittest/executor/test_execution_device_publication.py
   - unittest/executor/test_execution_device_guard.py
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestRecoveryAdmission
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestIdleGenerationRecovery
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestDeadlockDetection
   - unittest/executor/test_execution_ngram.py
   - unittest/_torch/executor/test_iter_stats_populate.py
   - unittest/grpc/openengine/test_coordinator.py

@@ -1423,6 +1423,346 @@ class TestNoBatching(TestKVCacheManagerV2):
                 if cache is not None and cache.status != _KVCache.Status.CLOSED:
                     cache.close()
 
+    @parameterized.expand([(6, False), (6, True), (8, False), (8, True)])
+    def test_suspended_reservation_close_keeps_async_successor_data(
+        self, prefix_length: int, attached: bool
+    ) -> None:
+        self.cfg = create_config(4, 8 << 20, 16 << 20, 0, 1, None, 0, 1 << 20)
+        self.cfg.max_util_for_resume = 1.0
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        scope = ReuseScope(salt=11)
+        tokens = [TokenId(i) for i in range(8)]
+        owner = self.manager.create_kv_cache(scope)
+        blocker = self.manager.create_kv_cache(ReuseScope(salt=12))
+        reservation = successor = None
+        marker = None
+        gate = HostGate()
+        try:
+            self.assertEqual(self.manager.get_storage_statistics(GPU_LEVEL)[0].total, 4)
+            self.assertTrue(owner.resume(stream))
+            self.assertTrue(owner.resize(8, 8))
+            self.engine.execute([Step(owner, tokens, [])], stream)
+            owner.commit(tokens[:prefix_length])
+            owner.stop_committing()
+            # Compile the full/partial history checks before gating the stream.
+            self.engine.execute([Step(owner, [], tokens[:prefix_length])], stream)
+            stream_holder.synchronize()
+            reservation = self.manager.create_kv_cache(scope, tokens)
+            self.assertEqual(reservation.num_committed_tokens, prefix_length)
+            self.assertEqual(reservation.status, _KVCache.Status.SUSPENDED)
+            owner.close()
+            self.assertTrue(blocker.resume(stream))
+            self.assertTrue(blocker.resize(16))
+            # Leave space for a private partial-block copy as well as its source.
+            self.assertTrue(blocker.resize(4))
+            stream_holder.synchronize()
+            stats = self.manager.get_and_reset_iteration_stats()
+            self.assertGreater(sum(s.iter_offload_bytes for s in stats.values()), 0)
+            if attached:
+                successor = self.manager.create_kv_cache(scope, tokens)
+                self.assertEqual(successor.num_committed_tokens, prefix_length)
+            gate.block_stream(stream, max_iters=1_000_000)
+            if attached:
+                self.assertTrue(successor.resume(stream))
+                self.engine.execute([Step(successor, [], tokens[:prefix_length])], stream)
+            marker = get_cached_cuda_event_type()(stream)
+            self.assertFalse(marker.query_complete())
+            reservation.close()
+            self.assertFalse(marker.query_complete())
+            gate.release()
+            marker.synchronize()
+            if not attached:
+                successor = self.manager.create_kv_cache(scope, tokens)
+                self.assertEqual(successor.num_committed_tokens, prefix_length)
+                self.assertTrue(successor.resume(stream))
+                self.engine.execute([Step(successor, [], tokens[:prefix_length])], stream)
+                stream_holder.synchronize()
+            stats = self.manager.get_and_reset_iteration_stats()
+            self.assertGreater(sum(s.iter_onboard_bytes for s in stats.values()), 0)
+        finally:
+            gate.release()
+            stream_holder.synchronize()
+            if marker is not None and not marker.is_closed():
+                marker.synchronize()
+            for cache in (successor, reservation, blocker, owner):
+                if cache is not None and cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+            stream_holder.synchronize()
+            gate.close()
+
+    def test_prefill_capacity_hint_rejects_before_host_restore(self) -> None:
+        self.prepare(8 << 20, 16 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=1 << 20)
+        self.assertEqual(self.manager.get_storage_statistics(GPU_LEVEL)[0].total, 4)
+        tokens = [TokenId(i) for i in range(8)]
+        caches = []
+        try:
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                owner = self.manager.create_kv_cache(ReuseScope(salt=1))
+                caches.append(owner)
+                self.assertTrue(owner.resume(stream))
+                self.assertTrue(owner.resize(8, 8))
+                owner.commit(tokens)
+                owner.stop_committing()
+                owner.suspend()
+                blocker = self.manager.create_kv_cache(ReuseScope(salt=2))
+                caches.append(blocker)
+                self.assertTrue(blocker.resume(stream))
+                # Move both held prefix pages to host, then leave two GPU slots free.
+                self.assertTrue(blocker.resize(16))
+                self.assertTrue(blocker.resize(8))
+                successor = self.manager.create_kv_cache(ReuseScope(salt=1), input_tokens=tokens)
+                caches.append(successor)
+                self.assertEqual(successor.num_committed_tokens, 8)
+                self.manager.get_and_reset_iteration_stats()
+                self.assertFalse(successor.resume(stream, capacity_hint=12))
+                self.assertFalse(successor.is_active)
+                self.assertEqual(successor.num_committed_tokens, 8)
+                self.assertEqual(successor.capacity, 8)
+                stats = self.manager.get_and_reset_iteration_stats()
+                self.assertEqual(sum(x.iter_onboard_bytes for x in stats.values()), 0)
+                self.assertEqual(sum(x.iter_offload_bytes for x in stats.values()), 0)
+                self.assertEqual(self.manager.probe_reuse(ReuseScope(salt=1), tokens), 8)
+                blocker.close()
+                self.assertTrue(successor.resume(stream, capacity_hint=12))
+                # The hint itself must neither allocate nor publish the unwritten tail.
+                self.assertEqual(successor.capacity, 8)
+                self.assertTrue(successor.resize(12))
+                self.assertEqual(successor.num_committed_tokens, 8)
+            stream_holder.take_finish_event().synchronize()
+        finally:
+            for cache in reversed(caches):
+                if cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
+    def test_prefill_capacity_hint_counts_shared_gpu_locks_once(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=1 << 20)
+        tokens = [TokenId(i) for i in range(8)]
+        caches = []
+        try:
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                owner = self.manager.create_kv_cache()
+                caches.append(owner)
+                self.assertTrue(owner.resume(stream))
+                self.assertTrue(owner.resize(8, 8))
+                owner.commit(tokens)
+                owner.stop_committing()
+                for decoding in (False, True):
+                    with self.subTest(decoding=decoding):
+                        successor = self.manager.create_kv_cache(input_tokens=tokens)
+                        caches.append(successor)
+                        self.assertEqual(
+                            self.manager.get_storage_statistics(GPU_LEVEL)[0].available, 2
+                        )
+                        # Four target blocks fit: two shared locks plus two free slots.
+                        self.assertTrue(
+                            successor.resume(stream, is_decoding=decoding, capacity_hint=16)
+                        )
+                        self.assertTrue(successor.resize(16))
+                        self.assertEqual(successor.num_committed_tokens, 8)
+                        successor.close()
+            stream_holder.take_finish_event().synchronize()
+        finally:
+            for cache in reversed(caches):
+                if cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
+    def test_prefill_capacity_hint_charges_private_partial_copy(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=1 << 20)
+        tokens = [TokenId(i) for i in range(6)]
+        caches = []
+        try:
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                owner = self.manager.create_kv_cache()
+                caches.append(owner)
+                self.assertTrue(owner.resume(stream))
+                self.assertTrue(owner.resize(8, 6))
+                owner.commit(tokens, is_end=True)
+                for decoding in (False, True):
+                    with self.subTest(decoding=decoding):
+                        successor = self.manager.create_kv_cache(input_tokens=tokens)
+                        caches.append(successor)
+                        self.assertEqual(successor.num_committed_tokens, 6)
+                        # Only the full source block is shared; the partial block needs a copy.
+                        self.assertFalse(
+                            successor.resume(stream, is_decoding=decoding, capacity_hint=16)
+                        )
+                        self.assertFalse(successor.is_decoding)
+                        self.assertTrue(
+                            successor.resume(stream, is_decoding=decoding, capacity_hint=12)
+                        )
+                        self.assertTrue(successor.resize(12))
+                        self.assertEqual(successor.num_committed_tokens, 6)
+                        successor.close()
+            stream_holder.take_finish_event().synchronize()
+        finally:
+            for cache in reversed(caches):
+                if cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
+    def test_prefill_capacity_hint_charges_held_gpu_pages(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=1 << 20)
+        tokens = [TokenId(i) for i in range(8)]
+        caches = []
+        try:
+            with TemporaryCudaStream([]) as stream_holder:
+                stream = cast(CudaStream, stream_holder.handle)
+                owner = self.manager.create_kv_cache()
+                caches.append(owner)
+                self.assertTrue(owner.resume(stream))
+                self.assertTrue(owner.resize(8, 8))
+                owner.commit(tokens)
+                owner.stop_committing()
+                owner.suspend()
+                successor = self.manager.create_kv_cache(input_tokens=tokens)
+                caches.append(successor)
+                self.assertEqual(self.manager.get_storage_statistics(GPU_LEVEL)[0].available, 4)
+                # HELD pages are already included in available; do not subtract them again.
+                self.assertFalse(successor.resume(stream, capacity_hint=20))
+                self.assertFalse(successor.is_active)
+                with self.assertRaisesRegex(ValueError, "cannot be negative"):
+                    successor.resume(stream, capacity_hint=-1)
+                self.assertTrue(successor.resume(stream, capacity_hint=16))
+                self.assertTrue(successor.resize(16))
+            stream_holder.take_finish_event().synchronize()
+        finally:
+            for cache in reversed(caches):
+                if cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
+    def test_migrated_descendants_are_released_after_ancestor_eviction(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=1 << 20)
+        with TemporaryCudaStream([]) as holder:
+            stream = cast(CudaStream, holder.handle)
+            for scope, length in enumerate((16, 8, 16), start=1):
+                tokens = [TokenId(i) for i in range(scope * 100, scope * 100 + length)]
+                cache = self.manager.create_kv_cache(
+                    ReuseScope(salt=scope),
+                    expected_prompt_length=length,
+                    custom_priority_callback=lambda ordinal, lifecycle: ordinal,
+                )
+                try:
+                    self.assertTrue(cache.resume(stream))
+                    self.assertTrue(cache.resize(length, length))
+                    cache.commit(tokens)
+                    cache.stop_committing()
+                finally:
+                    cache.close()
+        holder.take_finish_event().synchronize()
+        # Scope1's ancestors reach host first. Admitting scope3 evicts them
+        # while the descendants are in the GPU->host migration batch. Those
+        # orphaned descendants must not regain ownership in the host LRU.
+        self.manager.clear_reusable_blocks()
+        for level in (GPU_LEVEL, CacheLevel(1)):
+            for stat in self.manager.get_storage_statistics(level):
+                self.assertEqual(stat.evictable, 0)
+                self.assertEqual(stat.free, stat.total)
+        self.manager.shutdown()
+
+    def test_full_host_does_not_block_droppable_gpu_pages(self) -> None:
+        self.prepare(8 << 20, 8 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=1 << 20)
+        self.assertEqual(self.manager.get_storage_statistics(GPU_LEVEL)[0].total, 4)
+        self.assertEqual(self.manager.get_storage_statistics(CacheLevel(1))[0].total, 4)
+        caches = []
+        scopes = [ReuseScope(salt=i) for i in range(4)]
+        prompts = [[TokenId(i) for i in range(n)] for n in (16, 8, 8)]
+        try:
+            with TemporaryCudaStream([]) as holder:
+                stream = cast(CudaStream, holder.handle)
+                for index, tokens in enumerate(prompts):
+                    cache = self.manager.create_kv_cache(
+                        scopes[index], custom_priority_callback=lambda ordinal, lifecycle: 0
+                    )
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(stream))
+                    self.assertTrue(cache.resize(len(tokens), len(tokens)))
+                    cache.commit(tokens)
+                    cache.stop_committing()
+                    cache.suspend()
+                # The first cache is now held in host memory. The second is
+                # held ahead of the third in the GPU eviction queue.
+                caches[2].close()
+                host = self.manager.get_storage_statistics(CacheLevel(1))[0]
+                self.assertEqual(host.unavailable, host.total)
+                self.assertEqual(host.available, 0)
+                target = self.manager.create_kv_cache(scopes[3])
+                caches.append(target)
+                self.assertTrue(target.resume(stream))
+                self.assertTrue(target.resize(4, 4))
+                # Only the unowned cache may be dropped to make room.
+                self.assertEqual(self.manager.probe_reuse(scopes[0], prompts[0]), 16)
+                self.assertEqual(self.manager.probe_reuse(scopes[1], prompts[1]), 8)
+                self.assertEqual(caches[0].num_committed_tokens, 16)
+                self.assertEqual(caches[1].num_committed_tokens, 8)
+                target.close()
+                caches[1].close()
+                self.assertTrue(caches[0].resume(stream))
+            holder.take_finish_event().synchronize()
+        finally:
+            for cache in reversed(caches):
+                if cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
+    @parameterized.expand([(count, decoding) for count in (0, 1, 2) for decoding in (False, True)])
+    def test_full_host_resume_preserves_other_held_prefix(
+        self, droppable_blocks: int, decoding: bool
+    ) -> None:
+        self.cfg = create_config(4, 8 << 20, 8 << 20, 0, 1, None, 0, 1 << 20)
+        self.cfg.max_util_for_resume = 1.0
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+        caches = []
+        prompts = []
+        try:
+            with TemporaryCudaStream([]) as holder:
+                stream = cast(CudaStream, holder.handle)
+                lengths = [16, (4 - droppable_blocks) * 4]
+                if droppable_blocks:
+                    lengths.append(droppable_blocks * 4)
+                for index, length in enumerate(lengths):
+                    tokens = [TokenId(index * 100 + i) for i in range(length)]
+                    prompts.append(tokens)
+                    cache = self.manager.create_kv_cache(
+                        ReuseScope(salt=index + 1),
+                        custom_priority_callback=lambda ordinal, lifecycle: 0,
+                    )
+                    caches.append(cache)
+                    self.assertTrue(cache.resume(stream))
+                    self.assertTrue(cache.resize(length, length))
+                    self.engine.execute([Step(cache, tokens, [])], stream)
+                    cache.commit(tokens)
+                    cache.stop_committing()
+                    cache.suspend()
+                if droppable_blocks:
+                    caches[2].close()
+                holder.synchronize()
+                self.assertEqual(self.manager.get_storage_statistics(CacheLevel(1))[0].free, 0)
+                admitted = caches[0].resume(stream, is_decoding=decoding)
+                self.assertEqual(admitted, droppable_blocks > 0)
+                self.assertEqual(self.manager.probe_reuse(ReuseScope(salt=1), prompts[0]), 16)
+                self.assertEqual(
+                    self.manager.probe_reuse(ReuseScope(salt=2), prompts[1]), len(prompts[1])
+                )
+                if admitted:
+                    self.engine.execute([Step(caches[0], [], prompts[0])], stream)
+                    caches[0].suspend()
+                    self.assertTrue(caches[1].resume(stream))
+                    self.engine.execute([Step(caches[1], [], prompts[1])], stream)
+                else:
+                    caches[1].close()
+                    self.assertTrue(caches[0].resume(stream, is_decoding=decoding))
+                    self.engine.execute([Step(caches[0], [], prompts[0])], stream)
+            holder.take_finish_event().synchronize()
+        finally:
+            for cache in reversed(caches):
+                if cache.status != _KVCache.Status.CLOSED:
+                    cache.close()
+
     def test_create_kv_cache_accepts_sequence_input_tokens(self) -> None:
         self.prepare(8 << 20, 0, 0, 2, None, 0, tokens_per_block=4, kv_buf_size=1024)
         prompt = [self.next_token() for _ in range(8)]

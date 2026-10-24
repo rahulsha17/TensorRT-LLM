@@ -956,10 +956,10 @@ class ExecutionController:
         self._queue.put(publication)
         return publication
 
-    def _poll_one_fence(self) -> None:
+    def _poll_one_fence(self) -> bool:
         with self._lock:
             if not self._pending_fences:
-                return
+                return False
             request = next(iter(self._pending_fences))
             fence = self._pending_fences.pop(request)
             self._pending_fences[request] = fence
@@ -974,17 +974,20 @@ class ExecutionController:
                 if not fence._future.done():
                     fence._future.set_exception(error)
                 self._pending_fences.pop(request, None)
+            return True
         else:
             if receipt is not None:
                 with self._lock:
                     if not fence._future.done():
                         fence._future.set_result(receipt)
                     self._pending_fences.pop(request, None)
+                return True
+            return False
 
-    def _poll_one_alignment(self) -> None:
+    def _poll_one_alignment(self) -> bool:
         with self._lock:
             if not self._pending_alignments:
-                return
+                return False
             request = next(iter(self._pending_alignments))
             aligned = self._pending_alignments.pop(request)
             self._pending_alignments[request] = aligned
@@ -999,20 +1002,32 @@ class ExecutionController:
                 if not aligned._future.done():
                     aligned._future.set_exception(error)
                 self._pending_alignments.pop(request, None)
+            return True
         else:
             if receipt is not None:
                 with self._lock:
                     if not aligned._future.done():
                         aligned._future.set_result(receipt)
                     self._pending_alignments.pop(request, None)
+                return True
+            return False
 
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
-                self._poll_one_fence()
-                self._poll_one_alignment()
+                fence_done = self._poll_one_fence()
+                alignment_done = self._poll_one_alignment()
                 with self._lock:
-                    timeout = 0.01 if self._pending_fences or self._pending_alignments else None
+                    pending = max(len(self._pending_fences), len(self._pending_alignments))
+                    # Drain ready receipts without an idle delay, but check the
+                    # publication queue after every pair of lifecycle polls.
+                    # Pending work still sleeps; bounded polling keeps many
+                    # scopes from multiplying a single scope's polling period.
+                    timeout = (
+                        (0.0 if fence_done or alignment_done else max(0.001, 0.01 / pending))
+                        if pending
+                        else None
+                    )
                 try:
                     publication = self._queue.get(timeout=timeout)
                 except Empty:

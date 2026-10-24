@@ -19,7 +19,7 @@ from ...execution_gate import ExecutionAuthorityError
 from ...execution_mailbox import WorkerVersionTable
 from ...execution_version import ExecutionVersion
 from .execution_alignment import KVAlignmentAdapter
-from .execution_device import DeviceExecutionAuthority
+from .execution_device import DeviceExecutionAuthority, DeviceVersionCheckTicket
 from .execution_early_exit import (
     ExecutionEarlyExit,
     early_exit_scope,
@@ -33,6 +33,7 @@ from .sampler import SampleStateTorch, TorchSampler
 from .scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
+    from ...runtime.kv_cache_manager_v2 import _KVCache
     from .py_executor import BatchState, PyExecutor
 
 __all__ = ["ExecutionDeviceGuard"]
@@ -43,6 +44,26 @@ class _RequestUse:
     # Retain identity even if a native request or sequence slot is recycled.
     request: LlmRequest
     event: torch.cuda.Event | None
+
+
+@dataclass
+class _ContextOwner:
+    request: LlmRequest
+    request_id: int
+    version: ExecutionVersion
+    allocation: "_KVCache"
+    frontier: int
+    rejected: bool = False
+
+
+@dataclass
+class _ContextChunk:
+    owner: _ContextOwner
+    start: int
+    end: int
+    ticket: DeviceVersionCheckTicket
+    row: int
+    cursor_advanced: bool = False
 
 
 class ExecutionDeviceGuard:
@@ -110,6 +131,7 @@ class ExecutionDeviceGuard:
             raise ValueError("TRTLLM_RETIRE_EARLY_EXIT must be 0 or 1")
         self._early_exit_enabled = early_exit == "1"
         self.validate_executor(executor, tensor_parallel=rank_consensus is not None)
+        self._model_engine = executor.model_engine
         self._speculative_tokens_per_step = (
             executor.model_engine.original_max_draft_len + 1
             if is_private_ngram(getattr(executor.model_engine, "spec_config", None))
@@ -133,9 +155,21 @@ class ExecutionDeviceGuard:
         )
         self._kv_manager = executor.kv_cache_manager if executor._is_kv_manager_v2 else None
         self._v1_manager = None if executor._is_kv_manager_v2 else executor.kv_cache_manager
-        self._alignment_adapter = KVAlignmentAdapter(executor)
+        self._alignment_adapter = KVAlignmentAdapter(executor, keep_resident=rank_consensus is None)
         self._uses: dict[int, _RequestUse] = {}
         self._kv_frontiers: dict[int, int] = {}
+        self._async_context = bool(
+            self._native_kv_guards
+            and rank_consensus is None
+            and not executor.disable_overlap_scheduler
+            and not executor.enable_joint_kv_cache_reuse
+            and executor.drafter is None
+            and not executor.model_engine.is_spec_decode
+            and self._kv_manager is not None
+            and self._kv_manager.supports_execution_context_overlap()
+        )
+        self._context_owners: dict[int, _ContextOwner] = {}
+        self._context_chunks: dict[int, list[_ContextChunk]] = {}
         table.bind_device_publisher(self.device)
         table.drain_tracker = RequestDrainTracker()
         table.alignment_state = WorkerAlignmentState(
@@ -144,6 +178,17 @@ class ExecutionDeviceGuard:
             if self._admission_source
             else lambda: None,
             prepare=self._prepare_prefix,
+        )
+        if self._kv_manager is not None and rank_consensus is None:
+            self._kv_manager._execution_resident_recovery = self._has_resident_recovery
+
+    def _has_resident_recovery(self, request: LlmRequest) -> bool:
+        state = self.table.alignment_state
+        version = request.py_execution_version
+        return (
+            version is not None
+            and state is not None
+            and state.has_resident_recovery(version, request.py_request_id)
         )
 
     def _prepare_prefix(self, alignment: AlignmentRequest) -> None:
@@ -272,6 +317,9 @@ class ExecutionDeviceGuard:
             )
             if prefix_length is not None:
                 request.execution_reuse_limit = prefix_length
+            pending_prefix = state.pending_recovery_prefix(version, request.py_request_id)
+            request.py_execution_recovery_pending = pending_prefix is not None
+            request.py_execution_recovery_tokens = pending_prefix or 0
 
     def revoke_obsolete_requests(self, requests: list[LlmRequest]) -> list[LlmRequest]:
         """Stop scheduling old work, keeping slots until the normal result drain.
@@ -429,13 +477,25 @@ class ExecutionDeviceGuard:
             state = self.table.alignment_state
             if state is not None:
                 for request in requests:
-                    state.confirm_attachment(
+                    attached = state.confirm_attachment(
                         request.py_execution_version,
                         request.py_request_id,
                         request.prepopulated_prompt_len,
                     )
+                    if attached and self._rank_consensus is None and self._kv_manager is not None:
+                        # The agreed depth constrains the initial handoff, not
+                        # later local recomputation. Keeping it (including 0)
+                        # discards reuse of this successor's newly committed KV
+                        # after preemption. Native radix matching still checks
+                        # every token and the salt/adapter namespace. Retain the
+                        # common cap for distributed workers until they can
+                        # coordinate a new depth on recompute admission.
+                        # Keep the immutable native agreement for auditing;
+                        # only the local V2 lookup adapter consumes this flag.
+                        request.py_execution_reuse_attached = True
             for request in requests:
                 self._kv_frontiers.setdefault(id(request), request.prepopulated_prompt_len)
+            context_chunks = self._snapshot_context(batch)
         self._coordinate(entry_phase, all_requests, [True] * len(all_requests))
 
         def wholly_obsolete() -> bool:
@@ -478,7 +538,11 @@ class ExecutionDeviceGuard:
 
         with (
             self._completing_step("forward_done", all_requests, allow_early_exit=True),
-            self.device.submission(),
+            self.device.submission(
+                capture_possible=getattr(
+                    getattr(self, "_model_engine", None), "forward_may_capture", True
+                )
+            ),
             early_exit_scope(
                 wholly_obsolete
                 if self._rank_consensus is None
@@ -501,6 +565,14 @@ class ExecutionDeviceGuard:
             try:
                 yield
                 completed = True
+                if context_chunks:
+                    ticket = self.device.enqueue_check(
+                        tuple(owner.version for owner, _, _ in context_chunks)
+                    )
+                    for row, (owner, start, end) in enumerate(context_chunks):
+                        self._context_chunks.setdefault(id(owner.request), []).append(
+                            _ContextChunk(owner, start, end, ticket, row)
+                        )
             finally:
                 if requests:
                     self._record_uses(requests)
@@ -516,6 +588,109 @@ class ExecutionDeviceGuard:
         event.record()
         for request in requests:
             self._uses[id(request)] = _RequestUse(request, event)
+
+    def _uses_async_context(self, request: LlmRequest) -> bool:
+        return bool(
+            getattr(self, "_async_context", False)
+            and request.py_execution_version is not None
+            and not request.is_dummy_request
+            and getattr(request, "py_multimodal_data", None) is None
+        )
+
+    def _current_context_owner(self, request: LlmRequest) -> _ContextOwner | None:
+        owner = getattr(self, "_context_owners", {}).get(id(request))
+        if (
+            owner is not None
+            and owner.request is request
+            and owner.request_id == request.py_request_id
+            and owner.version == request.py_execution_version
+            and self._kv_manager.kv_cache_map.get(owner.request_id) is owner.allocation
+        ):
+            return owner
+        return None
+
+    def _owns_context_allocation(self, request: LlmRequest) -> bool:
+        return (
+            id(request) not in getattr(self, "_context_owners", {})
+            or self._current_context_owner(request) is not None
+        )
+
+    def _snapshot_context(self, batch: ScheduledRequests) -> list[tuple[_ContextOwner, int, int]]:
+        snapshots = []
+        for request in batch.context_requests:
+            if not self._uses_async_context(request):
+                continue
+            cache = self._kv_manager.kv_cache_map.get(request.py_request_id)
+            if cache is None or not cache.is_active:
+                raise RuntimeError("context forward has no active KV allocation")
+            owner = self._current_context_owner(request)
+            if owner is None:
+                owner = _ContextOwner(
+                    request,
+                    request.py_request_id,
+                    request.py_execution_version,
+                    cache,
+                    request.prepopulated_prompt_len,
+                )
+                self._context_owners[id(request)] = owner
+                # A new allocation only owns its acquired prefix. Old receipts
+                # retain their own owner until completion and cannot retarget it.
+                self._kv_frontiers[id(request)] = owner.frontier
+            start = request.context_current_position
+            end = start + request.context_chunk_size
+            if owner.rejected or not (owner.frontier <= start < end <= request.prompt_len):
+                raise RuntimeError("context submission has no valid contiguous frontier")
+            snapshots.append((owner, start, end))
+        return snapshots
+
+    def _settle_context_receipts(
+        self, request: LlmRequest, *, block: bool = False, abandon: bool = False
+    ) -> None:
+        chunks = getattr(self, "_context_chunks", {}).get(id(request), [])
+        while chunks:
+            chunk = chunks[0]
+            # A completed receipt can precede the host cursor update. Keep it
+            # until that update succeeds, or until drained terminal cleanup.
+            if not chunk.cursor_advanced and not abandon:
+                break
+            if not block and not chunk.ticket.query():
+                break
+            allowed = chunk.ticket.wait()
+            if (
+                len(allowed) != len(chunk.ticket.versions)
+                or chunk.ticket.versions[chunk.row] != chunk.owner.version
+            ):
+                raise RuntimeError("context receipt has no complete identity verdict")
+            owner = self._current_context_owner(request)
+            if owner is chunk.owner and chunk.cursor_advanced:
+                if not allowed[chunk.row]:
+                    owner.rejected = True
+                    self._cancel(request)
+                elif not owner.rejected:
+                    if chunk.start != owner.frontier:
+                        raise RuntimeError("context receipt leaves an unproven KV gap")
+                    owner.frontier = chunk.end
+                    self._kv_frontiers[id(request)] = max(
+                        self._kv_frontiers.get(id(request), 0), chunk.end
+                    )
+            chunks.pop(0)
+        if not chunks:
+            getattr(self, "_context_chunks", {}).pop(id(request), None)
+
+    def _publish_context_frontier(self, request: LlmRequest, *, drained: bool = False) -> None:
+        owner = self._current_context_owner(request)
+        if (
+            owner is None
+            or not owner.allocation.is_active
+            or not owner.allocation.is_commit_allowed
+        ):
+            return
+        if owner.frontier <= owner.allocation.num_committed_tokens:
+            return
+        # A receipt covers its own forward only. A newer overlap forward may
+        # still read this allocation, so receipt completion alone cannot rebase.
+        if drained or self._wait_for_use(request, required=True, block=False):
+            self._kv_manager.preserve_execution_context(request, owner.frontier, owner.allocation)
 
     @contextmanager
     def sampling(self, batch: ScheduledRequests) -> Iterator[None]:
@@ -581,6 +756,8 @@ class ExecutionDeviceGuard:
                     device_allowed = ticket.wait().allowed
                     if len(device_allowed) != len(requests):
                         raise RuntimeError("sampling step has no complete device commit verdict")
+                for request in requests:
+                    self._settle_context_receipts(request)
                 host_allowed = authority.enter_context(self.table.guard_versions(versions))
             allowed = self._coordinate(
                 "token_commit",
@@ -592,6 +769,9 @@ class ExecutionDeviceGuard:
                     if not allowed_row:
                         self._cancel(request)
                     elif request.py_execution_version is not None and not request.is_finished:
+                        owner = self._current_context_owner(request)
+                        if owner is not None and owner.frontier < request.prompt_len:
+                            raise RuntimeError("token acceptance requires proven completed context")
                         drafts = tuple(request.py_draft_tokens or ())
                         if len(drafts) >= getattr(self, "_speculative_tokens_per_step", 1):
                             raise RuntimeError("draft proposal exceeds the configured RETIRE step")
@@ -621,21 +801,35 @@ class ExecutionDeviceGuard:
                             raise RuntimeError(
                                 "accepted tokens do not match the verified draft prefix"
                             )
-                    # The new sample has no KV yet; its accepted input does.
-                    self._kv_frontiers[id(request)] = after - 1
-        # V2 rebasing drains the latest reader outside host authority. All ranks
-        # finish preservation, or report failure, before another model step.
+                    # Recompute can drain and release KV before the overlapped
+                    # sampler result is consumed. Accept that token, but do not
+                    # recreate a frontier for the released allocation. A later
+                    # forward starts its own frontier from the acquired prefix.
+                    if id(request) in self._kv_frontiers and self._owns_context_allocation(request):
+                        # The new sample has no KV yet; its accepted input does.
+                        self._kv_frontiers[id(request)] = after - 1
+        # V2 rebasing requires a drained reader. A single rank can defer
+        # publication while an overlapped forward runs: ALIGN and release
+        # drain and publish its accepted frontier before acquiring or freeing KV.
+        # Multi-rank publication keeps a common, blocking completion boundary.
         with self._completing_step("token_prefix_done", requests):
             for request, _, _ in accepted:
-                frontier = self._kv_frontiers.get(id(request), 0)
+                frontier = self._kv_frontiers.get(id(request))
+                if frontier is None or not self._owns_context_allocation(request):
+                    continue
+                self._publish_context_frontier(request)
                 if self._kv_manager is not None and self._kv_manager.needs_execution_prefix_commit(
                     request, frontier
                 ):
-                    self._wait_for_use(request, required=True)
-                    self._kv_manager.preserve_execution_prefix(request, frontier)
+                    if self._wait_for_use(
+                        request, required=True, block=self._rank_consensus is not None
+                    ):
+                        self._kv_manager.preserve_execution_prefix(request, frontier)
 
     @contextmanager
-    def context_commit(self, batch: ScheduledRequests) -> Iterator[ScheduledRequests]:
+    def context_commit(
+        self, batch: ScheduledRequests, *, publish: bool = False
+    ) -> Iterator[ScheduledRequests]:
         """Guard context progress and V2 prefix publication without changing sampler row order."""
         if self._rank_consensus is None and not any(
             r.py_execution_version is not None for r in batch.context_requests
@@ -646,12 +840,22 @@ class ExecutionDeviceGuard:
             with self._preparing_step("context_commit"):
                 requests = batch.context_requests
                 versions = [request.py_execution_version for request in requests]
+                # Eligibility belongs to the captured allocation. The ordinary
+                # cursor update can clear multimodal metadata or finish a row.
+                asynchronous = {
+                    id(r) for r in requests if id(r) in getattr(self, "_context_owners", {})
+                }
+                for request in requests:
+                    if id(request) in asynchronous:
+                        self._settle_context_receipts(request)
+                        if publish:
+                            self._publish_context_frontier(request)
                 if self._native_kv_guards:
                     # Complete native KV writes before accepting their frontier;
                     # publication stays unlocked during every device wait.
                     events = {}
                     for request, version in zip(requests, versions):
-                        if version is None:
+                        if version is None or id(request) in asynchronous:
                             continue
                         use = self._uses.get(id(request))
                         if use is None or use.request is not request or use.event is None:
@@ -668,6 +872,30 @@ class ExecutionDeviceGuard:
                 for request in requests:
                     if id(request) in rejected:
                         self._cancel(request)
+                advancing = []
+                if publish:
+                    # Ordinary V2 updates derive their commit end from the
+                    # scheduling cursor. Async rows publish explicit receipts.
+                    rejected |= asynchronous
+                else:
+                    for request in requests:
+                        if (
+                            id(request) not in asynchronous
+                            or id(request) in rejected
+                            or request.is_finished
+                        ):
+                            continue
+                        owner = self._current_context_owner(request)
+                        chunks = [
+                            chunk
+                            for chunk in self._context_chunks.get(id(request), [])
+                            if chunk.owner is owner
+                            and not chunk.cursor_advanced
+                            and chunk.start == request.context_current_position
+                        ]
+                        if len(chunks) != 1:
+                            raise RuntimeError("context progress has no unique submitted receipt")
+                        advancing.append(chunks[0])
                 accepted = copy(batch)
                 accepted.context_requests_chunking = [
                     r for r in batch.context_requests_chunking if id(r) not in rejected
@@ -676,22 +904,41 @@ class ExecutionDeviceGuard:
                     r for r in batch.context_requests_last_chunk if id(r) not in rejected
                 ]
                 yield accepted
+                for chunk in advancing:
+                    if chunk.owner.request.context_current_position != chunk.end:
+                        raise RuntimeError("context cursor did not advance to its submitted end")
+                    chunk.cursor_advanced = True
                 for request in accepted.context_requests:
-                    if request.py_execution_version is not None and not request.is_finished:
+                    if (
+                        request.py_execution_version is not None
+                        and not request.is_finished
+                        and id(request) not in asynchronous
+                    ):
                         self._kv_frontiers[id(request)] = max(
                             self._kv_frontiers.get(id(request), 0), request.context_current_position
                         )
 
-    def _wait_for_use(self, request: LlmRequest, *, required: bool = False) -> None:
+    def _wait_for_use(
+        self, request: LlmRequest, *, required: bool = False, block: bool = True
+    ) -> bool:
         use = self._uses.get(id(request))
         if use is None and not required:
-            return
+            return True
         if use is None or use.request is not request or use.event is None:
             raise RuntimeError("request GPU completion is unknown; refusing KV mutation or release")
+        if not block and not use.event.query():
+            return False
         self.device.wait_event(use.event)
+        return True
 
     def _settle_prefix(self, request: LlmRequest) -> None:
         self._wait_for_use(request, required=id(request) in self._kv_frontiers)
+        self._settle_context_receipts(request, block=True, abandon=True)
+        self._publish_context_frontier(request, drained=True)
+        if not self._owns_context_allocation(request):
+            # The old GPU use has drained, but its accepted frontier does not
+            # authorize publishing or freezing a replacement cache.
+            return
         if request.py_execution_version is None:
             return
         if self._v1_manager is not None:
@@ -703,9 +950,15 @@ class ExecutionDeviceGuard:
         elif self._kv_manager is not None:
             # Retain accepted progress if revocation won the race against the
             # ordinary V2 commit. The latest GPU use has completed above.
-            self._kv_manager.preserve_execution_prefix(
-                request, self._kv_frontiers.get(id(request), 0)
-            )
+            cache = self._kv_manager.kv_cache_map.get(request.py_request_id)
+            if cache is not None and cache.is_active:
+                self._kv_manager.preserve_execution_prefix(
+                    request, self._kv_frontiers.get(id(request), 0)
+                )
+            # Recompute admission can already have dropped this cache and
+            # rewound its context cursor. Its old accepted frontier is not
+            # evidence for a new allocation. Suspended caches likewise retain
+            # only their existing committed prefix; do not restore them here.
             self._kv_manager.stop_request_committing(request)
 
     def before_release(self, request: LlmRequest) -> None:
@@ -721,6 +974,8 @@ class ExecutionDeviceGuard:
             self._wait_for_use(request)
         self._uses.pop(id(request), None)
         self._kv_frontiers.pop(id(request), None)
+        getattr(self, "_context_owners", {}).pop(id(request), None)
+        getattr(self, "_context_chunks", {}).pop(id(request), None)
 
     @staticmethod
     def _cancel(request: LlmRequest) -> None:

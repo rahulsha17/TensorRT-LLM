@@ -48,6 +48,7 @@ class _StatsRequest:
     lora_task_id: int | None = None
     cache_salt: str | None = None
     cache_salt_id: int | None = None
+    execution_reuse_limit: int | None = None
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_encoder_init_state: bool = False

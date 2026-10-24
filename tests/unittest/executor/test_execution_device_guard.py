@@ -30,6 +30,289 @@ VERSION = ExecutionVersion("tenant", "scope", 7)
 NEXT = replace(VERSION, epoch=8)
 
 
+def test_short_device_wait_yields_to_publication_without_millisecond_delay(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = object.__new__(DeviceExecutionAuthority)
+    authority._lock = Lock()
+    authority._failure = None
+    clock = [0.0]
+    sleeps = []
+
+    def yield_to_publisher(delay):
+        assert authority._lock.acquire(blocking=False)
+        authority._lock.release()
+        sleeps.append(delay)
+        clock[0] += max(delay, 0.00005)
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", yield_to_publisher)
+    event = SimpleNamespace(query=lambda: clock[0] >= 0.0001)
+
+    authority.wait_event(event)
+
+    assert event.query()
+    assert 0 < clock[0] < 0.001
+    assert sleeps and max(sleeps) < 0.001
+    assert authority._failure is None
+
+
+def test_long_device_wait_backs_off_and_keeps_ownership_on_timeout(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = object.__new__(DeviceExecutionAuthority)
+    authority._lock = Lock()
+    authority._failure = None
+    clock = [0.0]
+    sleeps = []
+
+    def advance_time(delay):
+        sleeps.append(delay)
+        clock[0] += max(delay, 0.00005)
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", advance_time)
+    buffer = object()
+    use = module._PendingUse([buffer], SimpleNamespace(query=lambda: False))
+    authority._pending = [use]
+
+    with pytest.raises(TimeoutError, match="did not complete"):
+        authority._wait(use, timeout=0.003)
+
+    assert any(sleeps) and len(sleeps) < 32
+    assert authority._pending == [use]
+    assert use.tensors == [buffer]
+    assert isinstance(authority._failure, TimeoutError)
+    with pytest.raises(RuntimeError, match="restart required"):
+        authority.wait_event(SimpleNamespace(query=lambda: True))
+
+
+@pytest.mark.parametrize("wait_kind", ["model", "token_commit"])
+def test_slow_model_completion_keeps_ownership_and_publisher_access(monkeypatch, wait_kind):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = object.__new__(DeviceExecutionAuthority)
+    authority._lock = Lock()
+    authority._failure = None
+    clock = [0.0]
+    buffer = object()
+    event = SimpleNamespace(query=lambda: clock[0] >= 6.0)
+    use = module._PendingUse([buffer], event)
+    authority._pending = [use]
+    reads = []
+
+    def read_allowed():
+        assert event.query()
+        reads.append(clock[0])
+        return [True, False]
+
+    def advance_model(delay):
+        assert authority._lock.acquire(blocking=False)
+        authority._lock.release()
+        assert authority._pending == [use]
+        assert use.tensors == [buffer]
+        assert not reads
+        clock[0] += 0.5
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", advance_model)
+    if wait_kind == "model":
+        authority.wait_event(event)
+    else:
+        ticket = module.DeviceTokenCommitTicket(
+            authority,
+            (VERSION, NEXT),
+            (0, 1),
+            object(),
+            object(),
+            SimpleNamespace(tolist=read_allowed),
+            use,
+        )
+        result = ticket.wait()
+        assert result.allowed == [True, False]
+        assert result.tokens_device is ticket.tokens_device
+        assert result.tokens_host is ticket.tokens_host
+        assert reads == [6.0]
+    assert event.query()
+    assert clock[0] == 6.0
+    assert authority._failure is None
+
+
+@pytest.mark.parametrize("failure_source", ["publisher", "event"])
+def test_slow_device_wait_still_fails_closed_on_failure(monkeypatch, failure_source):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = object.__new__(DeviceExecutionAuthority)
+    authority._lock = Lock()
+    authority._failure = None
+    clock = [0.0]
+    buffer = object()
+    error = RuntimeError("injected device failure")
+
+    def query():
+        if failure_source == "event" and clock[0] >= 6.0:
+            raise error
+        return False
+
+    use = module._PendingUse([buffer], SimpleNamespace(query=query))
+    authority._pending = [use]
+
+    def advance_model(delay):
+        assert authority._lock.acquire(blocking=False)
+        try:
+            clock[0] += 0.5
+            if failure_source == "publisher" and clock[0] >= 6.0:
+                authority._failure = error
+        finally:
+            authority._lock.release()
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module.time, "sleep", advance_model)
+    message = "restart required" if failure_source == "publisher" else "injected device failure"
+    with pytest.raises(RuntimeError, match=message):
+        authority._wait(use)
+    assert clock[0] == 6.0
+    assert authority._pending == [use]
+    assert use.tensors == [buffer]
+    assert authority._failure is not None
+    with pytest.raises(RuntimeError, match="restart required"):
+        authority.wait_event(SimpleNamespace(query=lambda: True))
+
+
+@pytest.fixture
+def attention_metadata(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = object.__new__(DeviceExecutionAuthority)
+    authority.device = "cuda:0"
+    authority._lock = Lock()
+    authority._failure = None
+    authority._ready = object()
+    authority._published = {("tenant", "scope"): (VERSION.epoch, object())}
+    authority._slots = {("tenant", "scope"): 0}
+    authority._start_use = Mock(side_effect=lambda tensors: module._PendingUse(tensors))
+    authority._record = Mock()
+    stream = SimpleNamespace(cuda_stream=17, wait_event=Mock())
+    monkeypatch.setattr(module.torch.cuda, "current_stream", lambda device: stream)
+    monkeypatch.setattr(module.torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(module.torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(module, "prefer_pinned", lambda: False)
+    uploads = Mock(side_effect=lambda values, **kwargs: tuple(values))
+    monkeypatch.setattr(module.torch, "tensor", uploads)
+    slots = SimpleNamespace(numel=lambda: 4, dtype=module.torch.int32, copy_=Mock())
+    expected = SimpleNamespace(dtype=module.torch.int64, copy_=Mock())
+    rows = module.DeviceAttentionRows(authority, slots, expected, object(), stream.cuda_stream)
+    return authority, rows, stream, uploads
+
+
+def test_stable_attention_metadata_joins_publication_without_another_upload(attention_metadata):
+    authority, rows, stream, uploads = attention_metadata
+    authority.prepare_attention_rows(rows, [VERSION, None])
+    rows.slots.copy_.assert_called_once_with((0, -1, -1, -1), non_blocking=True)
+    publication = object()
+    authority._published[("tenant", "scope")] = (NEXT.epoch, publication)
+    authority.prepare_attention_rows(rows, [VERSION, None])
+    assert uploads.call_count == 2
+    assert authority._record.call_count == 1
+    stream.wait_event.assert_called_with(publication)
+    # Expected identities stay stale so the kernel can reject the old request.
+    assert rows._versions == (VERSION, None, None, None)
+    authority.prepare_attention_rows(rows, [None, NEXT])
+    rows.slots.copy_.assert_called_with((-1, 0, -1, -1), non_blocking=True)
+    rows.expected.copy_.assert_called_with((0, NEXT.epoch, 0, 0), non_blocking=True)
+    authority.prepare_attention_rows(rows, [None])
+    rows.slots.copy_.assert_called_with((-1, -1, -1, -1), non_blocking=True)
+    rows.expected.copy_.assert_called_with((0, 0, 0, 0), non_blocking=True)
+    assert uploads.call_count == 6
+
+
+@pytest.mark.parametrize("invalid_submission", ["stream", "capture"])
+def test_cached_attention_metadata_still_checks_submission_context(
+    attention_metadata, monkeypatch, invalid_submission
+):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority, rows, stream, uploads = attention_metadata
+    authority.prepare_attention_rows(rows, [VERSION])
+    if invalid_submission == "stream":
+        stream.cuda_stream += 1
+        message = "cannot move between"
+    else:
+        monkeypatch.setattr(module.torch.cuda, "is_current_stream_capturing", lambda: True)
+        message = "outside capture"
+    with pytest.raises(RuntimeError, match=message):
+        authority.prepare_attention_rows(rows, [VERSION])
+    assert uploads.call_count == 2
+
+
+def test_stable_token_metadata_keeps_publication_waits_and_inflight_ownership(monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = object.__new__(DeviceExecutionAuthority)
+    authority.device = "cuda:0"
+    authority._token_metadata_key = None
+    authority._token_metadata = None
+    authority._ready = object()
+    publication = object()
+    authority._published = {("tenant", "scope"): (VERSION.epoch, publication)}
+    authority._slots = {("tenant", "scope"): 0}
+    stream = SimpleNamespace(cuda_stream=17, wait_event=Mock())
+    monkeypatch.setattr(module.torch.cuda, "current_stream", lambda device: stream)
+    uploads = []
+
+    def upload(values, dtype, use):
+        tensor = object()
+        uploads.append((values, dtype))
+        use.tensors.append(tensor)
+        return tensor
+
+    authority._upload = upload
+    first = module._PendingUse([])
+    original = authority._token_inputs([VERSION, None], [2, 0], first)
+    assert len(uploads) == 3
+    next_publication = object()
+    authority._published[("tenant", "scope")] = (NEXT.epoch, next_publication)
+    second = module._PendingUse([])
+    assert authority._token_inputs([VERSION, None], [2, 0], second) is original
+    assert len(uploads) == 3
+    stream.wait_event.assert_called_with(next_publication)
+    assert all(tensor in second.tensors for tensor in original)
+    # A successor has a new expected epoch even when it recycles the same slots.
+    successor = authority._token_inputs([NEXT, None], [2, 0], module._PendingUse([]))
+    assert successor is not original
+    assert len(uploads) == 6
+    assert all(tensor in first.tensors and tensor in second.tensors for tensor in original)
+
+
+@pytest.mark.parametrize("change", ["slots", "row_order", "stream", "tenant", "scope"])
+def test_token_metadata_does_not_alias_other_rows_or_streams(monkeypatch, change):
+    from tensorrt_llm._torch.pyexecutor import execution_device as module
+
+    authority = object.__new__(DeviceExecutionAuthority)
+    authority.device = "cuda:0"
+    authority._token_metadata_key = None
+    authority._token_metadata = None
+    authority._input_values = Mock(return_value=([0, -1], [VERSION.epoch, 0]))
+    authority._upload = Mock(side_effect=lambda values, dtype, use: object())
+    stream = SimpleNamespace(cuda_stream=17)
+    monkeypatch.setattr(module.torch.cuda, "current_stream", lambda device: stream)
+    versions, slots = [VERSION, None], [2, 0]
+    before = authority._token_inputs(versions, slots, module._PendingUse([]))
+    if change == "slots":
+        slots.reverse()
+    elif change == "row_order":
+        versions.reverse()
+    elif change == "stream":
+        stream.cuda_stream = 18
+    elif change == "tenant":
+        versions[0] = replace(VERSION, tenant_id="other")
+    else:
+        versions[0] = replace(VERSION, scope_id="other")
+    after = authority._token_inputs(versions, slots, module._PendingUse([]))
+    assert after is not before
+    assert authority._upload.call_count == 6
+
+
 def _request(version=VERSION):
     request = SimpleNamespace(
         py_request_id=42,
@@ -70,7 +353,7 @@ def guard(monkeypatch):
     result.table = WorkerVersionTable("session")
     result.table.apply(VersionUpdate("session", 1, VERSION))
     result.device = Mock()
-    result.device.submission.side_effect = nullcontext
+    result.device.submission.side_effect = lambda *, capture_possible=True: nullcontext()
     result._uses = {}
     result._kv_frontiers = {}
     result._early_exit_enabled = True
@@ -89,6 +372,376 @@ def _batch(*requests, context=False):
     else:
         batch.generation_requests = list(requests)
     return batch
+
+
+def _async_context_fixture(guard, *, prompt_len=12, chunk_size=4):
+    request = _request()
+    request.prompt_len = prompt_len
+    request.context_remaining_length = prompt_len
+    request.context_chunk_size = chunk_size
+    request.is_dummy_request = False
+    request.num_tokens = prompt_len
+    cache = SimpleNamespace(is_active=True, is_commit_allowed=True, num_committed_tokens=0)
+    guard._async_context = guard._native_kv_guards = True
+    guard._context_owners = {}
+    guard._context_chunks = {}
+    guard._kv_manager.kv_cache_map = {request.py_request_id: cache}
+    receipts = []
+
+    def enqueue(versions):
+        ticket = Mock(versions=tuple(versions))
+        ticket.query.return_value = False
+        ticket.wait.return_value = [True] * len(versions)
+        receipts.append(ticket)
+        return ticket
+
+    guard.device.enqueue_check.side_effect = enqueue
+    return request, cache, receipts
+
+
+def _advance_async_context(guard, request):
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        pass
+    with guard.context_commit(batch) as accepted:
+        assert accepted.context_requests == [request]
+        request.context_current_position += request.context_chunk_size
+        request.context_remaining_length = request.prompt_len - request.context_current_position
+    return batch
+
+
+@pytest.mark.parametrize(
+    "exit_kind", ["success", "early_exit", "partial_failure", "receipt_failure"]
+)
+def test_async_context_guard_retains_readers_and_only_receipts_full_forwards(guard, exit_kind):
+    from tensorrt_llm._torch.pyexecutor.execution_early_exit import ExecutionEarlyExit
+
+    request, _, receipts = _async_context_fixture(guard)
+    if exit_kind == "receipt_failure":
+        guard.device.enqueue_check.side_effect = RuntimeError("receipt submission failed")
+    error = None
+    try:
+        with guard.forward(_batch(request, context=True)):
+            if exit_kind == "early_exit":
+                raise ExecutionEarlyExit("layer", 1, 4)
+            if exit_kind == "partial_failure":
+                raise ValueError("partial forward")
+    except (ExecutionEarlyExit, ValueError, RuntimeError) as caught:
+        error = caught
+    assert (error is None) is (exit_kind == "success")
+    assert len(receipts) == int(exit_kind == "success")
+    assert len(guard._context_chunks.get(id(request), [])) == int(exit_kind == "success")
+    assert guard._uses[id(request)].event is not None
+    assert guard._kv_frontiers[id(request)] == 0
+    guard.device.wait_event.assert_not_called()
+
+
+def test_async_context_guard_advances_cpu_cursor_without_waiting_or_publishing(guard):
+    request, cache, receipts = _async_context_fixture(guard)
+    batch = _advance_async_context(guard, request)
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.kv_cache_manager = guard._kv_manager
+    executor.enable_joint_kv_cache_reuse = False
+    executor._update_v2_context_resources(batch)
+    accepted = guard._kv_manager.update_context_resources.call_args.args[0]
+    assert accepted.context_requests == []
+    assert batch.context_requests == [request]
+    assert request.context_current_position == 4
+    assert guard._kv_frontiers[id(request)] == cache.num_committed_tokens == 0
+    receipts[0].wait.assert_not_called()
+    guard.device.wait_event.assert_not_called()
+    guard._kv_manager.preserve_execution_context.assert_not_called()
+
+
+def test_async_context_guard_keeps_completed_receipt_until_cursor_update(guard):
+    request, _, receipts = _async_context_fixture(guard)
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        pass
+    receipts[0].query.return_value = True
+    guard._settle_context_receipts(request)
+    assert len(guard._context_chunks[id(request)]) == 1
+    assert guard._kv_frontiers[id(request)] == 0
+    with guard.context_commit(batch):
+        request.context_current_position = 4
+    guard._settle_context_receipts(request)
+    assert guard._kv_frontiers[id(request)] == 4
+    assert id(request) not in guard._context_chunks
+
+
+def test_async_context_guard_settles_chunks_in_order_without_later_reader_rebase(guard):
+    request, cache, receipts = _async_context_fixture(guard)
+    _advance_async_context(guard, request)
+    batch = _advance_async_context(guard, request)
+    receipts[1].query.return_value = True
+    guard._settle_context_receipts(request)
+    assert guard._kv_frontiers[id(request)] == 0
+    receipts[1].wait.assert_not_called()
+    receipts[0].query.return_value = True
+    guard._uses[id(request)].event.query.return_value = False
+    with guard.context_commit(batch, publish=True) as accepted:
+        assert accepted.context_requests == []
+    assert guard._kv_frontiers[id(request)] == 8
+    assert id(request) not in guard._context_chunks
+    guard._kv_manager.preserve_execution_context.assert_not_called()
+    guard._uses[id(request)].event.query.return_value = True
+    guard._publish_context_frontier(request)
+    guard._kv_manager.preserve_execution_context.assert_called_once_with(request, 8, cache)
+
+
+@pytest.mark.parametrize("fault", ["gpu_reject", "gap", "identity", "query", "copy"])
+def test_async_context_guard_rejects_unproven_or_failed_receipts(guard, fault):
+    request, _, receipts = _async_context_fixture(guard)
+    _advance_async_context(guard, request)
+    _advance_async_context(guard, request)
+    for ticket in receipts:
+        ticket.query.return_value = True
+    if fault == "gpu_reject":
+        receipts[0].wait.return_value = [False]
+        guard._settle_context_receipts(request)
+        assert request.is_finished
+        assert guard._context_owners[id(request)].rejected
+        assert id(request) not in guard._context_chunks
+    else:
+        if fault == "gap":
+            guard._context_chunks[id(request)][0].start = 1
+        elif fault == "identity":
+            receipts[0].versions = (NEXT,)
+        elif fault == "query":
+            receipts[0].query.side_effect = RuntimeError("query failed")
+        else:
+            receipts[0].wait.side_effect = RuntimeError("copy failed")
+        with pytest.raises(RuntimeError):
+            guard._settle_context_receipts(request)
+        assert len(guard._context_chunks[id(request)]) == 2
+    assert guard._kv_frontiers[id(request)] == 0
+    guard._kv_manager.preserve_execution_context.assert_not_called()
+
+
+@pytest.mark.parametrize("changed", ["allocation", "request_id", "version"])
+def test_async_context_guard_never_retargets_an_old_receipt(guard, changed):
+    request, _, receipts = _async_context_fixture(guard)
+    _advance_async_context(guard, request)
+    old_owner = guard._context_owners[id(request)]
+    if changed == "request_id":
+        request.py_request_id += 1
+    elif changed == "version":
+        request.py_execution_version = NEXT
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+    replacement = SimpleNamespace(is_active=True, is_commit_allowed=True, num_committed_tokens=0)
+    guard._kv_manager.kv_cache_map[request.py_request_id] = replacement
+    request.context_current_position = request.prepopulated_prompt_len = 0
+    _advance_async_context(guard, request)
+    assert guard._context_owners[id(request)] is not old_owner
+    receipts[0].query.return_value = True
+    guard._settle_context_receipts(request)
+    assert guard._kv_frontiers[id(request)] == 0
+    assert len(guard._context_chunks[id(request)]) == 1
+    guard._publish_context_frontier(request)
+    guard._kv_manager.preserve_execution_context.assert_not_called()
+
+
+@pytest.mark.parametrize("revoke_at", ["before_cursor", "after_cursor"])
+def test_async_context_guard_revision_retains_only_accepted_completed_progress(guard, revoke_at):
+    request, cache, receipts = _async_context_fixture(guard, chunk_size=7)
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        pass
+    if revoke_at == "before_cursor":
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+    with guard.context_commit(batch) as accepted:
+        if accepted.context_requests:
+            request.context_current_position = 7
+    if revoke_at == "after_cursor":
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+    receipts[0].query.return_value = True
+    guard.before_release(request)
+    if revoke_at == "after_cursor":
+        guard._kv_manager.preserve_execution_context.assert_called_once_with(request, 7, cache)
+    else:
+        guard._kv_manager.preserve_execution_context.assert_not_called()
+    assert not guard._context_chunks and not guard._context_owners
+    assert id(request) not in guard._uses and id(request) not in guard._kv_frontiers
+
+
+@pytest.mark.parametrize("failure", ["reader", "receipt", "publication"])
+def test_async_context_guard_failed_release_retains_owner_and_receipts(guard, failure):
+    request, _, receipts = _async_context_fixture(guard)
+    _advance_async_context(guard, request)
+    if failure == "reader":
+        guard.device.wait_event.side_effect = RuntimeError("reader incomplete")
+    elif failure == "receipt":
+        receipts[0].wait.side_effect = RuntimeError("receipt incomplete")
+    else:
+        guard._kv_manager.preserve_execution_context.side_effect = RuntimeError("commit failed")
+    with pytest.raises(RuntimeError):
+        guard.before_release(request)
+    assert id(request) in guard._uses and id(request) in guard._context_owners
+    assert id(request) in guard._kv_frontiers
+    assert (id(request) in guard._context_chunks) is (failure != "publication")
+    guard._kv_manager.stop_request_committing.assert_not_called()
+
+
+@pytest.mark.parametrize("proof", ["ready", "pending", "rejected", "released"])
+def test_async_context_guard_requires_context_proof_before_accepting_first_token(guard, proof):
+    request, _, receipts = _async_context_fixture(guard, prompt_len=4, chunk_size=4)
+    _advance_async_context(guard, request)
+    if proof == "released":
+        guard.before_release(request)
+        guard._kv_manager.kv_cache_map.clear()
+    else:
+        receipts[0].query.return_value = proof != "pending"
+        receipts[0].wait.return_value = [proof != "rejected"]
+    if proof == "pending":
+        with pytest.raises(RuntimeError, match="proven completed context"):
+            with guard.token_commit(_state(request, allowed=[True])):
+                pytest.fail("must reject before token mutation")
+        assert request.num_tokens == 4
+    else:
+        with guard.token_commit(_state(request, allowed=[True])):
+            if not request.is_finished:
+                request.num_tokens += 1
+        if proof == "ready":
+            assert guard._kv_frontiers[id(request)] == 4
+        elif proof == "released":
+            assert id(request) not in guard._kv_frontiers
+        else:
+            assert request.is_finished and request.num_tokens == 4
+
+
+@pytest.mark.parametrize("reason", ["disabled", "untagged", "dummy", "multimodal"])
+def test_async_context_guard_keeps_unsupported_request_fallbacks(guard, reason):
+    request, _, receipts = _async_context_fixture(guard)
+    if reason == "disabled":
+        guard._async_context = False
+    elif reason == "untagged":
+        request.py_execution_version = None
+    elif reason == "dummy":
+        request.is_dummy_request = True
+    else:
+        request.py_multimodal_data = {"input": object()}
+    _advance_async_context(guard, request)
+    assert not receipts
+    assert guard.device.wait_event.call_count == int(reason != "untagged")
+
+
+def test_async_context_guard_cleanup_never_publishes_or_freezes_a_replacement(guard):
+    request, _, receipts = _async_context_fixture(guard)
+    _advance_async_context(guard, request)
+    receipts[0].query.return_value = True
+    guard._settle_context_receipts(request)
+    assert guard._kv_frontiers[id(request)] == 4
+    replacement = SimpleNamespace(is_active=True, is_commit_allowed=True, num_committed_tokens=0)
+    guard._kv_manager.kv_cache_map[request.py_request_id] = replacement
+    guard.before_release(request)
+    guard._kv_manager.preserve_execution_context.assert_not_called()
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    guard._kv_manager.stop_request_committing.assert_not_called()
+    assert id(request) not in guard._uses
+
+
+def test_async_context_guard_multimodal_metadata_cleanup_cannot_change_publication_mode(guard):
+    request, _, receipts = _async_context_fixture(guard)
+    request.py_multimodal_data = {"input": object()}
+    batch = _advance_async_context(guard, request)
+    request.py_multimodal_data = None
+    with guard.context_commit(batch, publish=True) as accepted:
+        assert accepted.context_requests == [request]
+    assert not receipts
+
+
+def test_async_context_guard_executor_advances_last_chunk_before_device_completion(guard):
+    request, _, receipts = _async_context_fixture(guard, prompt_len=4, chunk_size=4)
+    request.will_complete_next_iteration = lambda: False
+
+    def move():
+        request.context_current_position = 4
+        request.context_remaining_length = 0
+
+    request.move_to_next_context_chunk = move
+    batch = _batch(request, context=True)
+    with guard.forward(batch):
+        pass
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.dist = SimpleNamespace(cp_config={})
+    executor.active_requests = []
+    executor.disable_overlap_scheduler = False
+    executor.kv_cache_manager = guard._kv_manager
+    executor.enable_joint_kv_cache_reuse = False
+    executor._update_request_states(batch)
+    executor._update_v2_context_resources(batch)
+    assert request.state == LlmRequestState.GENERATION_IN_PROGRESS
+    assert request.context_current_position == 4
+    assert request.py_last_context_chunk == (0, 4)
+    assert guard._kv_frontiers[id(request)] == 0
+    receipts[0].wait.assert_not_called()
+    guard.device.wait_event.assert_not_called()
+
+
+@pytest.mark.parametrize("fallback", [None, "native", "overlap", "joint", "layout"])
+def test_async_context_guard_constructor_selects_only_supported_executor(fallback, monkeypatch):
+    executor = _executor()
+    executor.device_id = 0
+    executor._is_kv_manager_v2 = True
+    executor.disable_overlap_scheduler = fallback == "overlap"
+    executor.enable_joint_kv_cache_reuse = fallback == "joint"
+    executor.kv_cache_manager.supports_execution_context_overlap = lambda: fallback != "layout"
+    executor.executor_request_queue = Mock()
+    executor.model_engine.execution_attention = (
+        None if fallback == "native" else SimpleNamespace(authority=Mock())
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.execution_guard.DeviceExecutionAuthority", Mock()
+    )
+    guard = ExecutionDeviceGuard(executor, WorkerVersionTable("session"))
+    assert guard._async_context is (fallback is None)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_async_context_guard_fence_requires_receipt_and_resource_drain(guard, failed):
+    request, _, receipts = _async_context_fixture(guard)
+    tracker = guard.table.drain_tracker = RequestDrainTracker()
+    tracker.enqueue(VERSION, lambda: request.py_request_id)
+    _advance_async_context(guard, request)
+    if failed:
+        receipts[0].wait.side_effect = RuntimeError("receipt completion failed")
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.resource_manager = Mock()
+    executor._prefetched_request_ids = {request.py_request_id}
+    executor._disagg_coordinator = Mock()
+    executor.gather_all_responses = True
+    executor.result_wait_queues = {request.py_request_id: object()}
+
+    def free(req):
+        assert req is request
+        assert not tracker.drained(VERSION)
+
+    executor.resource_manager.free_resources.side_effect = free
+    if failed:
+        with pytest.raises(RuntimeError, match="receipt completion failed"):
+            executor._do_terminate_request(request)
+        executor.resource_manager.free_resources.assert_not_called()
+        assert request.py_request_id in executor.result_wait_queues
+    else:
+        executor._do_terminate_request(request)
+        executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert tracker.drained(VERSION) is (not failed)
+
+
+def test_async_context_guard_alignment_drains_then_publishes_accepted_partial_context(guard):
+    request, cache, receipts = _async_context_fixture(guard, chunk_size=7)
+    _advance_async_context(guard, request)
+    order = []
+    guard.device.wait_event.side_effect = lambda event: order.append("reader")
+    receipts[0].wait.side_effect = lambda: order.append("receipt") or [True]
+    guard._kv_manager.preserve_execution_context.side_effect = lambda *args: order.append("publish")
+    guard._prepare_prefix(SimpleNamespace(revision=SimpleNamespace(expected_version=VERSION)))
+    assert order == ["reader", "receipt", "publish"]
+    guard._kv_manager.preserve_execution_context.assert_called_once_with(request, 7, cache)
+    guard._kv_manager.stop_request_committing.assert_called_once_with(request)
 
 
 @pytest.mark.parametrize(
@@ -504,7 +1157,8 @@ def test_retired_sample_does_not_decrement_reused_sequence_slot() -> None:
     assert sampler._pending_steps == [0, 0, 4]
 
 
-def test_model_submission_excludes_publisher_cuda_calls(monkeypatch) -> None:
+@pytest.mark.parametrize("capture_possible", [False, True])
+def test_model_submission_excludes_publisher_cuda_calls(monkeypatch, capture_possible) -> None:
     authority = object.__new__(DeviceExecutionAuthority)
     authority._lock = Lock()
     authority._failure = None
@@ -526,17 +1180,88 @@ def test_model_submission_excludes_publisher_cuda_calls(monkeypatch) -> None:
 
     worker = Thread(target=publish)
     try:
-        with authority.submission():
+        with authority.submission(capture_possible=capture_possible):
             worker.start()
             assert started.wait(2)
-            assert not finished.wait(0.05)
-            cuda_calls.assert_not_called()
+            if capture_possible:
+                assert not finished.wait(0.05)
+                cuda_calls.assert_not_called()
+            else:
+                assert finished.wait(2)
+                cuda_calls.assert_called_once_with(None)
     finally:
         if worker.ident is not None:
             worker.join(timeout=2)
     assert finished.is_set()
     assert not errors
     cuda_calls.assert_called_once_with(None)
+
+
+@pytest.mark.parametrize("may_capture", [False, True, None])
+def test_forward_submission_uses_engine_capture_contract(guard, may_capture):
+    guard._model_engine = (
+        SimpleNamespace()
+        if may_capture is None
+        else SimpleNamespace(forward_may_capture=may_capture)
+    )
+    with guard.forward(_batch(_request())):
+        pass
+    guard.device.submission.assert_called_once_with(
+        capture_possible=True if may_capture is None else may_capture
+    )
+
+
+@pytest.mark.parametrize(
+    "capture_source",
+    [
+        None,
+        "warmup",
+        "compile",
+        "backend",
+        "breakable",
+        "missing_graph",
+        "graph",
+        "callback",
+        "engine",
+        "runner",
+    ],
+)
+def test_model_engine_capture_contract_is_conservative(capture_source):
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+    from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+
+    engine = object.__new__(PyTorchModelEngine)
+    runner = object.__new__(DecoderRunner)
+    engine._runner = runner
+    engine._is_warmup = capture_source == "warmup"
+    engine.torch_compile_config = object() if capture_source == "compile" else None
+    runner._torch_compile_backend = object() if capture_source == "backend" else None
+    runner.breakable_cuda_graph_runner = object() if capture_source == "breakable" else None
+    runner.cuda_graph_runner = SimpleNamespace(_capture_allowed=capture_source == "graph")
+    if capture_source == "missing_graph":
+        runner.cuda_graph_runner = None
+    runner.forward_pass_callable = object() if capture_source == "callback" else None
+    if capture_source == "engine":
+
+        class CustomEngine(PyTorchModelEngine):
+            pass
+
+        custom = object.__new__(CustomEngine)
+        custom.__dict__.update(engine.__dict__)
+        engine = custom
+    elif capture_source == "runner":
+
+        class CustomRunner(DecoderRunner):
+            pass
+
+        custom = object.__new__(CustomRunner)
+        custom.__dict__.update(runner.__dict__)
+        engine._runner = custom
+
+    assert engine.forward_may_capture is (capture_source is not None)
+    # The same engine must re-enter exclusion when capture is enabled later.
+    runner.cuda_graph_runner = SimpleNamespace(_capture_allowed=True)
+    assert engine.forward_may_capture
 
 
 def test_event_record_failure_prevents_release(guard, monkeypatch) -> None:
@@ -739,8 +1464,33 @@ def test_tp_guard_binds_exact_membership_and_only_source_wakes(monkeypatch, rank
     consensus = ExecutionStepConsensus("session", rank, (0, 1), Mock())
     guard = ExecutionDeviceGuard(executor, table, consensus)
     assert guard.is_distributed
+    assert not hasattr(executor.kv_cache_manager, "_execution_resident_recovery")
     table.alignment_state._wake()
     assert executor.executor_request_queue.wake_alignment.call_count == int(rank == 0)
+
+
+def test_resident_owner_query_is_bound_to_the_installed_worker_state():
+    executor = _executor()
+    executor._is_kv_manager_v2 = True
+    executor.executor_request_queue = Mock()
+    executor.model_engine.execution_attention = SimpleNamespace(authority=Mock())
+    table = WorkerVersionTable("session")
+    installed = ExecutionDeviceGuard(executor, table)
+    request = SimpleNamespace(py_execution_version=VERSION, py_request_id=19)
+    table.alignment_state.has_resident_recovery = Mock(return_value=True)
+    manager = executor.kv_cache_manager
+    assert KVCacheManagerV2.has_execution_resident_recovery(manager, request)
+    table.alignment_state.has_resident_recovery.assert_called_once_with(VERSION, 19)
+    request.py_execution_version = None
+    assert not KVCacheManagerV2.has_execution_resident_recovery(manager, request)
+    assert table.alignment_state.has_resident_recovery.call_count == 1
+    assert installed.table is table
+
+
+def test_resident_owner_query_is_false_without_an_execution_authority():
+    manager = SimpleNamespace()
+    request = SimpleNamespace(py_execution_version=VERSION, py_request_id=19)
+    assert not KVCacheManagerV2.has_execution_resident_recovery(manager, request)
 
 
 @pytest.mark.parametrize(
@@ -1070,6 +1820,74 @@ def test_resume_handoff_before_common_forward_boundary(guard, v2, overlap, mode,
 
 
 @pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("prefix", [0, 4])
+def test_consumed_resume_cap_allows_local_v2_recompute_reuse(guard, v2, prefix):
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.bindings.executor import SamplingConfig
+    from tensorrt_llm.execution_alignment import (
+        AlignmentInput,
+        AlignmentRequest,
+        WorkerAlignmentState,
+    )
+    from tensorrt_llm.execution_authority import Revision
+
+    if not v2:
+        guard._kv_manager = None
+    hold = Mock(num_tokens=prefix)
+    state = guard.table.alignment_state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    guard.table.drain_tracker = RequestDrainTracker()
+    revised = AlignmentInput(tuple(range(13)), cache_salt="cache")
+    alignment = AlignmentRequest("session", Revision("edit", VERSION, NEXT), revised)
+    guard.table.apply(VersionUpdate("session", 2, NEXT, alignment))
+    state.process()
+    receipt = guard.table.poll_alignment(alignment)
+    guard.table.apply(VersionUpdate("session", 3, NEXT, alignment, receipt, prefix))
+    request = LlmRequest(
+        request_id=42,
+        client_id=142,
+        max_new_tokens=4,
+        input_tokens=list(revised.input_token_ids),
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        cache_salt="cache",
+        execution_version=NEXT,
+    )
+    guard.validate_successor(request)
+    assert request.execution_reuse_limit == prefix
+    assert request.py_execution_recovery_pending
+    assert request.py_execution_recovery_tokens == prefix
+    assert not getattr(request, "py_execution_reuse_attached", False)
+    # A mismatched first attachment must preserve the original constraint.
+    request.set_prepopulated_prompt_len(prefix + 1, 4)
+    with pytest.raises(RuntimeError, match="agreed KV prefix"):
+        with guard.forward(_batch(request, context=True)):
+            pytest.fail("the initial agreed depth must still be enforced")
+    assert request.execution_reuse_limit == prefix
+    assert not getattr(request, "py_execution_reuse_attached", False)
+    hold.close.assert_not_called()
+
+    request.set_prepopulated_prompt_len(prefix, 4)
+    with guard.forward(_batch(request, context=True)):
+        assert request.execution_reuse_limit == prefix
+        assert getattr(request, "py_execution_reuse_attached", False) == v2
+    hold.close.assert_called_once()
+    # The C++ contract stays immutable, including a zero-token agreement.
+    with pytest.raises(TypeError, match="incompatible function arguments"):
+        request.execution_reuse_limit = None
+    with pytest.raises(RuntimeError, match="Execution reuse limit cannot change"):
+        request.execution_reuse_limit = 1 if prefix == 0 else 0
+    # A later replay can acquire additional content-matched, committed KV.
+    request.set_prepopulated_prompt_len(12, 4)
+    with guard.forward(_batch(request, context=True)):
+        pass
+    hold.close.assert_called_once()
+    assert state.pending_prefix_length(NEXT, request.py_request_id) == 0
+    assert state.pending_recovery_prefix(NEXT, request.py_request_id) is None
+    guard.table.apply(VersionUpdate("session", 4, replace(NEXT, epoch=9)))
+    assert guard.revoke_obsolete_requests([request]) == [request]
+
+
+@pytest.mark.parametrize("v2", [False, True])
 def test_eager_idle_iteration_drains_finished_revision(monkeypatch, v2) -> None:
     """The final revoked request must not need another GPU batch to drain."""
     from unittest.mock import MagicMock
@@ -1122,6 +1940,150 @@ def test_eager_idle_iteration_drains_finished_revision(monkeypatch, v2) -> None:
     assert not executor.active_requests
     executor._handle_responses.assert_called_once_with(terminal_only=True)
     assert executor._event_loop_completed
+
+
+@pytest.mark.parametrize("v2", [False, True])
+@pytest.mark.parametrize("revoked", [False, True])
+@pytest.mark.parametrize("early_emit", [False, True])
+def test_overlap_idle_iteration_drains_terminal_request(monkeypatch, v2, revoked, early_emit):
+    """Cancellation must free memory without waiting for a new model batch."""
+    executor, terminal, live = _idle_overlap_executor(monkeypatch, v2, early_emit)
+    terminal.is_finished = revoked
+    executor._execution_guard = object() if revoked else None
+
+    def cancel():
+        terminal.is_finished = True
+
+    def drain(*, terminal_only):
+        assert terminal_only and terminal.is_finished
+        executor.active_requests.remove(terminal)
+        executor._enqueue_responses([terminal])
+        return [terminal]
+
+    executor._handle_canceled_requests.side_effect = cancel
+    executor._handle_responses.side_effect = drain
+    PyExecutor._executor_loop_overlap(executor)
+
+    assert executor.active_requests == [live]
+    executor._handle_canceled_requests.assert_called_once_with()
+    executor._handle_responses.assert_called_once_with(terminal_only=True)
+    expected = [([terminal],)]
+    if early_emit:
+        expected.insert(0, ([],))
+    assert [call.args for call in executor._enqueue_responses.call_args_list] == expected
+    executor._process_previous_batch.assert_not_called()
+    assert executor._event_loop_completed
+
+
+@pytest.mark.parametrize("pending_previous", [False, True])
+def test_overlap_idle_peer_does_not_release_local_batch(monkeypatch, pending_previous):
+    """A rank waiting for its peers still owns its scheduled resources."""
+    executor, terminal, live = _idle_overlap_executor(monkeypatch, True, False)
+    previous = object() if pending_previous else None
+    executor.previous_batch = previous
+    executor._can_queue.return_value = (False, True)
+
+    PyExecutor._executor_loop_overlap(executor)
+
+    assert executor.previous_batch is previous
+    assert executor.active_requests == [terminal, live]
+    executor._handle_canceled_requests.assert_not_called()
+    executor._handle_responses.assert_not_called()
+    executor._process_previous_batch.assert_not_called()
+    executor._enqueue_responses.assert_called_once_with([])
+
+
+def test_overlap_empty_batch_consumes_final_sample_before_release(monkeypatch):
+    """Capacity deferral must drain the final sample without another forward."""
+    executor, terminal, live = _idle_overlap_executor(monkeypatch, True, False)
+    terminal.is_finished = False
+    sample = object()
+    scheduled = ScheduledRequests()
+    scheduled.generation_requests = [terminal]
+    previous = SimpleNamespace(
+        sample_state=sample,
+        scheduled_requests=scheduled,
+    )
+    executor.previous_batch = previous
+    executor.speculation_gate = None
+    executor._send_kv_async = Mock()
+    executor._commit_kv_cache_stats = Mock()
+    order = []
+
+    def accept(state):
+        assert state is sample and terminal in executor.active_requests
+        terminal.is_finished = True
+        order.append("accepted")
+
+    def release():
+        assert terminal.is_finished and order == ["accepted"]
+        executor.active_requests.remove(terminal)
+        order.append("released")
+
+    executor._update_requests = Mock(side_effect=accept)
+    executor._process_previous_batch.side_effect = release
+
+    PyExecutor._executor_loop_overlap(executor)
+
+    assert order == ["accepted", "released"]
+    assert executor.active_requests == [live]
+    assert executor.previous_batch is None
+    executor._update_requests.assert_called_once_with(sample)
+    executor._process_previous_batch.assert_called_once_with()
+    executor._handle_responses.assert_not_called()
+    assert executor._event_loop_completed
+
+
+def _idle_overlap_executor(monkeypatch, v2, early_emit):
+    from unittest.mock import MagicMock
+
+    for name in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
+        monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{name}", Mock())
+    terminal = SimpleNamespace(is_finished=True)
+    live = SimpleNamespace(is_finished=False)
+    executor = SimpleNamespace(
+        device_id=0,
+        _profiler=lambda: nullcontext(Mock()),
+        hang_detector=MagicMock(),
+        enable_iter_perf_stats=False,
+        is_benchmark_disagg=False,
+        _resource_governor_enabled=False,
+        _is_kv_manager_v2=v2,
+        _can_pause_for_rebalance=lambda: False,
+        _mm_encoder_item_scheduling_enabled=False,
+        kv_connector_manager=None,
+        active_requests=[terminal, live],
+        iter_counter=0,
+        disagg=Mock(),
+        perf_manager=Mock(enabled=False),
+        previous_batch=None,
+        drafter=None,
+        enable_early_first_token_response=early_emit,
+    )
+    executor._prepare_and_schedule_batch = Mock(
+        side_effect=[(ScheduledRequests(), None), (None, None)]
+    )
+    executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+    executor._can_queue = Mock(return_value=(False, False))
+    for name in (
+        "_wait_for_model_engine_input_copy",
+        "_terminate_requests",
+        "_pause_requests",
+        "_release_unused_connector_reservations",
+        "_revert_gen_alloc",
+        "_finalize_adp_dummy_allocation",
+        "_kv_connector_terminate_requests",
+        "_flush_pending_transfer_responses",
+        "_flush_iter_stats_synced",
+        "_terminate_recompute_paused_requests",
+        "_pause_recompute_paused_requests",
+        "_handle_canceled_requests",
+        "_handle_responses",
+        "_enqueue_responses",
+        "_process_previous_batch",
+    ):
+        setattr(executor, name, Mock())
+    return executor, terminal, live
 
 
 def test_terminal_only_response_pass_preserves_live_request() -> None:
@@ -1709,8 +2671,8 @@ def test_ngram_verification_failure_cannot_preserve_candidate_kv(guard, fault, m
     request.num_tokens = 80
     request.context_remaining_length = 0
     request.py_draft_tokens = [101, 102, 103, 104]
-    request.get_token = (
-        lambda beam, position: 999 if fault == "wrong_token" else 101 + position - 80
+    request.get_token = lambda beam, position: (
+        999 if fault == "wrong_token" else 101 + position - 80
     )
     guard._kv_frontiers[id(request)] = 64
     if fault == "event_error":
@@ -1775,6 +2737,8 @@ def test_ngram_frontier_with_real_verification_and_early_finish(guard, matched, 
 
     sampler = SimpleNamespace(_force_num_accepted_tokens=0, finish_if_reason=finish)
     handler = TwoModelSpecDecHandler(sampler)
+    with guard.forward(_batch(request)):
+        pass
     with guard.token_commit(_state(request, allowed=[True])):
         request.py_num_accepted_draft_tokens = handler._process_draft_tokens_greedy(
             request,
@@ -1785,6 +2749,130 @@ def test_ngram_frontier_with_real_verification_and_early_finish(guard, matched, 
     assert len(tokens) == 80 + count
     assert guard._kv_frontiers[id(request)] == 80 + count - 1
     assert tokens[80:] == samples[:count]
+
+
+@pytest.mark.parametrize("settle", ["revision", "release"])
+def test_v2_decode_publication_defers_without_losing_the_accepted_frontier(guard, settle):
+    request = _request()
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    request.num_tokens = 80
+    with guard.forward(_batch(request)):
+        pass
+    latest = guard._uses[id(request)].event
+    latest.query.return_value = False
+    guard._kv_manager.needs_execution_prefix_commit.return_value = True
+
+    with guard.token_commit(_state(request, allowed=[True])):
+        request.num_tokens += 1
+
+    assert guard._kv_frontiers[id(request)] == 80
+    guard.device.wait_event.assert_not_called()
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    if settle == "revision":
+        guard.table.apply(VersionUpdate("session", 2, NEXT))
+        guard._prepare_prefix(SimpleNamespace(revision=SimpleNamespace(expected_version=VERSION)))
+    else:
+        guard.before_release(request)
+    guard.device.wait_event.assert_called_once_with(latest)
+    guard._kv_manager.preserve_execution_prefix.assert_called_once_with(request, 80)
+    guard._kv_manager.stop_request_committing.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize("cache_state", ["absent", "suspended"])
+def test_v2_recompute_cleanup_drains_without_publishing_an_old_frontier(guard, cache_state):
+    request = _request()
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    request.num_tokens = 81
+    with guard.forward(_batch(request)):
+        pass
+    latest = guard._uses[id(request)].event
+    guard._kv_frontiers[id(request)] = 80
+    cache = Mock(is_active=False)
+    other = Mock()
+    guard._kv_manager.kv_cache_map = {43: other}
+    if cache_state == "suspended":
+        guard._kv_manager.kv_cache_map[request.py_request_id] = cache
+    # The scheduler has rolled back the first context admission before the
+    # executor performs the remaining resource cleanup for recompute.
+    request.context_current_position = 0
+    request.context_remaining_length = 81
+
+    guard.before_release(request)
+
+    guard.device.wait_event.assert_called_once_with(latest)
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    guard._kv_manager.stop_request_committing.assert_called_once_with(request)
+    assert id(request) not in guard._uses
+    assert id(request) not in guard._kv_frontiers
+    assert other.mock_calls == []
+    assert cache.mock_calls == []
+    request.prepopulated_prompt_len = 16
+    with guard.forward(_batch(request)):
+        pass
+    assert guard._kv_frontiers[id(request)] == 16
+
+
+@pytest.mark.parametrize("cancel_after_consume", [False, True])
+def test_pending_token_after_recompute_release_cannot_restore_old_frontier(
+    guard, cancel_after_consume
+):
+    request = _request()
+    request.context_current_position = 64
+    request.context_remaining_length = 0
+    request.num_tokens = 80
+    with guard.forward(_batch(request)):
+        pass
+    with guard.sampling(_batch(request)):
+        state = _state(request, allowed=[True])
+    latest = guard._uses[id(request)].event
+    guard._kv_frontiers[id(request)] = 79
+    guard._kv_manager.kv_cache_map = {request.py_request_id: Mock(is_active=False)}
+
+    # The overlap executor frees a recompute victim before consuming the
+    # previous batch's sample, then resets the request's context cursor.
+    guard.before_release(request)
+    guard._kv_manager.kv_cache_map.clear()
+    guard.device.wait_event.assert_called_once_with(latest)
+    guard._kv_manager.needs_execution_prefix_commit.return_value = True
+    with guard.token_commit(state):
+        request.num_tokens += 1
+    assert request.num_tokens == 81
+    assert id(request) not in guard._kv_frontiers
+    assert id(request) not in guard._uses
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    request.context_current_position = 0
+    request.context_remaining_length = 81
+    if cancel_after_consume:
+        request.finish_by_reason(FinishReason.CANCELLED)
+    guard.before_release(request)
+    guard.device.wait_event.assert_called_once_with(latest)
+    if not cancel_after_consume:
+        request.prepopulated_prompt_len = 16
+        with guard.forward(_batch(request, context=True)):
+            pass
+        assert guard._kv_frontiers[id(request)] == 16
+
+
+def test_v2_active_cache_cleanup_still_rejects_an_invalid_frontier(guard):
+    request = _request()
+    request.context_current_position = 0
+    request.context_remaining_length = 64
+    with guard.forward(_batch(request)):
+        pass
+    guard._kv_frontiers[id(request)] = 64
+    guard._kv_manager.kv_cache_map = {request.py_request_id: Mock(is_active=True)}
+    guard._kv_manager.preserve_execution_prefix.side_effect = (
+        KVCacheManagerV2.preserve_execution_prefix.__get__(guard._kv_manager)
+    )
+
+    with pytest.raises(ValueError, match="completed frontier"):
+        guard.before_release(request)
+
+    guard._kv_manager.stop_request_committing.assert_not_called()
+    assert id(request) in guard._uses
+    assert guard._kv_frontiers[id(request)] == 64
 
 
 def test_v2_decode_commit_drains_latest_overlap_reader_without_locking_publisher(guard):
@@ -1968,7 +3056,7 @@ def _guard_group(template, size):
         local.table.apply(VersionUpdate("session", 1, VERSION))
         local.table.drain_tracker = RequestDrainTracker()
         local.device = Mock()
-        local.device.submission.side_effect = nullcontext
+        local.device.submission.side_effect = lambda *, capture_possible=True: nullcontext()
         local._uses = {}
         local._kv_frontiers = {}
         local._kv_manager = Mock()
@@ -1993,6 +3081,23 @@ def _all_rank_failure(guards, run):
 
     with ThreadPoolExecutor(max_workers=len(guards)) as pool:
         list(pool.map(attempt, range(len(guards))))
+
+
+def test_multi_rank_handoff_keeps_common_reuse_cap(guard):
+    guards = _guard_group(guard, 2)
+
+    def run(rank):
+        local = guards[rank]
+        local.table.alignment_state = Mock()
+        local.table.alignment_state.confirm_attachment.return_value = True
+        request = _request()
+        request.execution_reuse_limit = request.prepopulated_prompt_len = 4
+        with local.forward(_batch(request, context=True)):
+            pass
+        assert request.execution_reuse_limit == 4
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(run, range(2)))
 
 
 @pytest.mark.parametrize("size", [2, 4])
@@ -2116,8 +3221,11 @@ def test_rank_commit_body_failure_keeps_every_drain_unknown(guard, phase):
     def run(rank, local):
         request = _request()
         if phase == "prefix":
+            request.context_remaining_length = 0
+            request.num_tokens = 80
+            with local.forward(_batch(request)):
+                pass
             local._kv_manager.needs_execution_prefix_commit.return_value = True
-            local._uses[id(request)] = SimpleNamespace(request=request, event=Mock())
             if rank == 1:
                 local._kv_manager.preserve_execution_prefix.side_effect = RuntimeError(
                     "rebase failed"
@@ -2128,7 +3236,9 @@ def test_rank_commit_body_failure_keeps_every_drain_unknown(guard, phase):
             else local.token_commit(_state(request, allowed=[True]))
         )
         with commit:
-            if rank == 1 and phase != "prefix":
+            if phase == "prefix":
+                request.num_tokens += 1
+            elif rank == 1:
                 raise RuntimeError("host update failed")
 
     _all_rank_failure(guards, run)

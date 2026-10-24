@@ -63,8 +63,56 @@ def test_resume_limit_requires_receipt_and_cannot_change_on_retry():
         with pytest.raises(RuntimeError, match="cannot change"):
             state.authorize_resume(receipt, changed)
     assert state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None) == 2
+    assert state.pending_prefix_length(NEW, 10) == 2
+    assert state.pending_prefix_length(NEW, 11) == 0
+    state.confirm_attachment(NEW, 10, 2)
+    assert state.pending_prefix_length(NEW, 10) == 0
     state.close()
     state.process()
+
+
+@pytest.mark.parametrize("prefix", [0, 3])
+def test_pending_recovery_prefix_requires_a_current_claim(prefix):
+    request = AlignmentRequest("session", REVISION, INPUT)
+    state = WorkerAlignmentState(lambda _: Mock(num_tokens=prefix), lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    receipt = state.poll(request)
+    state.authorize_resume(receipt)
+    assert state.pending_prefix_length(NEW, 10) == 0
+    assert state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None) is None
+    assert state.pending_prefix_length(NEW, 10) == prefix
+    state.observe(replace(NEW, epoch=NEW.epoch + 1), None)
+    assert state.pending_prefix_length(NEW, 10) == 0
+    state.close()
+    state.process()
+
+
+@pytest.mark.parametrize("agreed_prefix", [None, 0, 3])
+def test_zero_prefix_recovery_distinguishes_a_pending_successor(agreed_prefix):
+    request = AlignmentRequest("session", REVISION, INPUT)
+    held_prefix = 0 if agreed_prefix is None else agreed_prefix
+    state = WorkerAlignmentState(lambda _: Mock(num_tokens=held_prefix), lambda: None)
+    state.observe(OLD, None)
+    assert state.pending_recovery_prefix(OLD, 10) is None
+    state.observe(NEW, request)
+    state.process()
+    receipt = state.poll(request)
+    assert state.pending_recovery_prefix(NEW, 10) is None
+    state.authorize_resume(receipt, agreed_prefix)
+    assert state.pending_recovery_prefix(NEW, 10) is None
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None)
+    assert state.pending_recovery_prefix(NEW, 10) == held_prefix
+    assert state.pending_recovery_prefix(NEW, 11) is None
+    assert state.pending_prefix_length(NEW, 10) == held_prefix
+    state.confirm_attachment(NEW, 10, held_prefix)
+    assert state.pending_recovery_prefix(NEW, 10) is None
+    assert state.pending_prefix_length(NEW, 10) == 0
+    state.observe(replace(NEW, epoch=NEW.epoch + 1), None)
+    assert state.pending_recovery_prefix(NEW, 10) is None
+    state.close()
+    state.process()
+    assert state.pending_recovery_prefix(NEW, 10) is None
 
 
 @pytest.fixture(params=["local", "ipc"])
@@ -89,6 +137,71 @@ def setup(request):
     # Unknown native completion intentionally retains ownership until restart.
     if state._unsafe_error is None:
         state.process()
+
+
+def test_resident_owner_hint_requires_a_live_claim_and_does_not_reserve_again():
+    request = AlignmentRequest("session", REVISION, INPUT)
+    hold = Mock(num_tokens=3, has_resident_prefix=True)
+    reserve = Mock(return_value=hold)
+    state = WorkerAlignmentState(reserve, lambda: None)
+    state.observe(OLD, None)
+    assert not state.has_resident_recovery(OLD, 10)
+    state.observe(NEW, request)
+    assert not state.has_resident_recovery(NEW, 10)
+    state.process()
+    assert not state.has_resident_recovery(NEW, 10)
+    state.authorize_resume(state.poll(request))
+    assert not state.has_resident_recovery(NEW, 10)
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None)
+    assert state.has_resident_recovery(NEW, 10)
+    assert not state.has_resident_recovery(NEW, 11)
+    assert not state.has_resident_recovery(OLD, 10)
+    hold.has_resident_prefix = False
+    assert not state.has_resident_recovery(NEW, 10)
+    assert state.pending_recovery_prefix(NEW, 10) == 3
+    hold.has_resident_prefix = True
+    assert state.has_resident_recovery(NEW, 10)
+    reserve.assert_called_once_with(INPUT)
+    state.close()
+    state.process()
+
+
+@pytest.mark.parametrize("invalidation", ["attachment", "revision", "terminal", "close"])
+def test_resident_owner_hint_ends_when_its_claim_is_invalidated(invalidation):
+    request = AlignmentRequest("session", REVISION, INPUT)
+    hold = Mock(num_tokens=3, has_resident_prefix=True)
+    state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    state.authorize_resume(state.poll(request))
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None)
+    assert state.has_resident_recovery(NEW, 10)
+    if invalidation == "attachment":
+        state.confirm_attachment(NEW, 10, 3)
+    elif invalidation == "revision":
+        state.observe(replace(NEW, epoch=9), None)
+    elif invalidation == "terminal":
+        state.terminal(NEW, 10)
+    else:
+        state.close()
+    assert not state.has_resident_recovery(NEW, 10)
+    state.close()
+    state.process()
+
+
+def test_resident_owner_hint_is_optional_for_a_valid_prefix_reservation():
+    request = AlignmentRequest("session", REVISION, INPUT)
+    hold = Mock(spec=["num_tokens", "settle", "close"], num_tokens=3)
+    state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    state.observe(NEW, request)
+    state.process()
+    state.authorize_resume(state.poll(request))
+    state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None)
+    assert state.pending_recovery_prefix(NEW, 10) == 3
+    assert not state.has_resident_recovery(NEW, 10)
+    state.confirm_attachment(NEW, 10, 3)
+    state.close()
+    state.process()
 
 
 def test_reserve_before_old_release_and_acknowledge_only_after_fence(setup):

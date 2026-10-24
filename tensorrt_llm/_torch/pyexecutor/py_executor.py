@@ -3853,7 +3853,7 @@ class PyExecutor:
     def _update_v2_context_resources(self, scheduled_batch) -> None:
         """Commit one context frontier to target and draft caches."""
         guard = getattr(self, '_execution_guard', None)
-        commit = (guard.context_commit(scheduled_batch)
+        commit = (guard.context_commit(scheduled_batch, publish=True)
                   if guard is not None else nullcontext(scheduled_batch))
         with commit as accepted_batch:
             self.kv_cache_manager.update_context_resources(accepted_batch)
@@ -5750,6 +5750,13 @@ class PyExecutor:
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
+                elif self.previous_batch is None and not can_queue_this_rank:
+                    # No sampler remains to consume on this rank. Terminal
+                    # requests must release their resources even when memory
+                    # pressure prevents another batch from running. This pass
+                    # joins the same response collective as the other branches.
+                    self._handle_canceled_requests()
+                    self._handle_responses(terminal_only=True)
                 else:
                     self._enqueue_responses([])
 

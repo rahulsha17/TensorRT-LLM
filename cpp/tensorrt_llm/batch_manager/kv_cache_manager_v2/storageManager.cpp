@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/batchedPageCopy.h"
+#include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -744,7 +745,15 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 {
     PageStatus s = page.status();
     CacheLevel lvl = level.value_or(page.cacheLevel);
-    return (s == PageStatus::DROPPABLE && page.isCommitted()) || (s == PageStatus::HELD && lvl < numCacheLevels() - 1);
+    if (s == PageStatus::HELD)
+        return lvl < numCacheLevels() - 1;
+    if (s != PageStatus::DROPPABLE || !page.isCommitted())
+        return false;
+    // Evicting an ancestor can detach a descendant while a migration batch
+    // still owns its page. Do not resurrect that unreachable page in an LRU:
+    // no tree walk can reclaim it, and it would pin storage until more pressure.
+    auto const& committed = static_cast<CommittedPage const&>(page);
+    return committed.block != nullptr && !committed.block->isOrphan() && committed.block->holdsPage(committed);
 }
 
 // ---------------------------------------------------------------------------
@@ -805,7 +814,55 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
     }
 
     PagesByLifeCycle fallenPages(numLifeCycles());
-    _prepareFreeSlots(goals, level, fallenPages, migrationRecorder, dropRecorder);
+    try
+    {
+        _prepareFreeSlots(goals, level, fallenPages, migrationRecorder, dropRecorder);
+    }
+    catch (OutOfPagesError const&)
+    {
+        // A held page at the front of an eviction queue may have no room in
+        // a lower tier. Unowned pages later in this tier can still satisfy the
+        // allocation without migrating or dropping any held page.
+        auto& controller = mLevels.at(level).controller;
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> droppable(numPoolGroups(level));
+        for (PoolGroupIndex pg{0}; pg < requirements.size(); ++pg)
+        {
+            SlotCount const free = poolGroup(level, pg).numFreeSlots();
+            SlotCount const needed = std::max(requirements.at(pg) - free, SlotCount{0});
+            auto nextPage = controller.pageGenerator(pg);
+            auto& selected = droppable.at(pg);
+            while (slotCountValueFromSize(selected.size()) < needed)
+            {
+                auto const* page = nextPage();
+                if (page == nullptr)
+                {
+                    // Check every pool before removing anything from a queue.
+                    throw;
+                }
+                if ((*page)->status() == PageStatus::DROPPABLE)
+                {
+                    selected.push_back(*page);
+                }
+            }
+        }
+
+        auto rollback = makeEvictionRollbackGuard(droppable);
+        for (auto const& pages : droppable)
+        {
+            for (auto const& page : pages)
+            {
+                excludeFromEviction(*page);
+            }
+            if (dropRecorder && !pages.empty())
+            {
+                dropRecorder(pages, level);
+            }
+        }
+        rollback.cancel();
+        // The eviction queues owned these unheld pages. Releasing the last
+        // references returns their slots with the existing CUDA ready events.
+        droppable.clear();
+    }
 }
 
 void StorageManager::forceEvict(
@@ -1079,10 +1136,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             for (auto const& page : pages)
             {
-                if (!isLast || page->status() != PageStatus::HELD)
-                {
-                    lvl.controller.scheduleForEviction(*page);
-                }
+                scheduleForEviction(*page);
             }
         }
     }

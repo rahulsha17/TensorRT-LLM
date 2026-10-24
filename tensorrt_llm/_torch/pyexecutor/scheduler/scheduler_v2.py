@@ -259,6 +259,21 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+        self._recovery_admission_streak = 0
+        self._resident_recovery_admission_streak = 0
+        self._handoff_repoll_available = True
+        self._context_retries: dict[int, tuple[LlmRequest, int, tuple[int, ...]]] = {}
+        self._recovery_drain_enabled = (
+            kv_cache_manager.enable_block_reuse
+            and kv_cache_manager.has_cache_tier_below_gpu
+            and kv_cache_manager.mapping.world_size == 1
+            and not self.has_cp_helix
+            and draft_kv_cache_manager is None
+            and cross_kv_cache_manager is None
+            and kv_cache_manager.kv_connector_manager is None
+            and kv_cache_manager._supports_dense_resume_capacity() is True
+        )
+        self._recovery_drain_passes = 0
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -317,6 +332,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+        blocked_generation = None
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -359,9 +375,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # empty and context requests with a different adapter could be
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
+        # Its KV ownership also drains when the final sample is consumed. A
+        # failed admission must not reclaim other owners before that cleanup.
+        pending_completion = False
         for req in requests_list:
             if req.state_value == self._gen_to_complete_state_value:
                 budget.pre_claim_peft(req)
+                pending_completion |= req.py_request_id in self.kv_cache_manager.kv_cache_map
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
@@ -448,8 +468,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     recompute_paused,
                     inflight_request_ids,
                     scheduled_beam_width,
+                    pending_completion=pending_completion,
                 )
                 if action is ScheduleAction.STOP:
+                    if budget.can_fit_tokens(
+                        req.get_beam_width_by_iter(for_next_iteration=False)
+                        + get_draft_token_length(req)
+                    ):
+                        blocked_generation = req
                     break
                 if action is ScheduleAction.SKIP:
                     req_it += 1
@@ -463,6 +489,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # itself a started context request still sits in pending_ctx, so
         # re-admitting it would spend the pages its own preemption released.
         preempted_ids: set[int] = set()
+        blocked_ctx: RequestList = []
+        promised_recovery_blocked = False
+        deferred_for_recovery = False
+        fresh_context_admitted = False
 
         def preempt_for_pages(req: LlmRequest) -> bool:
             """Free pages for `req` by giving up one started request.
@@ -473,11 +503,76 @@ class KVCacheV2Scheduler(RequestScheduler):
             the next pass, repeating without ever admitting it. The cost is
             one iteration of admission.
             """
+            nonlocal promised_recovery_blocked
+            blocked_ctx.append(req)
+            if req.py_request_id in promised_recovery_ids:
+                promised_recovery_blocked = True
+            if pending_completion:
+                return False
+            if self.kv_cache_manager.has_execution_residency:
+                # Try other contexts before context growth displaces a
+                # resident successor or an executing owner. Idle recovery can
+                # yield the optional locks after that scan finds no work.
+                return False
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
             return self._try_preempt_for_pages(
                 requests_list, protected, inflight_request_ids, recompute_paused, preempted_ids
+            )
+
+        recovery_ids: set[int] = set()
+        promised_recovery_ids: set[int] = set()
+        recovery_prefill_ids: set[int] = set()
+        for req in pending_ctx:
+            if req.state_value != self._context_init_state_value:
+                continue
+            if req.is_first_context_chunk:
+                if req.py_execution_recovery_pending or req.py_execution_recovery_tokens > 0:
+                    recovery_ids.add(req.py_request_id)
+                if self._recovery_drain_enabled and req.py_execution_recovery_tokens > 0:
+                    promised_recovery_ids.add(req.py_request_id)
+            elif req.py_execution_recovery_prefill:
+                recovery_prefill_ids.add(req.py_request_id)
+        retry_candidates = {
+            req.py_request_id
+            for req in pending_ctx
+            if self.kv_cache_manager.enable_block_reuse
+            and self.kv_cache_manager.has_cache_tier_below_gpu
+            and req.state_value == self._context_init_state_value
+            and req.is_first_context_chunk
+        }
+        if self._context_retries:
+            self._context_retries = {
+                key: value
+                for key, value in self._context_retries.items()
+                if key in retry_candidates
+            }
+        resident_recovery_ids: set[int] = set()
+        if recovery_ids or recovery_prefill_ids:
+            # Finish an admitted recovery prefill before admitting new contexts,
+            # including when no fresh recovery is waiting.
+            # Ordinary continuations retain arrival order within their class;
+            # new ordinary contexts lead after bounded recovery admissions.
+            prefer_recovery = self._recovery_admission_streak < 4
+            prefer_resident = self._resident_recovery_admission_streak < 4
+            resident_recovery_ids = (
+                {
+                    req.py_request_id
+                    for req in pending_ctx
+                    if req.py_request_id in recovery_ids
+                    and self.kv_cache_manager.has_execution_resident_recovery(req) is True
+                }
+                if self.kv_cache_manager.has_execution_residency
+                else set()
+            )
+            pending_ctx.sort(
+                key=lambda req: (
+                    req.py_request_id not in recovery_prefill_ids,
+                    (req.py_request_id in recovery_ids) != prefer_recovery,
+                    req.py_request_id in recovery_ids
+                    and ((req.py_request_id in resident_recovery_ids) != prefer_resident),
+                )
             )
 
         # --- Phase 2: schedule deferred context / encoder requests ---
@@ -511,6 +606,29 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 continue
             if req.py_request_id in preempted_ids:
+                continue
+            if (
+                promised_recovery_blocked
+                and self._recovery_drain_passes < self._RECOVERY_DRAIN_PASSES
+                and req.state_value == self._context_init_state_value
+                and req.is_first_context_chunk
+                and req.py_request_id not in resident_recovery_ids
+                and (scheduled_gen or scheduled_ctx)
+                and not (evicted or recompute_paused)
+            ):
+                # Let admitted owners finish and release pages before another
+                # fresh context consumes them. Resident successors already own
+                # GPU locks; allowing them to run can release those pages too.
+                # With no scheduled work, keep the work-conserving scan and
+                # idle reclamation paths. Bound deferral even for long decodes.
+                deferred_for_recovery = True
+                continue
+            if req.py_request_id in retry_candidates and self._defer_context_retry(
+                req,
+                bool(scheduled_gen or scheduled_ctx or scheduled_encoder),
+            ):
+                if req.py_request_id in promised_recovery_ids:
+                    promised_recovery_blocked = True
                 continue
             # Probe context requests before peft_pages_needed and before
             # _try_schedule_context so that a deferral costs nothing: KV pages
@@ -547,13 +665,39 @@ class KVCacheV2Scheduler(RequestScheduler):
                 action, tokens, chunking_flag = self._try_schedule_context(
                     req, budget, preempt_for_pages
                 )
+                if (
+                    req.py_request_id in retry_candidates
+                    and action is not ScheduleAction.SCHEDULED
+                    and blocked_ctx
+                    and blocked_ctx[-1] is req
+                    and not (evicted or recompute_paused)
+                ):
+                    # Rollback has released this attempt's claims. Defer a
+                    # repeated restore/rollback in both Native and RETIRE;
+                    # any separate ALIGN reservation remains untouched.
+                    self._context_retries[req.py_request_id] = (
+                        req,
+                        self._CONTEXT_RETRY_PASSES - 1,
+                        self._context_available_pages(),
+                    )
                 if action is ScheduleAction.STOP:
+                    if (
+                        req.py_request_id in recovery_ids
+                        or self.kv_cache_manager.has_execution_residency
+                    ) and not (evicted or recompute_paused):
+                        # Priority must not turn a failed recovery admission
+                        # into head-of-line blocking for an otherwise runnable
+                        # context. The first-chunk rollback has released its
+                        # claims; preserve STOP after any preemption instead.
+                        continue
                     break
                 if action is ScheduleAction.SKIP:
                     continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
+                fresh_context_admitted = fresh_context_admitted or req.is_first_context_chunk
+                self._record_context_admission(req, recovery_ids, resident_recovery_ids)
                 # Register the block only once the request has cleared its
                 # budget and is committed. Registering earlier, inside the check
                 # above, would let a request that then fails to schedule defer
@@ -568,6 +712,86 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        if (
+            blocked_generation is not None
+            and not pending_completion
+            and self.kv_cache_manager.has_cache_tier_below_gpu
+            and not self.has_cp_helix
+            and not (
+                scheduled_gen
+                or scheduled_ctx
+                or scheduled_encoder
+                or disagg_candidates
+                or recompute_paused
+                or deferred_behind_contributor
+                or inflight_request_ids
+            )
+        ):
+            admitted = self._reclaim_for_idle_generation(
+                blocked_generation, requests_list, evicted, recompute_paused, inflight_request_ids
+            )
+            if admitted:
+                peft_pages = budget.peft_pages_needed(blocked_generation)
+                assert peft_pages is not None
+                tokens = blocked_generation.get_beam_width_by_iter(
+                    for_next_iteration=False
+                ) + get_draft_token_length(blocked_generation)
+                scheduled_gen.append(blocked_generation)
+                budget.commit(blocked_generation, tokens, peft_pages)
+            preempted_ids.update(r.py_request_id for r in recompute_paused)
+
+        deferred_handoff_repoll = False
+        if (
+            blocked_ctx
+            and not pending_completion
+            and self.kv_cache_manager.has_cache_tier_below_gpu
+            and not self.has_cp_helix
+            and not (
+                scheduled_gen
+                or scheduled_ctx
+                or scheduled_encoder
+                or disagg_candidates
+                or evicted
+                or recompute_paused
+                or deferred_behind_contributor
+                or inflight_request_ids
+            )
+        ):
+            deferred_handoff_repoll = (
+                self._handoff_repoll_available
+                and self.kv_cache_manager.defer_execution_residency_recovery()
+            )
+            if deferred_handoff_repoll:
+                self._handoff_repoll_available = False
+            if not deferred_handoff_repoll:
+                for req in blocked_ctx:
+                    # A cold partial context can itself occupy the space needed by
+                    # a later cache-backed successor. Try the other blocked rows
+                    # before declaring a deadlock, without re-admitting a victim
+                    # whose executor resources have not yet been reset.
+                    if any(req is victim for victim in (*evicted, *recompute_paused)):
+                        continue
+                    action, tokens, chunking_flag = self._recover_context_admission(
+                        req, requests_list, budget, evicted, recompute_paused, inflight_request_ids
+                    )
+                    if action is ScheduleAction.SCHEDULED:
+                        peft_pages = budget.peft_pages_needed(req)
+                        assert peft_pages is not None
+                        scheduled_ctx.append(req)
+                        budget.commit(req, tokens, peft_pages)
+                        has_chunking = has_chunking or chunking_flag
+                        fresh_context_admitted = (
+                            fresh_context_admitted or req.is_first_context_chunk
+                        )
+                        self._record_context_admission(req, recovery_ids, resident_recovery_ids)
+                        break
+                preempted_ids.update(r.py_request_id for r in recompute_paused)
+
+        if fresh_context_admitted or not promised_recovery_ids:
+            self._recovery_drain_passes = 0
+        elif deferred_for_recovery:
+            self._recovery_drain_passes += 1
+
         self._detect_deadlock(
             active_requests,
             inflight_request_ids,
@@ -578,11 +802,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or scheduled_ctx
                 or scheduled_encoder
                 or disagg_candidates
-                or evicted
                 or recompute_paused
                 or deferred_behind_contributor
+                or deferred_handoff_repoll
             ),
         )
+
+        if scheduled_gen or scheduled_ctx or scheduled_encoder:
+            self._handoff_repoll_available = True
+            if self.kv_cache_manager.has_execution_residency:
+                self.kv_cache_manager.advance_execution_residency()
 
         return (
             scheduled_encoder,
@@ -593,6 +822,65 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         )
+
+    def _record_context_admission(
+        self, req: LlmRequest, recovery_ids: set[int], resident_recovery_ids: set[int]
+    ) -> None:
+        self._context_retries.pop(req.py_request_id, None)
+        if req.is_first_context_chunk:
+            req.py_execution_recovery_prefill = req.py_request_id in recovery_ids
+        if req.py_request_id in recovery_ids:
+            self._recovery_admission_streak += 1
+            if req.py_request_id in resident_recovery_ids:
+                self._resident_recovery_admission_streak = min(
+                    4, self._resident_recovery_admission_streak + 1
+                )
+            else:
+                self._resident_recovery_admission_streak = 0
+            req.py_execution_recovery_pending = False
+            req.py_execution_recovery_tokens = 0
+        elif req.is_first_context_chunk:
+            # Ordinary admissions must not renew the resident preference:
+            # a cold successor still gets its turn after four resident ones.
+            self._recovery_admission_streak = 0
+
+    _CONTEXT_RETRY_PASSES = 8
+    _RECOVERY_DRAIN_PASSES = 128
+
+    def _context_available_pages(self) -> tuple[int, ...]:
+        # Host allocator metadata only: no CUDA wait, tree lookup, or page move.
+        # Include backing tiers because they can prevent a GPU eviction too.
+        manager = self.kv_cache_manager.impl
+        return tuple(
+            value
+            for level in range(len(manager.cache_tier_list))
+            for pool in manager.get_storage_statistics(level)
+            for value in (pool.free, pool.available)
+        )
+
+    def _defer_context_retry(self, req: LlmRequest, other_work: bool) -> bool:
+        """Avoid repeated restore/rollback while a first context cannot fit.
+
+        Defer only behind work actually scheduled in this pass. A changed
+        allocator snapshot or a pass with no scheduled work retries immediately.
+        Equal counts do not prove identical residency or reuse depth, so retry
+        after at most seven eligible passes even while other work keeps running.
+        This changes admission timing, never cache ownership or reuse authority.
+        """
+        pending = self._context_retries.get(req.py_request_id)
+        if pending is None:
+            return False
+        owner, remaining, available = pending
+        if (
+            owner is not req
+            or not other_work
+            or remaining == 0
+            or self._context_available_pages() != available
+        ):
+            del self._context_retries[req.py_request_id]
+            return False
+        self._context_retries[req.py_request_id] = (req, remaining - 1, available)
+        return True
 
     # ---- Prefix-aware skip ----
 
@@ -818,8 +1106,9 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Prepare first so block reuse updates context_remaining_length
         # before budget check.
-        if not self._prepare_context_pair(req):
+        if not self._prepare_context_pair(req, budget):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
+            preempt_for_pages(req)
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -883,8 +1172,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.SKIP, 0, False
 
         # Prepare context (create _KVCache, block reuse, resume — no resize)
-        if not self._prepare_context_pair(req):
+        if not self._prepare_context_pair(req, budget):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            if preempt_for_pages(req):
+                return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -1008,13 +1299,43 @@ class KVCacheV2Scheduler(RequestScheduler):
             return True
         return draft_manager.admit_mirror(req)
 
-    def _prepare_context_pair(self, req: LlmRequest) -> bool:
+    def _prepare_context_pair(self, req: LlmRequest, budget: BudgetTracker | None = None) -> bool:
         """Prepare target/draft caches with one verified logical reuse depth."""
         from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
 
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
-            if not self.kv_cache_manager.prepare_context(req):
+            # Ordinary contexts can restore a cold prefix only to fail their
+            # next resize. Check the actual next chunk before any
+            # restore, in both tagged and untagged execution. Specialized
+            # chunking/pool paths retain their existing admission protocol.
+            hint_enabled = (
+                budget is not None
+                and self.enable_prefix_aware_scheduling
+                and self.kv_cache_manager.enable_block_reuse
+                and self.kv_cache_manager.has_cache_tier_below_gpu
+                and self.kv_cache_manager.kv_connector_manager is None
+                and self.draft_kv_cache_manager is None
+                and self.cross_kv_cache_manager is None
+                and not self.has_cp_helix
+                and self.chunking_policy != ContextChunkingPolicy.FORCE_CHUNK
+                and getattr(req, "py_multimodal_data", None) is None
+            )
+            if hint_enabled:
+                token_budget = req.prompt_len
+                if self.chunking_enabled:
+                    if budget.remaining_tokens is not None:
+                        token_budget = min(token_budget, budget.remaining_tokens)
+                    if self.max_context_length is not None:
+                        token_budget = min(token_budget, self.max_context_length)
+                prepared = self.kv_cache_manager.prepare_context(
+                    req,
+                    prefill_token_budget=token_budget,
+                    prefill_chunk_unit=self.chunk_unit_size if self.chunking_enabled else 1,
+                )
+            else:
+                prepared = self.kv_cache_manager.prepare_context(req)
+            if not prepared:
                 return False
             if self._admit_unpaired_draft(req):
                 return True
@@ -1342,6 +1663,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         recompute_paused: RequestList,
         inflight_request_ids: set[int],
         scheduled_beam_width: int,
+        *,
+        pending_completion: bool = False,
     ) -> tuple[ScheduleAction, int, int, int]:
         """Try to schedule a generation request.
 
@@ -1374,6 +1697,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"or max_tokens (GLOBAL tokens across CP ranks, not "
                     f"per-rank), or reduce concurrency."
                 )
+            if pending_completion:
+                # The overlap executor consumes the final sample and releases
+                # its cache even with an empty next batch. Let that owner drain
+                # before suspending or recomputing unrelated requests.
+                return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
             req_it_end, success = self._try_evict_for_gen(
                 req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
             )
@@ -1437,6 +1765,78 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Eviction ----
 
+    def _recover_context_admission(
+        self,
+        req: LlmRequest,
+        requests_list: RequestList,
+        budget: BudgetTracker,
+        evicted: RequestList,
+        recompute_paused: RequestList,
+        inflight_request_ids: set[int],
+    ) -> tuple[ScheduleAction, int, bool]:
+        """Make progress when every context is blocked by cache capacity.
+
+        Suspend later requests first, preserving their pages in lower tiers.
+        If those tiers cannot accept the pages, release a replayable request's
+        ownership. Retry the blocked context before any victim can re-enter
+        admission and take the capacity back.
+        """
+        if any(
+            self._has_pending_connector_load(candidate)
+            or candidate.state_value in self._TRANSFER_HOLDING_STATE_VALUES
+            for candidate in requests_list
+        ) or (
+            self._async_transfer_manager is not None
+            and self._async_transfer_manager.has_any_inflight_requests()
+        ):
+            return ScheduleAction.SKIP, 0, False
+
+        # An idle successor can already own the protected GPU prefix. Try
+        # suspending other owners before turning that prefix into cold KV.
+        # This is only an ordering preference: unsuccessful admission still
+        # yields optional locks before the existing recompute fallback.
+        preserve_residency = (
+            req.is_first_context_chunk
+            and (req.py_execution_recovery_pending or req.py_execution_recovery_tokens > 0)
+            and self.kv_cache_manager.has_execution_resident_recovery(req) is True
+        )
+        if not preserve_residency and self.kv_cache_manager._yield_execution_residency():
+            result = self._try_schedule_context(req, budget, lambda _: False)
+            if result[0] is ScheduleAction.SCHEDULED:
+                return result
+
+        candidates = [candidate for candidate in reversed(requests_list) if candidate is not req]
+        for victim in candidates:
+            if victim.state_value == self._gen_to_complete_state_value:
+                continue
+            if not self._is_evictable(victim, inflight_request_ids):
+                continue
+            self._suspend_request(victim)
+            evicted.append(victim)
+            result = self._try_schedule_context(req, budget, lambda _: False)
+            if result[0] is ScheduleAction.SCHEDULED:
+                return result
+
+        if preserve_residency and self.kv_cache_manager._yield_execution_residency():
+            result = self._try_schedule_context(req, budget, lambda _: False)
+            if result[0] is ScheduleAction.SCHEDULED:
+                return result
+
+        if self.enable_recompute_pause:
+            for victim in candidates:
+                if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
+                    continue
+                if victim.py_request_id not in self.kv_cache_manager.kv_cache_map:
+                    continue
+                evicted[:] = [candidate for candidate in evicted if candidate is not victim]
+                self._recompute_pause_request(victim)
+                recompute_paused.append(victim)
+                result = self._try_schedule_context(req, budget, lambda _: False)
+                if result[0] is ScheduleAction.SCHEDULED:
+                    return result
+
+        return ScheduleAction.SKIP, 0, False
+
     @staticmethod
     def _is_started_request(req: LlmRequest) -> bool:
         """A request that has begun execution and can be paused.
@@ -1445,6 +1845,43 @@ class KVCacheV2Scheduler(RequestScheduler):
         return (
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
+
+    def _reclaim_for_idle_generation(
+        self,
+        req: LlmRequest,
+        requests_list: RequestList,
+        evicted: RequestList,
+        recompute_paused: RequestList,
+        inflight_request_ids: set[int],
+    ) -> bool:
+        """Admit blocked decode before released context owners can reclaim capacity."""
+        if not self.enable_recompute_pause:
+            return False
+        if any(
+            self._has_pending_connector_load(candidate)
+            or candidate.state_value in self._TRANSFER_HOLDING_STATE_VALUES
+            for candidate in requests_list
+        ) or (
+            self._async_transfer_manager is not None
+            and self._async_transfer_manager.has_any_inflight_requests()
+        ):
+            return False
+        # Earlier context rows are outside the generation pass's tail scan.
+        # Retry after each release within this pass: deferring admission lets
+        # those rows re-prefill and take the same capacity back indefinitely.
+        request_index = next(i for i, candidate in enumerate(requests_list) if candidate is req)
+        for victim in reversed(requests_list[:request_index]):
+            if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
+                continue
+            if victim.py_request_id not in self.kv_cache_manager.kv_cache_map:
+                continue
+            evicted[:] = [candidate for candidate in evicted if candidate is not victim]
+            self._recompute_pause_request(victim)
+            recompute_paused.append(victim)
+            if self._try_allocate_generation(req):
+                evicted[:] = [candidate for candidate in evicted if candidate is not req]
+                return True
+        return False
 
     def _suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache in both main and draft managers.

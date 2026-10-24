@@ -378,10 +378,56 @@ void KvCache::activate()
     }
 }
 
-bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding)
+bool KvCache::_canFitDenseCapacity(int capacity) const
+{
+    if (mBeamWidth != BeamIndex{1})
+        return true;
+    auto const& storage = mManager->storage();
+    int const target = std::max(capacity, mCapacity);
+    for (auto const& [lcId, lc] : mManager->lifeCycles())
+    {
+        auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+        if (attn == nullptr || attn->isSparse || (attn->windowSize && *attn->windowSize < target))
+            return true;
+    }
+
+    // Every target block needs a GPU slot. Only a full page already LOCKED on GPU by
+    // another owner is already charged to unavailable storage. HELD GPU pages remain
+    // evictable, so counting them as free reuse would double-count available capacity.
+    TypedVec<PoolGroupIndex, SlotCount> needed(storage.numPoolGroups(kHotLevel), 0);
+    int const targetBlocks = divUp(target, mTokensPerBlock);
+    for (auto const& [lcId, lc] : mManager->lifeCycles())
+        needed[storage.getPoolGroupIndex(kHotLevel, lcId)] += targetBlocks;
+    for (BlockOrdinal ordinal{0}; ordinal < mBlocks.size(); ++ordinal)
+    {
+        // A never-resumed partial match is copied to a private page, even if its
+        // source is already GPU-locked. Its destination must remain in the demand.
+        if (mNeverResumed && numCommittedTokens() % mTokensPerBlock != 0
+            && ordinal == BlockOrdinal{numCommittedTokens() / mTokensPerBlock})
+            continue;
+        for (LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+        {
+            auto const& holder = std::get<SharedPtr<PageHolder>>(mBlocks[ordinal].pages[kDefaultBeamIndex][lc]);
+            auto const& page = *holder->page;
+            if (page.cacheLevel == kHotLevel && page.status() == PageStatus::LOCKED)
+                --needed[storage.getPoolGroupIndex(kHotLevel, lc)];
+        }
+    }
+    for (PoolGroupIndex pg{0}; pg < needed.size(); ++pg)
+    {
+        TLLM_CHECK_DEBUG(needed[pg] >= 0);
+        if (needed[pg] > storage.getStatistics(kHotLevel, pg).available())
+            return false;
+    }
+    return true;
+}
+
+bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding, std::optional<int> capacityHint)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
+    if (capacityHint && *capacityHint < 0)
+        throw std::invalid_argument("Resume capacity hint cannot be negative");
 
     // Set stream first (mirrors Python: self.cuda_stream = cuda_stream).
     if (stream.has_value())
@@ -397,6 +443,10 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         throw std::invalid_argument("Cannot return a decoding cache to prefill");
     auto restorePhase = FuncGuard([&]() { mIsDecoding = oldIsDecoding; });
     mIsDecoding = isDecoding.value_or(mIsDecoding);
+
+    // Fail before allocating scratch slots, activating pages, or submitting copies.
+    if (capacityHint && !_canFitDenseCapacity(*capacityHint))
+        return false;
 
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kHotLevel);

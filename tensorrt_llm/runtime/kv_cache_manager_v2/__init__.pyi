@@ -613,8 +613,17 @@ class _KVCache:
         ...
     def suspend(self) -> None: ...
     def resume(
-        self, cuda_stream: CudaStream | None = None, is_decoding: bool | None = None
-    ) -> bool: ...
+        self,
+        cuda_stream: CudaStream | None = None,
+        is_decoding: bool | None = None,
+        capacity_hint: int | None = None,
+    ) -> bool:
+        """Resume, optionally checking dense single-beam capacity before copies.
+
+        The hint does not allocate or publish its tail and is ignored for other
+        layouts. Successful resume still requires a later checked resize.
+        """
+        ...
     def enter_decode(self) -> bool: ...
     @property
     def is_decoding(self) -> bool: ...
