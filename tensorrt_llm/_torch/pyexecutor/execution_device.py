@@ -5,7 +5,7 @@
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import RLock
 
 import torch
@@ -97,6 +97,11 @@ class DeviceAttentionRows:
 
     Keep this object alive until every graph/model reader has completed. The
     counters are cumulative predicate rejections, not a GPU completion proof.
+
+    Only prepare_attention_rows may write slots or expected, including through
+    aliases. Native attention reads both tensors without modifying them. This
+    ownership contract also applies to inference tensors, which have no version
+    counter. Counters remain writable by the native attention predicates.
     """
 
     authority: "DeviceExecutionAuthority"
@@ -104,6 +109,32 @@ class DeviceAttentionRows:
     expected: torch.Tensor
     counters: torch.Tensor
     stream_id: int
+    _layout: "_AttentionRowLayout | None" = field(default=None, init=False, repr=False)
+
+
+_RowStorage = tuple[
+    int, tuple[int, ...], tuple[int, ...], int, torch.dtype, torch.device, int | None
+]
+
+
+def _row_storage(tensor: torch.Tensor) -> _RowStorage:
+    return (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tensor.stride(),
+        tensor.storage_offset(),
+        tensor.dtype,
+        tensor.device,
+        None if torch.is_inference(tensor) else tensor._version,
+    )
+
+
+@dataclass(frozen=True)
+class _AttentionRowLayout:
+    key: tuple[tuple[int, ...], tuple[int, ...]]
+    slots: torch.Tensor
+    expected: torch.Tensor
+    storage: tuple[_RowStorage, _RowStorage]
 
 
 @dataclass(frozen=True)
@@ -378,16 +409,34 @@ class DeviceExecutionAuthority:
                 raise RuntimeError("attention rows cannot move between model submission streams")
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("attention authority rows must be staged outside capture")
-            use = self._start_use([rows.slots, rows.expected, rows.counters])
             try:
+                use = self._start_use([rows.slots, rows.expected, rows.counters])
                 padded = list(versions) + [None] * (rows.slots.numel() - len(versions))
                 slots, expected = self._input_values(padded)
-                for target, values in ((rows.slots, slots), (rows.expected, expected)):
-                    host = torch.tensor(values, dtype=target.dtype, pin_memory=prefer_pinned())
-                    use.tensors.append(host)
-                    target.copy_(host, non_blocking=True)
+                key = (tuple(slots), tuple(expected))
+                storage = (_row_storage(rows.slots), _row_storage(rows.expected))
+                cached = rows._layout
+                hit = (
+                    cached is not None
+                    and cached.key == key
+                    and cached.slots is rows.slots
+                    and cached.expected is rows.expected
+                    and cached.storage == storage
+                )
+                if not hit:
+                    rows._layout = None
+                    for target, values in ((rows.slots, slots), (rows.expected, expected)):
+                        host = torch.tensor(values, dtype=target.dtype, pin_memory=prefer_pinned())
+                        use.tensors.append(host)
+                        target.copy_(host, non_blocking=True)
+                    storage = (_row_storage(rows.slots), _row_storage(rows.expected))
+                # Hits keep publication waits, pending limits and completion/error
+                # tracking. All readers and row copies use this same stream.
                 self._record(use, stream)
+                if not hit:
+                    rows._layout = _AttentionRowLayout(key, rows.slots, rows.expected, storage)
             except BaseException as error:
+                rows._layout = None
                 self._failure = error
                 raise
 
