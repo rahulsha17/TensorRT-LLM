@@ -71,9 +71,11 @@ def test_suspended_hold_reclaims_while_successor_reader_is_pending(num_tokens: i
             enable_block_reuse=True,
             _stream=manager_stream,
             _derive_reuse_salt=lambda _: None,
+            _supports_dense_resume_capacity=lambda: True,
         )
         adapter = KVAlignmentAdapter(
-            SimpleNamespace(kv_cache_manager=manager, max_seq_len=32, _is_kv_manager_v2=True)
+            SimpleNamespace(kv_cache_manager=manager, max_seq_len=32, _is_kv_manager_v2=True),
+            keep_resident=False,
         )
         hold = adapter.reserve(AlignmentInput(tuple(tokens + [99])))
         assert hold.num_tokens == num_tokens
