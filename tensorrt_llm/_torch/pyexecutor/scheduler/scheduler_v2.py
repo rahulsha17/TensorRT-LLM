@@ -275,6 +275,17 @@ class KVCacheV2Scheduler(RequestScheduler):
             and kv_cache_manager._supports_dense_resume_capacity() is True
         )
         self._recovery_drain_passes = 0
+        # Experimental compute sharing; cache admission and recovery ownership
+        # keep their existing protocol. Leave deployment opt-in until the paired
+        # trace and exact-output checks have qualified this policy.
+        self._recovery_fair_share = (
+            os.environ.get("TRTLLM_RETIRE_PREFILL_FAIR_SHARE", "0") == "1"
+            and self._recovery_drain_enabled
+            and self.chunking_enabled
+            and self.chunking_policy != ContextChunkingPolicy.FORCE_CHUNK
+            and self.enable_prefix_aware_scheduling
+        )
+        self._ordinary_prefill_wait: dict[int, tuple[LlmRequest, int]] = {}
 
     def set_execution_suspend_guard(self, guard: Callable[[LlmRequest], None]) -> None:
         """Bind the execution owner's completion check for lossless suspension.
@@ -725,6 +736,22 @@ class KVCacheV2Scheduler(RequestScheduler):
                     contributed_blocks.add(first_new_block)
 
         if (
+            self._recovery_fair_share
+            and not (recovery_ids or promised_recovery_blocked or pending_completion)
+            and not (evicted or recompute_paused)
+            and not self.kv_cache_manager.has_execution_residency
+        ):
+            shared = self._share_recovery_prefill(
+                pending_ctx, scheduled_ctx, blocked_ctx, budget, contributed_blocks
+            )
+            if shared is not None:
+                has_chunking |= any(
+                    req.context_chunk_size < req.context_remaining_length for req in scheduled_ctx
+                )
+                fresh_context_admitted |= shared.is_first_context_chunk
+                self._record_context_admission(shared, recovery_ids, resident_recovery_ids)
+
+        if (
             blocked_generation is not None
             and not pending_completion
             and self.kv_cache_manager.has_cache_tier_below_gpu
@@ -807,6 +834,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif deferred_for_recovery:
             self._recovery_drain_passes += 1
 
+        if self._recovery_fair_share:
+            self._account_prefill_wait(requests_list, pending_ctx, scheduled_ctx)
+
         self._detect_deadlock(
             active_requests,
             inflight_request_ids,
@@ -861,6 +891,108 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     _CONTEXT_RETRY_PASSES = 8
     _RECOVERY_DRAIN_PASSES = 128
+    _RECOVERY_FAIR_SHARE_PASSES = 4
+
+    def _account_prefill_wait(
+        self, active: RequestList, pending: RequestList, scheduled: RequestList
+    ) -> None:
+        """Age ordinary contexts only behind productive recovery prefill batches."""
+        scheduled_ids = {req.py_request_id for req in scheduled}
+        pending_ids = {req.py_request_id for req in pending}
+        recovery_ran = any(req.py_execution_recovery_prefill for req in scheduled)
+        waiting: dict[int, tuple[LlmRequest, int]] = {}
+        for req in active:
+            if (
+                req.state_value != self._context_init_state_value
+                or req.py_request_id in scheduled_ids
+                or req.py_execution_recovery_pending
+                or req.py_execution_recovery_tokens > 0
+                or req.py_execution_recovery_prefill
+            ):
+                continue
+            owner, count = self._ordinary_prefill_wait.get(req.py_request_id, (req, 0))
+            if owner is not req:
+                count = 0
+            if recovery_ran and req.py_request_id in pending_ids:
+                count = min(count + 1, self._RECOVERY_FAIR_SHARE_PASSES)
+            if count:
+                waiting[req.py_request_id] = (req, count)
+        self._ordinary_prefill_wait = waiting
+
+    def _share_recovery_prefill(
+        self,
+        pending: RequestList,
+        scheduled: RequestList,
+        blocked: RequestList,
+        budget: BudgetTracker,
+        contributed_blocks: set[object] | None,
+    ) -> LlmRequest | None:
+        """Share compute only after allocating the recovery's full next chunk.
+
+        Offer one aged ordinary context at most half of an admitted recovery's
+        chunk. Allocation failure leaves the recovery's chunk and token budget
+        intact. No eviction, suspension, or reservation release of other owners
+        is allowed to make this optional admission fit. The recovery retains its
+        already allocated capacity even when it computes a smaller chunk.
+        """
+        remaining = budget.remaining_tokens
+        if budget.requests_full or remaining is None:
+            return None
+        donor = next(
+            (
+                req
+                for req in scheduled
+                if req.py_execution_recovery_prefill
+                and not req.is_first_context_chunk
+                and req.py_multimodal_data is None
+                and req.context_chunk_size >= 2 * self.chunk_unit_size
+            ),
+            None,
+        )
+        if donor is None:
+            return None
+        excluded = {req.py_request_id for req in (*scheduled, *blocked)}
+        candidate = next(
+            (
+                req
+                for req in pending
+                if req.py_request_id not in excluded
+                and req.py_request_id not in self._context_retries
+                and req.state_value == self._context_init_state_value
+                and req.py_multimodal_data is None
+                and not req.py_execution_recovery_prefill
+                and not req.py_execution_recovery_pending
+                and req.py_execution_recovery_tokens == 0
+                and self._ordinary_prefill_wait.get(req.py_request_id)
+                == (req, self._RECOVERY_FAIR_SHARE_PASSES)
+            ),
+            None,
+        )
+        if candidate is None:
+            return None
+        if contributed_blocks is not None and candidate.is_first_context_chunk:
+            key = self.kv_cache_manager.probe_first_new_block_key(candidate)
+            if key is not None and key in contributed_blocks:
+                return None
+        peft_pages = budget.peft_pages_needed(candidate)
+        if peft_pages is None:
+            return None
+        original_chunk = donor.context_chunk_size
+        unit = self.chunk_unit_size
+        retained = ((original_chunk + 2 * unit - 1) // (2 * unit)) * unit
+        offered = remaining + original_chunk - retained
+        share_budget = BudgetTracker(offered, 1)
+        action, tokens, _ = self._try_schedule_context(candidate, share_budget, lambda req: False)
+        if action is not ScheduleAction.SCHEDULED:
+            return None
+        # Return any unused offer to recovery, preserving its block alignment.
+        borrowed = max(0, tokens - remaining)
+        if borrowed:
+            donor.context_chunk_size = ((original_chunk - borrowed) // unit) * unit
+            budget.num_tokens -= original_chunk - donor.context_chunk_size
+        scheduled.append(candidate)
+        budget.commit(candidate, tokens, peft_pages)
+        return candidate
 
     def _context_available_pages(self) -> tuple[int, ...]:
         # Host allocator metadata only: no CUDA wait, tree lookup, or page move.
