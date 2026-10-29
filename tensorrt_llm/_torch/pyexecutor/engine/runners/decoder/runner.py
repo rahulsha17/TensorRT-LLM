@@ -4608,6 +4608,11 @@ class DecoderRunner(ScheduledModelRunner):
                 is_dummy=is_dummy,
             )
             execution_attention = getattr(self, "execution_attention", None)
+            from ....execution_rate_policy import current_policy_step
+
+            policy_step = current_policy_step()
+            if policy_step is not None:
+                policy_step.finalize(execution_requests, inputs["input_ids"].numel(), can_run_graph)
             if execution_attention is not None:
                 execution_attention.prepare(attn_metadata, execution_requests)
             if execution_promoted_context_ids:

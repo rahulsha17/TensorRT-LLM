@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from ...logger import logger
+from .execution_rate_policy import current_policy_step
 
 __all__ = [
     "ExecutionEarlyExit",
@@ -103,4 +104,15 @@ def execution_early_exit_point(
 def get_layer_early_exit_point() -> Callable[..., None] | None:
     """Return the active prefill hook, or None for unarmed/short decode batches."""
     armed = _poll.get() is not None or _boundary_poll.get() is not None
+    step = current_policy_step()
+    if step is not None:
+        plan = step.require_plan()
+        if not plan.layer_probes or not armed:
+            return None
+
+        def policy_probe(boundary: str, submitted: int, total: int) -> None:
+            if submitted > 0 and submitted % plan.config.layer_horizon == 0:
+                execution_early_exit_point(boundary, submitted, total)
+
+        return policy_probe
     return execution_early_exit_point if _layer_checks.get() and armed else None

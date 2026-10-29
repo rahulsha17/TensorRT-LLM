@@ -7,6 +7,9 @@ RETIRE lets a runtime replace work when its context changes. The runtime decides
 what to replace and supplies the revised input. TRT-LLM will use that decision to
 stop obsolete work and safely hand useful KV to the replacement.
 
+The [experimental batch policy](retire-batch-policy.md) documents the separate,
+opt-in dense eager policy extension and its qualification limits.
+
 The Python LLM and executor APIs carry version metadata. A separate host-side
 `ScopeRegistry` records which version is current and accepts revisions from the
 runtime. An executor controller publishes accepted versions to a worker's host

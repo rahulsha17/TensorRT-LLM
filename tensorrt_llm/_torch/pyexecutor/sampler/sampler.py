@@ -48,6 +48,7 @@ import torch
 
 if TYPE_CHECKING:
     from ..execution_device import DeviceTokenCommitTicket
+    from ..execution_rate_policy import _PolicySampleReceipt
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
@@ -489,6 +490,8 @@ class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTenso
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
     execution_ticket: "DeviceTokenCommitTicket | None" = None
     """RETIRE's asynchronous commit, retaining this batch's identity and token buffers."""
+    execution_policy_receipt: "_PolicySampleReceipt | None" = None
+    """Private opt-in batch policy identity and native sampler completion proof."""
     sample_type: SampleType = SampleType.FULL
     """Tier this batch was sampled at.
 

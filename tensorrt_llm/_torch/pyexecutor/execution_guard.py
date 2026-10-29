@@ -26,6 +26,7 @@ from .execution_early_exit import (
     execution_trace_enabled,
     trace_execution,
 )
+from .execution_rate_policy import _PolicySampleReceipt, _PolicyStep, policy_step_scope
 from .execution_speculation import is_private_ngram
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
@@ -148,6 +149,21 @@ class ExecutionDeviceGuard:
         self._admission_source = executor.dist.rank == 0
         attention_binding = getattr(executor.model_engine, "execution_attention", None)
         self._native_kv_guards = attention_binding is not None
+        self._rate_policy = (
+            None if attention_binding is None else getattr(attention_binding, "rate_policy", None)
+        )
+        self._pending_policy_step: _PolicyStep | None = None
+        if self._rate_policy is not None and (
+            rank_consensus is not None
+            or not executor.disable_overlap_scheduler
+            or executor.drafter is not None
+            or executor.model_engine.is_spec_decode
+            or executor.dist.world_size != 1
+            or not self._early_exit_enabled
+        ):
+            raise NotImplementedError(
+                "RETIRE batch policy requires TP1 non-overlap without speculation"
+            )
         self.device = (
             attention_binding.authority
             if attention_binding is not None
@@ -468,6 +484,10 @@ class ExecutionDeviceGuard:
         later event for a request therefore covers its earlier device uses too.
         Calls run on the engine's execution stream, outside model graph capture.
         """
+        policy = getattr(self, "_rate_policy", None)
+        step = _PolicyStep(policy, batch) if policy is not None else None
+        if policy is not None:
+            self._pending_policy_step = None
         entry_phase = f"forward_entry:early_exit={int(self._early_exit_enabled)}"
         with self._preparing_step(entry_phase):
             # Include untagged rows: one live neighbor prohibits a whole-batch exit.
@@ -516,6 +536,10 @@ class ExecutionDeviceGuard:
         )
 
         def observe(boundary: str, submitted: int, total: int, obsolete: bool) -> None:
+            if policy is not None:
+                policy.count("layer_probes" if boundary == "eager_layer" else "prelaunch_probes")
+                if obsolete:
+                    policy.count("layer_exits" if boundary == "eager_layer" else "prelaunch_exits")
             trace_execution(
                 "boundary",
                 requests=trace_requests,
@@ -526,6 +550,7 @@ class ExecutionDeviceGuard:
             )
 
         with (
+            policy_step_scope(step),
             self._completing_step("forward_done", all_requests, allow_early_exit=True),
             self.device.submission(
                 capture_possible=getattr(
@@ -540,7 +565,7 @@ class ExecutionDeviceGuard:
                 and all(v is not None for v in versions)
                 else None,
                 layer_checks=sum(r.context_chunk_size for r in batch.context_requests) >= 32,
-                observer=observe if traced else None,
+                observer=observe if traced or policy is not None else None,
                 boundary_poll=coordinated_obsolete
                 if self._rank_consensus is not None and self._early_exit_enabled
                 else None,
@@ -553,6 +578,10 @@ class ExecutionDeviceGuard:
             completed = False
             try:
                 yield
+                if step is not None:
+                    step.require_plan()
+                    if not step.attention_prepared:
+                        raise RuntimeError("RETIRE policy forward did not prepare attention")
                 completed = True
                 if context_chunks:
                     ticket = self.device.enqueue_check(
@@ -567,6 +596,9 @@ class ExecutionDeviceGuard:
                     self._record_uses(requests)
                 if traced:
                     trace_execution("forward_end", requests=trace_requests, completed=completed)
+        if step is not None:
+            step.completed = True
+            self._pending_policy_step = step
 
     def _record_uses(self, requests: list[LlmRequest]) -> None:
         # Publish a completion proof only after event.record succeeds. On a
@@ -695,9 +727,37 @@ class ExecutionDeviceGuard:
 
     def commit_sample(self, batch: ScheduledRequests, state: SampleStateTorch) -> None:
         """Queue the device guard; leave host waits to the normal result-consume step."""
+        policy = getattr(self, "_rate_policy", None)
+        plan = None
+        if policy is not None:
+            step = self._pending_policy_step
+            self._pending_policy_step = None
+            if step is None or not step.completed or step.batch is not batch:
+                raise RuntimeError("sampling has no completed RETIRE policy forward")
+            plan = step.require_plan()
+            plan.validate_rows(list(batch.all_requests()))
+            plan.validate_rows(state.requests, sampling=True)
         versions = [request.py_execution_version for request in state.requests]
         if any(version is not None for version in versions):
             assert state.device is not None and state.host is not None
+            if plan is not None and state.sampler_event is None:
+                raise RuntimeError("RETIRE policy sampling has no completion event")
+            if plan is not None and not plan.predicates:
+                if state.execution_ticket is not None:
+                    raise RuntimeError("boundary-only sampling unexpectedly has a device ticket")
+                event = torch.cuda.Event()
+                event.record()
+                state.execution_policy_receipt = _PolicySampleReceipt(
+                    plan,
+                    state,
+                    state.host.new_tokens,
+                    state.device.new_tokens,
+                    state.sampler_event,
+                    None,
+                    event,
+                )
+                policy.count("boundary_sample_dispatches")
+                return
             ticket = self.device.enqueue_token_commit(
                 versions,
                 [request.py_seq_slot for request in state.requests],
@@ -709,14 +769,37 @@ class ExecutionDeviceGuard:
             state.device.new_tokens = ticket.tokens_device
             state.host.new_tokens = ticket.tokens_host
             state.execution_ticket = ticket
+            if plan is not None:
+                state.execution_policy_receipt = _PolicySampleReceipt(
+                    plan,
+                    state,
+                    state.host.new_tokens,
+                    state.device.new_tokens,
+                    state.sampler_event,
+                    ticket,
+                    None,
+                )
+                policy.count("device_sample_dispatches")
 
     @contextmanager
     def token_commit(self, state: SampleStateTorch | None) -> Iterator[None]:
         """Order host token mutation with publication, at the usual overlap consume point."""
-        if self._rank_consensus is None and (
-            state is None
-            or state.execution_ticket is None
-            and not any(r.py_execution_version is not None for r in state.requests)
+        policy_receipt = None if state is None else getattr(state, "execution_policy_receipt", None)
+        if (
+            getattr(self, "_rate_policy", None) is not None
+            and state is not None
+            and any(r.py_execution_version is not None for r in state.requests)
+            and policy_receipt is None
+        ):
+            raise RuntimeError("tagged policy sampling step has no policy receipt")
+        if (
+            policy_receipt is None
+            and self._rank_consensus is None
+            and (
+                state is None
+                or state.execution_ticket is None
+                and not any(r.py_execution_version is not None for r in state.requests)
+            )
         ):
             yield
             return
@@ -726,9 +809,16 @@ class ExecutionDeviceGuard:
                 requests = [] if state is None else state.requests
                 versions = [r.py_execution_version for r in requests]
                 ticket = None if state is None else state.execution_ticket
+                if policy_receipt is not None:
+                    if (
+                        getattr(self, "_rate_policy", None) is None
+                        or policy_receipt.plan.config is not self._rate_policy.config
+                    ):
+                        raise RuntimeError("policy sample has no configured execution policy")
+                    policy_receipt.validate(state)
                 device_allowed = [True] * len(requests)
                 if ticket is None:
-                    if any(version is not None for version in versions):
+                    if any(version is not None for version in versions) and policy_receipt is None:
                         raise RuntimeError("tagged sampling step has no device commit ticket")
                 else:
                     if tuple(versions) != ticket.versions:
@@ -739,6 +829,12 @@ class ExecutionDeviceGuard:
                         raise RuntimeError("sequence slots changed while sampling was in flight")
                 if state is not None and state.sampler_event is not None:
                     state.sampler_event.synchronize()
+                    if policy_receipt is not None:
+                        for future in state.sampler_event.worker_futures or ():
+                            future.result()
+                        if policy_receipt.completion_event is not None:
+                            self.device.wait_event(policy_receipt.completion_event)
+                        policy_receipt.validate(state)
                     # The sampler must not repeat this wait under host authority.
                     state.sampler_event = None
                 if ticket is not None:
@@ -747,7 +843,17 @@ class ExecutionDeviceGuard:
                         raise RuntimeError("sampling step has no complete device commit verdict")
                 for request in requests:
                     self._settle_context_receipts(request)
+                if policy_receipt is not None:
+                    policy_receipt.plan.validate_rows(requests, sampling=True)
                 host_allowed = authority.enter_context(self.table.guard_versions(versions))
+                if policy_receipt is not None:
+                    self._rate_policy.count(
+                        "boundary_commit_checks" if ticket is None else "device_commit_checks"
+                    )
+                    self._rate_policy.count(
+                        "host_rejected_rows", sum(not allowed for allowed in host_allowed)
+                    )
+                    state.execution_policy_receipt = None
             allowed = self._coordinate(
                 "token_commit",
                 requests,

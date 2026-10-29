@@ -10,6 +10,7 @@ import torch
 
 from ...execution_version import ExecutionVersion
 from .execution_device import DeviceAttentionRows, DeviceExecutionAuthority
+from .execution_rate_policy import _RatePolicyState, _startup_policy, current_policy_step
 from .execution_speculation import is_private_ngram
 
 if TYPE_CHECKING:
@@ -52,12 +53,16 @@ class ExecutionAttentionBinding:
     shapes cannot share a mutable row buffer with their source metadata.
     """
 
-    def __init__(self, authority: DeviceExecutionAuthority) -> None:
+    def __init__(
+        self, authority: DeviceExecutionAuthority, *, rate_policy: _RatePolicyState | None = None
+    ) -> None:
         self.authority = authority
+        self.rate_policy = rate_policy
         self._rows: dict[int, tuple[weakref.ReferenceType, DeviceAttentionRows]] = {}
 
     @classmethod
     def from_runner(cls, runner: "DecoderRunner") -> "ExecutionAttentionBinding | None":
+        rate_policy = _startup_policy(runner)
         setting = os.environ.get("TRTLLM_RETIRE_NATIVE_GUARDS", "0")
         if setting == "0":
             return None
@@ -85,7 +90,7 @@ class ExecutionAttentionBinding:
             )
         if os.environ.get("TLLM_FMHA_LIBS") != "fallback":
             raise ValueError("RETIRE native guards require TLLM_FMHA_LIBS=fallback before startup")
-        return cls(DeviceExecutionAuthority(torch.cuda.current_device()))
+        return cls(DeviceExecutionAuthority(torch.cuda.current_device()), rate_policy=rate_policy)
 
     def prepare(self, metadata: "TrtllmAttentionMetadata", batch: "ScheduledRequests") -> None:
         from ..attention.backends.trtllm import TrtllmAttentionMetadata
@@ -99,6 +104,28 @@ class ExecutionAttentionBinding:
         if metadata.request_ids is None or len(metadata.request_ids) != count:
             raise ValueError("attention identities do not match physical sequence rows")
         versions = attention_versions(metadata.request_ids, list(batch.all_requests()))
+        if self.rate_policy is not None:
+            step = current_policy_step()
+            if step is None:
+                if any(version is not None for version in versions):
+                    raise RuntimeError("tagged attention has no RETIRE policy step")
+                predicates = False
+            else:
+                if step.owner is not self.rate_policy or step.attention_prepared:
+                    raise RuntimeError("RETIRE attention policy owner or preparation changed")
+                plan = step.require_plan()
+                plan.validate_rows(list(batch.all_requests()))
+                predicates = plan.predicates
+                step.attention_prepared = True
+                self.rate_policy.count(
+                    "attention_predicate_prepares" if predicates else "attention_boundary_prepares"
+                )
+            if not predicates:
+                metadata.retire_current_versions = None
+                metadata.retire_sequence_slots = None
+                metadata.retire_expected_versions = None
+                metadata.retire_counters = None
+                return
         key = id(metadata)
         entry = self._rows.get(key)
         if entry is None:
