@@ -26,6 +26,7 @@ from .execution_early_exit import (
     execution_trace_enabled,
     trace_execution,
 )
+from .execution_gpt_oss import _validate_gpt_oss_v2_executor
 from .execution_rate_policy import _PolicySampleReceipt, _PolicyStep, policy_step_scope
 from .execution_speculation import is_private_ngram
 from .kv_cache.mamba_cache_manager import BaseMambaCacheManager
@@ -80,6 +81,7 @@ class ExecutionDeviceGuard:
     @staticmethod
     def validate_executor(executor: "PyExecutor", *, tensor_parallel: bool = False) -> None:
         engine = executor.model_engine
+        gpt_oss_v2 = _validate_gpt_oss_v2_executor(executor)
         private_ngram = is_private_ngram(getattr(engine, "spec_config", None))
         if private_ngram:
             from ..speculative.ngram import NGramDrafter
@@ -107,7 +109,8 @@ class ExecutionDeviceGuard:
             "guided decoding": executor.guided_decoder is not None,
             "recurrent KV state": isinstance(executor.kv_cache_manager, BaseMambaCacheManager)
             or getattr(executor.kv_cache_manager, "is_linear_attention", False),
-            "variable sliding windows": getattr(executor.kv_cache_manager, "is_vswa", False),
+            "variable sliding windows": getattr(executor.kv_cache_manager, "is_vswa", False)
+            and not gpt_oss_v2,
         }
         if tensor_parallel:
             unsupported["non-lockstep tensor parallel topology"] = (

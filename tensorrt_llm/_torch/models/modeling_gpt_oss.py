@@ -468,6 +468,8 @@ class Transformer(DecoderModel):
     def __init__(self, model_config: ModelConfig[GptOssConfig]):
         super().__init__(model_config)
         config = self.model_config
+        # Latched only by the explicit RETIRE GPT-OSS V2 startup capability.
+        self._retire_gpt_oss_v2 = False
 
         # Triton MoE kernels require installing Triton main branch,
         # which may be incompatible with torch.compile due to version mismatch.
@@ -534,7 +536,15 @@ class Transformer(DecoderModel):
         hidden_states = inputs_embeds or self.embedding(input_ids)
 
         residual = None
-        for block in self.block:
+        early_exit = None
+        if self._retire_gpt_oss_v2 and not torch.compiler.is_compiling():
+            from ..pyexecutor.execution_early_exit import get_layer_early_exit_point
+            early_exit = get_layer_early_exit_point()
+            if early_exit is not None and torch.cuda.is_current_stream_capturing():
+                early_exit = None
+        for layer_index, block in enumerate(self.block):
+            if early_exit is not None and layer_index % 4 == 0:
+                early_exit("eager_layer", layer_index, len(self.block))
             hidden_states, residual = block(
                 position_ids=position_ids,
                 hidden_states=hidden_states,

@@ -31,6 +31,11 @@ sparse attention are rejected. Existing native authority validation continues
 to reject recurrent or variable-sliding-window KV, guided decoding, and KV
 connectors or transfers. The extension does not broaden native engine support.
 
+A separate [GPT-OSS V2 candidate](retire-gpt-oss-v2.md) adds an explicit private
+opt-in for one validated variable-window layout. It preserves the defaults above
+and remains unqualified on GPUs; the Qwen qualification evidence does not apply
+to it.
+
 ## Batch and acceptance semantics
 
 The runner freezes the actual ordered request objects, runtime IDs, execution

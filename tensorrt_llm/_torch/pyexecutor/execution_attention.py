@@ -10,6 +10,7 @@ import torch
 
 from ...execution_version import ExecutionVersion
 from .execution_device import DeviceAttentionRows, DeviceExecutionAuthority
+from .execution_gpt_oss import _GptOssV2Layout, _startup_gpt_oss_v2
 from .execution_rate_policy import _RatePolicyState, _startup_policy, current_policy_step
 from .execution_speculation import is_private_ngram
 
@@ -54,14 +55,20 @@ class ExecutionAttentionBinding:
     """
 
     def __init__(
-        self, authority: DeviceExecutionAuthority, *, rate_policy: _RatePolicyState | None = None
+        self,
+        authority: DeviceExecutionAuthority,
+        *,
+        rate_policy: _RatePolicyState | None = None,
+        gpt_oss_v2_layout: _GptOssV2Layout | None = None,
     ) -> None:
         self.authority = authority
         self.rate_policy = rate_policy
+        self._gpt_oss_v2_layout = gpt_oss_v2_layout
         self._rows: dict[int, tuple[weakref.ReferenceType, DeviceAttentionRows]] = {}
 
     @classmethod
     def from_runner(cls, runner: "DecoderRunner") -> "ExecutionAttentionBinding | None":
+        gpt_oss_v2_layout = _startup_gpt_oss_v2(runner)
         rate_policy = _startup_policy(runner)
         setting = os.environ.get("TRTLLM_RETIRE_NATIVE_GUARDS", "0")
         if setting == "0":
@@ -90,7 +97,14 @@ class ExecutionAttentionBinding:
             )
         if os.environ.get("TLLM_FMHA_LIBS") != "fallback":
             raise ValueError("RETIRE native guards require TLLM_FMHA_LIBS=fallback before startup")
-        return cls(DeviceExecutionAuthority(torch.cuda.current_device()), rate_policy=rate_policy)
+        binding = cls(
+            DeviceExecutionAuthority(torch.cuda.current_device()),
+            rate_policy=rate_policy,
+            gpt_oss_v2_layout=gpt_oss_v2_layout,
+        )
+        if gpt_oss_v2_layout is not None:
+            gpt_oss_v2_layout.model.model._retire_gpt_oss_v2 = True
+        return binding
 
     def prepare(self, metadata: "TrtllmAttentionMetadata", batch: "ScheduledRequests") -> None:
         from ..attention.backends.trtllm import TrtllmAttentionMetadata

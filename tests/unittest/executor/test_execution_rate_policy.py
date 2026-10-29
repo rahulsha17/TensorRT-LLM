@@ -247,7 +247,10 @@ def test_attention_clears_all_predicates_without_releasing_old_rows(
     )
     binding = ExecutionAttentionBinding(authority, rate_policy=owner)
     metadata = object.__new__(TrtllmAttentionMetadata)
-    metadata.is_cross = False
+    # is_cross is derived from the two sequence-length objects, not writable.
+    metadata._seq_lens = object()
+    metadata._seq_lens_kv = None
+    assert metadata.is_cross is False
     metadata.kv_cache_manager = object()
     metadata.kv_lens_cuda_runtime = SimpleNamespace(numel=lambda: 1)
     metadata.request_ids = [42]
@@ -286,6 +289,21 @@ def test_attention_clears_all_predicates_without_releasing_old_rows(
         assert metadata.retire_current_versions is authority._table
         assert binding._rows == retained
         assert authority.create_attention_rows.call_count == 1
+
+
+def test_attention_metadata_cross_flag_is_derived_and_read_only() -> None:
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata._seq_lens = object()
+    metadata._seq_lens_kv = None
+    assert metadata.is_cross is False
+    with pytest.raises(AttributeError):
+        metadata.is_cross = False
+    metadata._seq_lens_kv = object()
+    assert metadata.is_cross is True
+    metadata._seq_lens_kv = metadata._seq_lens
+    assert metadata.is_cross is False
 
 
 def test_boundary_commit_waits_outside_authority_and_preserves_native_use(

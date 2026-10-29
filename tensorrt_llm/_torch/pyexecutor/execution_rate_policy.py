@@ -140,6 +140,12 @@ def _startup_policy(runner: "DecoderRunner") -> _RatePolicyState | None:
     if config is None:
         return None
     resolved = runner._config
+    from .execution_gpt_oss import _startup_gpt_oss_v2
+
+    supported_model = (
+        type(runner.model).__module__ == "tensorrt_llm._torch.models.modeling_qwen3"
+        and type(runner.model).__name__ == "Qwen3ForCausalLM"
+    ) or _startup_gpt_oss_v2(runner) is not None
     if os.environ.get("TRTLLM_RETIRE_NATIVE_GUARDS", "0") != "1":
         raise ValueError("RETIRE batch policy requires native attention guards at startup")
     if os.environ.get("TRTLLM_RETIRE_EARLY_EXIT", "1") != "1":
@@ -157,11 +163,11 @@ def _startup_policy(runner: "DecoderRunner") -> _RatePolicyState | None:
         or resolved.enable_attention_dp
         or resolved.max_beam_width != 1
         or runner.sparse_attention_config is not None
-        or type(runner.model).__module__ != "tensorrt_llm._torch.models.modeling_qwen3"
-        or type(runner.model).__name__ != "Qwen3ForCausalLM"
+        or not supported_model
     ):
         raise NotImplementedError(
-            "RETIRE batch policy requires dense Qwen3 TP1 eager non-overlap without speculation"
+            "RETIRE batch policy requires Qwen3 or opt-in GPT-OSS V2, TP1 eager non-overlap "
+            "without speculation"
         )
     return _RatePolicyState(config)
 
