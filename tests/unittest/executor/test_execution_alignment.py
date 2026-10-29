@@ -332,6 +332,163 @@ def test_reserve_before_old_release_and_acknowledge_only_after_fence(setup):
             pass
 
 
+@pytest.mark.parametrize("prefix", [0, 3])
+def test_isolated_prefix_resumes_before_cleanup_with_exact_reuse_ceiling(setup, prefix):
+    controller, table, tracker, state, reserve, _ = setup
+    tracker.enqueue(OLD, lambda: 1)
+    owner = object()
+    hold = Mock(num_tokens=prefix)
+
+    def reserve_isolated(request):
+        assert request.revision == REVISION
+        tracker.isolate(1, OLD, owner)
+        return hold
+
+    state._reserve_isolated = reserve_isolated
+    state._prepare = Mock(side_effect=AssertionError("isolated source must not block"))
+    result = controller.advance(REVISION, alignment=INPUT)
+    result.publication.wait()
+    state.process()
+    aligned = result.alignment.wait()
+    assert state.has_isolated_prefix(aligned.request)
+    reserve.assert_not_called()
+    state._prepare.assert_not_called()
+    with pytest.raises(TimeoutError):
+        result.fence.wait(0.02)
+    controller.resume(aligned).wait()
+    with controller.admission(NEW):
+        pass
+    with pytest.raises(ExecutionAuthorityError):
+        with table.admission(OLD):
+            pass
+    assert state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None) == prefix
+    with pytest.raises(RuntimeError, match="agreed KV prefix"):
+        state.confirm_attachment(NEW, 10, prefix + 1)
+    state.confirm_attachment(NEW, 10, prefix)
+    assert state.has_isolated_prefix(aligned.request)
+    assert state._records[aligned.request].reservation is None
+    # Exercise the worker's retry path after attachment, not only the cached
+    # frontend publication future.
+    resumed = controller.resume(aligned)
+    table.apply(resumed.update)
+    controller.resume(aligned).wait()
+    hold.close.assert_called_once()
+    with pytest.raises(TimeoutError):
+        result.fence.wait(0.02)
+    tracker.complete(1, OLD)
+    result.fence.wait()
+
+
+@pytest.mark.parametrize("blocker", ["queued", "older", "resource", "scope_resource"])
+def test_isolated_alignment_requires_every_old_accessor_to_be_safe(setup, blocker):
+    controller, _, tracker, state, _, _ = setup
+    tracker.enqueue(OLD, lambda: 1)
+    tracker.isolate(1, OLD, object())
+    if blocker in ("queued", "older"):
+        version = OLD if blocker == "queued" else replace(OLD, epoch=6)
+        tracker.enqueue(version, lambda: 2)
+    elif blocker == "resource":
+        tracker.enqueue(OLD, lambda: 2)
+        claim = tracker.acquire_resource(2, OLD, "unknown-copy")
+        tracker.complete(2, OLD)
+    else:
+        claim = tracker.acquire_scope_resource(OLD, "unknown-copy")
+    state._reserve_isolated = lambda _: Mock(num_tokens=3)
+    result = controller.advance(REVISION, alignment=INPUT)
+    result.publication.wait()
+    state.process()
+    with pytest.raises(TimeoutError):
+        result.alignment.wait(0.02)
+    if blocker in ("queued", "older"):
+        tracker.complete(2, version)
+    else:
+        tracker.release_resource(claim)
+    controller.resume(result.alignment.wait()).wait()
+    with pytest.raises(TimeoutError):
+        result.fence.wait(0.02)
+    tracker.complete(1, OLD)
+    result.fence.wait()
+
+
+def test_isolated_prefix_none_falls_back_to_conservative_preparation(setup):
+    controller, _, tracker, state, reserve, _ = setup
+    tracker.enqueue(OLD, lambda: 1)
+    state._reserve_isolated = Mock(return_value=None)
+    state._prepare = Mock()
+    result = controller.advance(REVISION, alignment=INPUT)
+    result.publication.wait()
+    state.process()
+    request = result.alignment.request
+    state._reserve_isolated.assert_called_once_with(request)
+    state._prepare.assert_called_once_with(request)
+    reserve.assert_called_once_with(INPUT)
+    assert not state.has_isolated_prefix(request)
+    tracker.isolate(1, OLD, object())
+    with pytest.raises(TimeoutError):
+        result.alignment.wait(0.02)
+    tracker.complete(1, OLD)
+    result.alignment.wait()
+
+
+@pytest.mark.parametrize("role", ["source", "destination", "transfer"])
+def test_routed_alignment_never_uses_local_isolation_callback(role):
+    placement = ExecutionPlacement("session", "remote")
+    revised = INPUT
+    if role != "source":
+        revised = replace(INPUT, destination=placement)
+    if role == "transfer":
+        revised = replace(
+            revised, transfer=PrefixTransferPlan(ExecutionPlacement("session", "source"), 3)
+        )
+    isolated = Mock(side_effect=AssertionError("routed isolation is unsupported"))
+    reserve = Mock(return_value=Mock(num_tokens=3))
+    state = WorkerAlignmentState(reserve, lambda: None, reserve_isolated=isolated)
+    request = AlignmentRequest("session", REVISION, revised)
+    state.observe(NEW, request, source_only=role == "source")
+    state.process()
+    isolated.assert_not_called()
+    assert state.poll(request) is not None
+    assert not state.has_isolated_prefix(request)
+    state.close()
+    state.process()
+
+
+@pytest.mark.parametrize("fault", ["reserve", "tracker", "superseded", "close", "terminal"])
+def test_isolated_prefix_failure_or_invalidation_prevents_resume(setup, fault):
+    controller, _, tracker, state, reserve, _ = setup
+    tracker.enqueue(OLD, lambda: 1)
+    tracker.isolate(1, OLD, object())
+    if fault == "reserve":
+        state._reserve_isolated = Mock(side_effect=AlignmentSafetyError("unsafe source"))
+    else:
+        state._reserve_isolated = Mock(return_value=Mock(num_tokens=3))
+    result = controller.advance(REVISION, alignment=INPUT)
+    result.publication.wait()
+    if fault == "reserve":
+        with pytest.raises(AlignmentSafetyError):
+            state.process()
+        with pytest.raises(RuntimeError, match="unsafe source"):
+            result.alignment.wait()
+        reserve.assert_not_called()
+        return
+    state.process()
+    aligned = result.alignment.wait()
+    if fault == "tracker":
+        tracker.fail(RuntimeError("device failed"))
+    elif fault == "superseded":
+        controller.advance(Revision("next", NEW, replace(NEW, epoch=9))).publication.wait()
+    elif fault == "close":
+        state.close()
+    else:
+        state._records[aligned.request].request_id = 10
+        state.terminal(NEW, 10)
+    with pytest.raises((RuntimeError, ValueError)):
+        controller.resume(aligned).wait()
+    with pytest.raises(ExecutionAuthorityError):
+        with controller.admission(NEW):
+            pass
+
+
 def test_idle_alignment_and_retry_are_idempotent(setup):
     controller, _, _, state, reserve, _ = setup
     result = controller.advance(REVISION, alignment=INPUT)

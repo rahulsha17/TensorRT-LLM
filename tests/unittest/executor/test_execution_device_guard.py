@@ -1917,6 +1917,309 @@ def test_alignment_wake_is_consumed_without_becoming_inference(guard):
     assert queue.request_queue.empty()
 
 
+def _isolated_handoff(guard):
+    from tensorrt_llm.execution_alignment import (
+        AlignmentInput,
+        AlignmentRequest,
+        WorkerAlignmentState,
+    )
+    from tensorrt_llm.execution_authority import Revision
+
+    request = _request()
+    cache = SimpleNamespace(is_active=True)
+    guard._async_context = True
+    guard._isolated_requests = {}
+    guard._pending_releases = {}
+    guard._release_error = None
+    guard._kv_manager.kv_cache_map = {request.py_request_id: cache}
+    guard.table.drain_tracker = RequestDrainTracker()
+    guard.table.drain_tracker.enqueue(VERSION, lambda: request.py_request_id)
+    with guard.forward(_batch(request)):
+        pass
+    guard._uses[id(request)].event.query.return_value = False
+    guard._alignment_adapter = Mock()
+    guard._alignment_adapter.reserve_isolated.return_value = Mock(num_tokens=2)
+    guard.table.alignment_state = WorkerAlignmentState(
+        guard._alignment_adapter.reserve,
+        lambda: None,
+        prepare=guard._prepare_prefix,
+        reserve_isolated=guard._reserve_isolated_prefix,
+    )
+    alignment = AlignmentRequest(
+        "session", Revision("edit", VERSION, NEXT), AlignmentInput((1, 2, 3))
+    )
+    guard.table.apply(VersionUpdate("session", 2, NEXT, alignment))
+    return request, cache, alignment
+
+
+def _retiring_executor(guard, request):
+    executor = object.__new__(PyExecutor)
+    executor._execution_guard = guard
+    executor.resource_manager = Mock()
+    executor._prefetched_request_ids = {request.py_request_id}
+    executor._disagg_coordinator = Mock()
+    executor.gather_all_responses = True
+    executor.result_wait_queues = {request.py_request_id: object()}
+    return executor
+
+
+def test_isolated_alignment_resumes_while_old_gpu_work_and_cleanup_remain(guard):
+    from tensorrt_llm.execution_fence import FenceRequest
+
+    request, cache, alignment = _isolated_handoff(guard)
+    guard.process_alignment()
+    receipt = guard.table.poll_alignment(alignment)
+    assert receipt.reusable_prefix_length == 2
+    fence = FenceRequest("session", alignment.revision)
+    assert guard.table.poll_fence(fence) is None
+    assert request.is_finished
+    guard.device.wait_event.assert_not_called()
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    guard._kv_manager.stop_request_committing.assert_not_called()
+
+    guard.table.apply(VersionUpdate("session", 3, NEXT, alignment, resume=receipt))
+    successor = _request(NEXT)
+    successor.py_request_id = 43
+    successor.get_tokens = lambda beam: [1, 2, 3]
+    successor.cache_salt = successor.lora_task_id = None
+    guard.validate_successor(successor)
+    assert successor.execution_reuse_limit == 2
+    assert guard._kv_manager.kv_cache_map[request.py_request_id] is cache
+
+    executor = _retiring_executor(guard, request)
+    executor._do_terminate_request(request)
+    executor._do_terminate_request(request)  # duplicate retirement is idempotent
+    assert guard.pending_releases == 1
+    guard.process_releases(executor._finish_terminated_request)
+    executor.resource_manager.free_resources.assert_not_called()
+    assert request.py_request_id in executor.result_wait_queues
+    assert guard.table.poll_fence(fence) is None
+    # The old completion need not depend on successor attachment or success.
+    guard._uses[id(request)].event.query.return_value = True
+    guard.process_releases(executor._finish_terminated_request)
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert request.py_request_id not in executor.result_wait_queues
+    assert guard.pending_releases == 0
+    assert guard.table.poll_fence(fence) is not None
+
+
+@pytest.mark.parametrize("invalid", ["event", "allocation", "native_cleanup"])
+def test_isolated_alignment_and_retirement_fail_closed(guard, invalid):
+    from tensorrt_llm.execution_alignment import AlignmentSafetyError
+
+    request, _, _ = _isolated_handoff(guard)
+    if invalid == "event":
+        guard._uses[id(request)].event = None
+        with pytest.raises(AlignmentSafetyError, match="ownership is unknown"):
+            guard.process_alignment()
+        assert not guard.table.drain_tracker.drained(VERSION)
+        guard._alignment_adapter.reserve_isolated.assert_not_called()
+        return
+    guard.process_alignment()
+    executor = _retiring_executor(guard, request)
+    if invalid == "allocation":
+        guard._kv_manager.kv_cache_map[request.py_request_id] = object()
+        with pytest.raises(RuntimeError, match="allocation changed"):
+            executor._do_terminate_request(request)
+        executor.resource_manager.free_resources.assert_not_called()
+        assert not guard.table.drain_tracker.drained(VERSION)
+        return
+    executor._do_terminate_request(request)
+    guard._uses[id(request)].event.query.return_value = True
+    executor.resource_manager.free_resources.side_effect = RuntimeError("native cleanup failed")
+    with pytest.raises(RuntimeError, match="native cleanup failed"):
+        guard.process_releases(executor._finish_terminated_request)
+    assert guard.pending_releases == 1
+    assert request.py_request_id in executor.result_wait_queues
+    with pytest.raises(RuntimeError, match="restart required"):
+        guard.table.drain_tracker.drained(VERSION)
+    with pytest.raises(RuntimeError, match="cleanup is unknown"):
+        guard.process_releases(executor._finish_terminated_request)
+    executor.resource_manager.free_resources.assert_called_once()
+
+
+def test_isolated_retirement_waits_for_latest_sampling_event_and_context_ticket(guard):
+    request, _, _ = _isolated_handoff(guard)
+    guard.process_alignment()
+    owner = guard._isolated_requests[id(request)]
+    # Sampling already queued by the overlap loop can extend the completion
+    # record. Isolation is tied to the allocation, not the superseded event.
+    with guard.sampling(_batch(request)):
+        pass
+    assert guard._isolated_requests[id(request)] is owner
+    event = guard._uses[id(request)].event
+    event.query.return_value = True
+    ticket = Mock()
+    ticket.query.return_value = False
+    guard._context_chunks = {id(request): [SimpleNamespace(ticket=ticket)]}
+    executor = _retiring_executor(guard, request)
+    executor._do_terminate_request(request)
+    guard.process_releases(executor._finish_terminated_request)
+    executor.resource_manager.free_resources.assert_not_called()
+    # Receipt consumption itself is covered by the existing context tests.
+    guard._context_chunks.clear()
+    guard.process_releases(executor._finish_terminated_request)
+    executor.resource_manager.free_resources.assert_called_once()
+
+
+def test_rapid_revision_keeps_old_owner_but_reclaims_ready_newer_owner(guard):
+    from tensorrt_llm.execution_alignment import AlignmentRequest
+    from tensorrt_llm.execution_authority import Revision
+    from tensorrt_llm.execution_fence import FenceRequest
+
+    old_request, _, first = _isolated_handoff(guard)
+    guard.process_alignment()
+    first_receipt = guard.table.poll_alignment(first)
+    guard.table.apply(VersionUpdate("session", 3, NEXT, first, resume=first_receipt))
+    next_request = _request(NEXT)
+    next_request.py_request_id = 43
+    next_request.get_tokens = lambda beam: [1, 2, 3]
+    next_request.cache_salt = next_request.lora_task_id = None
+    guard.validate_successor(next_request)
+    guard._kv_manager.kv_cache_map[43] = SimpleNamespace(is_active=True)
+    guard.table.drain_tracker.enqueue(NEXT, lambda: 43)
+    guard.table.alignment_state.confirm_attachment(NEXT, 43, 2)
+    with guard.forward(_batch(next_request)):
+        pass
+    guard._uses[id(next_request)].event.query.return_value = True
+    old_owner = guard._isolated_requests[id(old_request)]
+    later = replace(NEXT, epoch=NEXT.epoch + 1)
+    second = AlignmentRequest("session", Revision("again", NEXT, later), first.revised_input)
+    guard._alignment_adapter.reserve_isolated.return_value = Mock(num_tokens=2)
+    guard.table.apply(VersionUpdate("session", 4, later, second))
+    guard.process_alignment()
+    second_receipt = guard.table.poll_alignment(second)
+    assert second_receipt is not None
+    assert guard._isolated_requests[id(old_request)] is old_owner
+    guard.table.apply(VersionUpdate("session", 5, later, second, resume=second_receipt))
+    executor = _retiring_executor(guard, old_request)
+    executor._do_terminate_request(old_request)
+    executor._do_terminate_request(next_request)
+    guard.process_releases(executor._finish_terminated_request)
+    executor.resource_manager.free_resources.assert_called_once_with(next_request)
+    assert guard.pending_releases == 1
+    assert guard.table.poll_fence(FenceRequest("session", second.revision)) is None
+    guard._uses[id(old_request)].event.query.return_value = True
+    guard.process_releases(executor._finish_terminated_request)
+    assert guard.pending_releases == 0
+    assert guard.table.poll_fence(FenceRequest("session", first.revision)) is not None
+    assert guard.table.poll_fence(FenceRequest("session", second.revision)) is not None
+
+
+@pytest.mark.parametrize("unsupported", ["no_overlap", "distributed", "no_prefix", "lora_source"])
+def test_isolated_alignment_falls_back_to_existing_drain_path(guard, unsupported):
+    request, _, alignment = _isolated_handoff(guard)
+    if unsupported == "no_overlap":
+        guard._async_context = False
+    elif unsupported == "distributed":
+        guard._rank_consensus = object()
+    elif unsupported == "lora_source":
+        request.lora_task_id = 11
+    else:
+        guard._alignment_adapter.reserve_isolated.return_value = None
+    assert guard._reserve_isolated_prefix(alignment) is None
+    assert not request.is_finished
+    assert not guard.defer_release(request)
+    assert not guard.table.drain_tracker.isolated(VERSION)
+
+
+def test_retired_slots_survive_pending_cpu_sample_even_after_gpu_completion(guard):
+    request, _, _ = _isolated_handoff(guard)
+    guard.process_alignment()
+    executor = _retiring_executor(guard, request)
+    executor._do_terminate_request(request)
+    guard._uses[id(request)].event.query.return_value = True
+    executor.previous_batch = SimpleNamespace(scheduled_requests=_batch(request))
+    executor._process_execution_releases()
+    executor.resource_manager.free_resources.assert_not_called()
+    assert guard.pending_releases == 1
+    # The normal overlap consumer replaces/clears previous_batch only after
+    # it has read the old sampler rows. Only the following safe point reclaims.
+    executor.previous_batch = None
+    executor._process_execution_releases()
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_rebalance_rechecks_owners_retired_while_consuming_previous_batch(
+    guard, monkeypatch, ready
+):
+    request, _, _ = _isolated_handoff(guard)
+    guard.process_alignment()
+    guard._uses[id(request)].event.query.return_value = ready
+    executor = _retiring_executor(guard, request)
+    executor._agreed_need_adjustment = lambda: True
+    executor._consume_previous_batch_for_rebalance = lambda: executor._do_terminate_request(request)
+    executor._rebalance_kv_pools_now = Mock()
+    monkeypatch.setattr("torch.cuda.current_stream", Mock(return_value=Mock()))
+    assert guard.pending_releases == 0
+    executor._maybe_rebalance_kv_pools()
+    assert guard.pending_releases == (0 if ready else 1)
+    assert executor._rebalance_kv_pools_now.call_count == int(ready)
+    assert executor.resource_manager.free_resources.call_count == int(ready)
+
+
+@pytest.mark.parametrize("draining", [True, False])
+def test_retired_owners_block_shutdown_rebalance_and_control(guard, draining):
+    request, _, _ = _isolated_handoff(guard)
+    guard.process_alignment()
+    executor = _retiring_executor(guard, request)
+    executor._do_terminate_request(request)
+    executor.is_shutdown = True
+    executor.active_requests = []
+    executor.waiting_queue = []
+    executor.kv_connector_manager = None
+    executor.enable_kv_pool_rebalance = True
+    executor.control_requests = [SimpleNamespace(control_requires_drain=draining)]
+    assert executor._num_execution_pending_releases() == 1
+    assert not executor.should_stop_processing
+    assert not executor._can_pause_for_rebalance()
+    executor._handle_control_request()
+    assert len(executor.control_requests) == 1
+    guard._uses[id(request)].event.query.return_value = True
+    guard.process_releases(executor._finish_terminated_request)
+    assert executor.should_stop_processing
+
+
+def test_retired_slots_count_against_fetch_admission_and_prevent_idle_wait(guard, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor import py_executor as module
+
+    request, _, _ = _isolated_handoff(guard)
+    guard.process_alignment()
+    executor = _retiring_executor(guard, request)
+    executor._do_terminate_request(request)
+    executor.enable_attention_dp = False
+    executor.enable_iter_perf_stats = False
+    executor.num_fetch_requests = 0
+    executor.dist = SimpleNamespace(cp_config=None, cp_rank=0, cp_size=1)
+    executor._fetch_and_enqueue_requests = Mock()
+    executor._pop_from_waiting_queue = Mock(return_value=[])
+    executor._should_exclude_last_generation_logits = lambda: False
+    monkeypatch.setattr(module, "merge_requests", lambda requests, **kwargs: requests)
+    waiting = object()
+    assert executor._fetch_new_requests(waiting, []) == []
+    executor._fetch_and_enqueue_requests.assert_called_once_with(waiting, 1)
+    executor._pop_from_waiting_queue.assert_called_once_with(waiting, 1, None)
+
+
+def test_shutdown_closes_alignment_before_blocking_retired_cleanup():
+    order = []
+    executor = object.__new__(PyExecutor)
+    executor.response_cv = Condition()
+    executor.shutdown_event = Event()
+    executor.num_micro_batches = 0
+    executor._execution_guard = Mock()
+    executor._execution_guard.close_alignment.side_effect = lambda: order.append("invalidate")
+    executor._execution_guard.process_releases.side_effect = lambda *args, **kw: order.append(
+        "drain"
+    )
+    executor._executor_loop_cleanup()
+    assert order == ["invalidate", "drain"]
+    executor._execution_guard.process_releases.assert_called_once_with(
+        executor._finish_terminated_request, block=True
+    )
+
+
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("mode", ["eager", "graph", "compiled", "compiled-graph"])
@@ -3640,6 +3943,7 @@ def test_executor_dispatch_checks_before_returning_branch(with_guard, has_batch)
 def test_executor_checks_stop_before_skipping_schedule():
     guard = Mock()
     executor = SimpleNamespace(
+        _process_execution_releases=Mock(),
         _release_unused_connector_reservations=Mock(),
         _poll_encoder_steps=Mock(),
         _fetch_and_activate_new_requests=Mock(return_value=[]),
@@ -3649,6 +3953,7 @@ def test_executor_checks_stop_before_skipping_schedule():
         _handle_control_request=Mock(),
     )
     assert PyExecutor._prepare_and_schedule_batch(executor) == (None, None)
+    executor._process_execution_releases.assert_called_once()
     guard.check_loop_branch.assert_called_once_with("stop", True, [])
     executor._handle_control_request.assert_not_called()
 

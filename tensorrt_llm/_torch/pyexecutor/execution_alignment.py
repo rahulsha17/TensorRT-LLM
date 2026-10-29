@@ -49,6 +49,7 @@ class KVAlignmentAdapter:
         self._resident_v2: dict[int, _KVCache] = {}
         self._fresh_resident_v2: set[int] = set()
         self._idle_repoll_available = False
+        self._failed_isolated_reservations: list[PrefixReservation] = []
         if self._keep_resident:
             self._manager._execution_residency_reclaimer = self.yield_residency
             self._manager._execution_residency_pending = self.has_residency
@@ -110,8 +111,44 @@ class KVAlignmentAdapter:
         if not self._manager.enable_block_reuse or revised.reuse_limit == 0:
             return _Reservation(0, lambda: None)
         if self._executor._is_kv_manager_v2:
-            return self._reserve_v2(revised)
+            reservation = self._reserve_v2(revised)
+            assert reservation is not None
+            return reservation
         return self._reserve_v1(revised)
+
+    def reserve_isolated(self, revised: AlignmentInput) -> PrefixReservation | None:
+        """Hold only existing full V2 blocks without waiting for obsolete work.
+
+        The caller must establish that the execution mode preserves committed
+        pages as immutable. This method never publishes an old owner's pending
+        progress, activates the reservation, or changes the old allocation.
+        None requests the ordinary drained preparation path.
+        """
+        if self._failed_isolated_reservations:
+            raise AlignmentSafetyError("isolated V2 reservation cleanup is unknown")
+        if not self._executor._is_kv_manager_v2:
+            return None
+        sequence_limit = self._executor.max_seq_len or self._manager.max_seq_len
+        if len(revised.input_token_ids) > sequence_limit:
+            raise ValueError("revised input exceeds max_seq_len")
+        if not self._manager.enable_block_reuse or revised.reuse_limit == 0:
+            return None if revised.required_prefix_length else _Reservation(0, lambda: None)
+        reservation = self._reserve_v2(revised, isolated=True)
+        if reservation is None:
+            return None
+        if (
+            reservation.num_tokens % self._manager.impl.tokens_per_block
+            or reservation.num_tokens < revised.required_prefix_length
+        ):
+            try:
+                reservation.close()
+            except Exception as error:
+                # Keep uncertain ownership alive; a fallback cannot reuse its
+                # capacity or retry a native close with an unknown side effect.
+                self._failed_isolated_reservations.append(reservation)
+                raise AlignmentSafetyError("isolated V2 reservation cleanup is unknown") from error
+            return None
+        return reservation
 
     def _v2_reservation_block_limit(self) -> int:
         """Bound ALIGN holds by the first backing tier's logical-block capacity.
@@ -129,14 +166,20 @@ class KVAlignmentAdapter:
         stats = impl.get_storage_statistics(1)
         return min((stats[group].total // count for group, count in groups.items()), default=0)
 
-    def _reserve_v2(self, revised: AlignmentInput) -> PrefixReservation:
+    def _reserve_v2(
+        self, revised: AlignmentInput, *, isolated: bool = False
+    ) -> PrefixReservation | None:
         from ...runtime.kv_cache_manager_v2 import ReuseScope
 
         manager = self._manager
         block_size = manager.impl.tokens_per_block
         available = max(0, self._v2_reservation_block_limit() - self._reserved_v2_blocks)
         limit = min(revised.reuse_limit, available * block_size)
+        if isolated:
+            limit = limit // block_size * block_size
         if limit < revised.required_prefix_length:
+            if isolated:
+                return None
             raise RuntimeError("ALIGN required prefix exceeds recovery-safe reservation capacity")
         if limit == 0:
             return _Reservation(0, lambda: None)
@@ -156,7 +199,7 @@ class KVAlignmentAdapter:
                 raise RuntimeError("ALIGN acquired prefix exceeds its reservation limit")
             blocks = (count + block_size - 1) // block_size
             assert blocks <= available
-            dense = manager._supports_dense_resume_capacity()
+            dense = not isolated and manager._supports_dense_resume_capacity()
             if self._keep_resident and dense and count >= block_size:
                 # Only protect a prefix already recorded as resident. Optional
                 # locks never proactively restore cold KV. Native resume

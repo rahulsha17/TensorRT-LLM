@@ -64,6 +64,159 @@ def test_v2_owns_a_suspended_cache_with_exact_namespace_and_last_token_excluded(
     cache.close.assert_called_once()
 
 
+def test_isolated_v2_holds_full_blocks_without_promoting_residency(engine) -> None:
+    manager = engine.kv_cache_manager
+    manager._supports_dense_resume_capacity.return_value = True
+    cache = Mock(num_committed_tokens=12, cached_tokens_by_level=[12, 0])
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+
+    hold = adapter.reserve_isolated(INPUT)
+
+    assert hold is not None and hold.num_tokens == 12
+    args, kwargs = manager.impl.create_kv_cache.call_args
+    assert args[0].lora_id == 3 and args[0].salt == 42
+    assert args[1] == list(INPUT.input_token_ids[:-1])
+    assert kwargs["expected_prompt_length"] == len(INPUT.input_token_ids)
+    assert adapter._reserved_v2_blocks == 3
+    assert not hold.has_resident_prefix and not adapter.has_residency()
+    hold.settle()
+    cache.resume.assert_not_called()
+    cache.commit.assert_not_called()
+    cache.stop_committing.assert_not_called()
+    cache.suspend.assert_not_called()
+    cache.resize.assert_not_called()
+    manager._stream.synchronize.assert_not_called()
+    hold.close()
+    hold.close()
+    cache.close.assert_called_once()
+    assert adapter._reserved_v2_blocks == 0
+
+
+@pytest.mark.parametrize("limit,expected", [(0, 0), (1, 0), (7, 4), (8, 8), (None, 16)])
+def test_isolated_v2_rounds_runtime_and_final_token_bounds(engine, limit, expected) -> None:
+    manager = engine.kv_cache_manager
+    cache = Mock(num_committed_tokens=expected)
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+
+    hold = adapter.reserve_isolated(replace(INPUT, max_reuse_tokens=limit))
+
+    assert hold is not None and hold.num_tokens == expected
+    assert hold.num_tokens <= (len(INPUT.input_token_ids) - 1 if limit is None else limit)
+    if expected:
+        assert manager.impl.create_kv_cache.call_args.args[1] == list(
+            INPUT.input_token_ids[:expected]
+        )
+    else:
+        manager.impl.create_kv_cache.assert_not_called()
+    hold.close()
+
+
+@pytest.mark.parametrize("count,minimum", [(7, 0), (0, 4), (4, 8)])
+def test_isolated_v2_incomplete_match_releases_before_fallback(engine, count, minimum) -> None:
+    manager = engine.kv_cache_manager
+    cache = Mock(num_committed_tokens=count)
+    replacement = Mock(num_committed_tokens=8)
+    manager.impl.create_kv_cache.side_effect = [cache, replacement]
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+
+    assert adapter.reserve_isolated(replace(INPUT, min_reuse_tokens=minimum)) is None
+
+    cache.close.assert_called_once()
+    cache.resume.assert_not_called()
+    assert adapter._reserved_v2_blocks == 0
+    hold = adapter.reserve(INPUT)
+    assert hold.num_tokens == 8
+    hold.close()
+    assert adapter._reserved_v2_blocks == 0
+
+
+@pytest.mark.parametrize("capacity,minimum,limit", [(0, 4, None), (1, 8, None), (4, 5, 7)])
+def test_isolated_v2_insufficient_budget_or_rounded_limit_falls_back_without_allocation(
+    engine, capacity, minimum, limit
+) -> None:
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=capacity)]
+    adapter = KVAlignmentAdapter(engine)
+
+    assert (
+        adapter.reserve_isolated(replace(INPUT, min_reuse_tokens=minimum, max_reuse_tokens=limit))
+        is None
+    )
+
+    manager.impl.create_kv_cache.assert_not_called()
+    assert adapter._reserved_v2_blocks == 0
+
+
+def test_isolated_v2_charges_the_shared_reservation_budget(engine) -> None:
+    manager = engine.kv_cache_manager
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=3)]
+    ordinary_cache, isolated_cache = (Mock(num_committed_tokens=8), Mock(num_committed_tokens=4))
+    manager.impl.create_kv_cache.side_effect = [ordinary_cache, isolated_cache]
+    adapter = KVAlignmentAdapter(engine)
+    ordinary = adapter.reserve(INPUT)
+
+    isolated = adapter.reserve_isolated(INPUT)
+
+    assert isolated is not None and isolated.num_tokens == 4
+    assert manager.impl.create_kv_cache.call_args.args[1] == list(INPUT.input_token_ids[:4])
+    assert adapter._reserved_v2_blocks == 3
+    assert adapter.reserve_isolated(replace(INPUT, min_reuse_tokens=4)) is None
+    assert manager.impl.create_kv_cache.call_count == 2
+    isolated.close()
+    assert adapter._reserved_v2_blocks == 2
+    ordinary.close()
+    assert adapter._reserved_v2_blocks == 0
+
+
+def test_isolated_v2_unknown_fallback_cleanup_retains_ownership_and_fails_closed(engine) -> None:
+    manager = engine.kv_cache_manager
+    cache = Mock(num_committed_tokens=7)
+    cache.close.side_effect = RuntimeError("close outcome unknown")
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+
+    with pytest.raises(AlignmentSafetyError, match="isolated V2 reservation cleanup is unknown"):
+        adapter.reserve_isolated(INPUT)
+    with pytest.raises(AlignmentSafetyError, match="isolated V2 reservation cleanup is unknown"):
+        adapter.reserve_isolated(INPUT)
+
+    cache.close.assert_called_once()
+    assert adapter._reserved_v2_blocks == 2
+    assert len(adapter._failed_isolated_reservations) == 1
+    manager.impl.create_kv_cache.assert_called_once()
+
+
+@pytest.mark.parametrize("reuse,minimum", [(True, 0), (False, 0), (False, 4)])
+def test_isolated_v2_zero_reuse_obeys_the_minimum(engine, reuse, minimum) -> None:
+    manager = engine.kv_cache_manager
+    manager.enable_block_reuse = reuse
+    adapter = KVAlignmentAdapter(engine)
+    revised = replace(INPUT, min_reuse_tokens=minimum, max_reuse_tokens=0 if reuse else None)
+
+    hold = adapter.reserve_isolated(revised)
+
+    assert (hold is None) == bool(minimum)
+    if hold is not None:
+        assert hold.num_tokens == 0
+        hold.close()
+    manager.impl.create_kv_cache.assert_not_called()
+
+
+def test_isolated_v1_falls_back_without_native_calls(engine) -> None:
+    engine._is_kv_manager_v2 = False
+    assert KVAlignmentAdapter(engine).reserve_isolated(INPUT) is None
+    assert engine.kv_cache_manager.mock_calls == []
+
+
+def test_isolated_v2_rejects_excessive_input_before_native_calls(engine) -> None:
+    engine.max_seq_len = 4
+    with pytest.raises(ValueError, match="max_seq_len"):
+        KVAlignmentAdapter(engine).reserve_isolated(INPUT)
+    assert engine.kv_cache_manager.impl.mock_calls == []
+
+
 @pytest.mark.parametrize("v2", [False, True])
 def test_zero_limit_never_acquires_cached_pages(engine, v2):
     engine._is_kv_manager_v2 = v2

@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from ...bindings.executor import FinishReason
-from ...execution_alignment import AlignmentRequest, AlignmentSafetyError, WorkerAlignmentState
+from ...execution_alignment import (
+    AlignmentRequest,
+    AlignmentSafetyError,
+    PrefixReservation,
+    WorkerAlignmentState,
+)
 from ...execution_consensus import ExecutionRow, ExecutionStepConsensus
 from ...execution_fence import RequestDrainTracker
 from ...execution_gate import ExecutionAuthorityError
@@ -44,6 +49,14 @@ class _RequestUse:
     # Retain identity even if a native request or sequence slot is recycled.
     request: LlmRequest
     event: torch.cuda.Event | None
+
+
+@dataclass
+class _IsolatedRequest:
+    # Stable ownership across forward/sampling event replacement. Neither the
+    # request slot nor this allocation may be recycled before terminal cleanup.
+    request: LlmRequest
+    allocation: "_KVCache"
 
 
 @dataclass
@@ -170,6 +183,9 @@ class ExecutionDeviceGuard:
         )
         self._context_owners: dict[int, _ContextOwner] = {}
         self._context_chunks: dict[int, list[_ContextChunk]] = {}
+        self._isolated_requests: dict[int, _IsolatedRequest] = {}
+        self._pending_releases: dict[int, LlmRequest] = {}
+        self._release_error: Exception | None = None
         table.bind_device_publisher(self.device)
         table.drain_tracker = RequestDrainTracker()
         table.alignment_state = WorkerAlignmentState(
@@ -178,6 +194,7 @@ class ExecutionDeviceGuard:
             if self._admission_source
             else lambda: None,
             prepare=self._prepare_prefix,
+            reserve_isolated=self._reserve_isolated_prefix,
         )
         if self._kv_manager is not None and rank_consensus is None:
             self._kv_manager._execution_resident_recovery = self._has_resident_recovery
@@ -208,6 +225,116 @@ class ExecutionDeviceGuard:
                     raise AlignmentSafetyError(
                         "source KV preparation failed; restart required"
                     ) from error
+
+    def _reserve_isolated_prefix(self, alignment: AlignmentRequest) -> PrefixReservation | None:
+        """Acquire only canonical full blocks, leaving old GPU owners untouched.
+
+        The alignment lock is held here. Never reenter the authority table or
+        wait for CUDA: the mailbox takes the table lock before the alignment
+        lock. The observed revision has already closed old host authority.
+        """
+        if not getattr(self, "_async_context", False) or self._rank_consensus is not None:
+            return None
+        old = alignment.revision.expected_version
+        sources = []
+        for use in self._uses.values():
+            request = use.request
+            version = request.py_execution_version
+            if (
+                version is None
+                or (version.tenant_id, version.scope_id) != (old.tenant_id, old.scope_id)
+                or version.epoch > old.epoch
+            ):
+                continue
+            # PEFT admission currently accounts for active generation owners,
+            # not retired adapter locks. Keep LoRA sources on the drained path
+            # until the scheduler budgets their retained adapter residency.
+            if getattr(request, "lora_task_id", None) is not None:
+                return None
+            cache = self._kv_manager.kv_cache_map.get(request.py_request_id)
+            if use.event is None or not self._owns_context_allocation(request):
+                raise AlignmentSafetyError("source GPU ownership is unknown; refusing early ALIGN")
+            if cache is None or not cache.is_active:
+                return None
+            sources.append((request, cache))
+
+        reservation = self._alignment_adapter.reserve_isolated(alignment.revised_input)
+        if reservation is None:
+            return None
+        try:
+            tracker = self.table.drain_tracker
+            assert tracker is not None
+            for request, cache in sources:
+                key = id(request)
+                owner = self._isolated_requests.get(key)
+                if owner is None:
+                    owner = _IsolatedRequest(request, cache)
+                    self._isolated_requests[key] = owner
+                elif owner.request is not request or owner.allocation is not cache:
+                    raise AlignmentSafetyError("isolated source allocation changed")
+                # Previously submitted sampling may still finish in its own
+                # slot. Future scheduling is closed and the entire old owner
+                # survives until the normal result consumer retires it.
+                self._cancel(request)
+                tracker.isolate(request.py_request_id, request.py_execution_version, owner)
+            return reservation
+        except Exception as error:
+            try:
+                reservation.close()
+            except Exception as cleanup_error:
+                raise AlignmentSafetyError("isolated ALIGN cleanup is unknown") from cleanup_error
+            raise AlignmentSafetyError("source isolation failed; restart required") from error
+
+    @property
+    def pending_releases(self) -> int:
+        """Retired requests still occupying native resources and executor slots."""
+        return len(getattr(self, "_pending_releases", {}))
+
+    def defer_release(self, request: LlmRequest) -> bool:
+        """Retire after normal result consumption; keep all ownership until polled."""
+        owner = getattr(self, "_isolated_requests", {}).get(id(request))
+        if owner is None:
+            return False
+        if (
+            owner.request is not request
+            or self._kv_manager.kv_cache_map.get(request.py_request_id) is not owner.allocation
+        ):
+            raise RuntimeError("isolated source allocation changed before retirement")
+        self._pending_releases[id(request)] = request
+        return True
+
+    def process_releases(
+        self,
+        release: Callable[[LlmRequest], None],
+        *,
+        block: bool = False,
+        retained: tuple[LlmRequest, ...] = (),
+    ) -> None:
+        """Reclaim on the engine thread without waiting behind unfinished owners.
+
+        The caller supplies requests retained by its previous batch/sample.
+        CUDA completion alone is insufficient to recycle their slots.
+        Failed cleanup retains the queue and poisons both readiness and FENCE.
+        """
+        if getattr(self, "_release_error", None) is not None:
+            raise RuntimeError("retired resource cleanup is unknown") from self._release_error
+        retained_ids = {id(request) for request in retained}
+        for key, request in list(getattr(self, "_pending_releases", {}).items()):
+            if key in retained_ids:
+                continue
+            try:
+                if not self._wait_for_use(request, required=True, block=block):
+                    continue
+                chunks = getattr(self, "_context_chunks", {}).get(key, [])
+                if not block and any(not chunk.ticket.query() for chunk in chunks):
+                    continue
+                release(request)
+            except Exception as error:
+                self._release_error = error
+                self.execution_failed(error)
+                raise
+            del self._pending_releases[key]
+            del self._isolated_requests[key]
 
     def process_alignment(self) -> None:
         """Drive native prefix reservations on the engine thread outside capture."""
@@ -395,11 +522,11 @@ class ExecutionDeviceGuard:
         return self._rank_consensus is not None
 
     def execution_failed(self, error: Exception) -> None:
-        """Invalidate distributed drain evidence before the engine's fatal cleanup."""
+        """Invalidate readiness and drain evidence before the engine's fatal cleanup."""
+        if self.table.drain_tracker is not None:
+            self.table.drain_tracker.fail(error)
         if self._rank_consensus is not None:
             self._rank_consensus.fail(error)
-            if self.table.drain_tracker is not None:
-                self.table.drain_tracker.fail(error)
             self.table.close()
 
     def check_loop_branch(self, boundary: str, selected: bool, requests: list[LlmRequest]) -> None:

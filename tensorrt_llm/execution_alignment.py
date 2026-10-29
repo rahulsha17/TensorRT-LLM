@@ -156,10 +156,11 @@ class AlignmentRequest:
 
 @dataclass(frozen=True)
 class AlignmentReceipt:
-    """A reserved prefix after FENCE; RESUME must revalidate the live reservation.
+    """A successor-safe reserved prefix; RESUME revalidates its live ownership.
 
     reservation_id identifies a worker-owned hold, not a GPU address. A later
     revision or shutdown invalidates the hold even if this receipt was delivered.
+    Isolated local owners may still await physical cleanup and full FENCE.
     """
 
     request: AlignmentRequest
@@ -217,6 +218,7 @@ class _AlignmentRecord:
     transfer_drains: list[Callable[[], bool]] = field(default_factory=list)
     source_only: bool = False
     source_released: bool = False
+    isolated: bool = False
 
 
 class WorkerAlignmentState:
@@ -225,6 +227,9 @@ class WorkerAlignmentState:
     The release boundary shares this lock with publication so a newly observed
     plan cannot fall between reservation processing and old-owner release.
     Native cache operations may wait for copies, but never reenter authority.
+    For local handoff, reserve_isolated may retain a safe prefix while old
+    allocations remain live. Returning None selects conservative preparation;
+    a returned hold still requires the drain tracker's isolation proof.
     """
 
     def __init__(
@@ -234,10 +239,12 @@ class WorkerAlignmentState:
         max_reservations: int = 256,
         *,
         prepare: Callable[[AlignmentRequest], None] | None = None,
+        reserve_isolated: Callable[[AlignmentRequest], PrefixReservation | None] | None = None,
     ) -> None:
         self._lock = RLock()
         self._reserve = reserve
         self._prepare = prepare
+        self._reserve_isolated = reserve_isolated
         self._wake = wake
         self._max_reservations = max_reservations
         self._current: dict[tuple[str, str], ExecutionVersion] = {}
@@ -315,9 +322,19 @@ class WorkerAlignmentState:
                     if not self._is_current(request) or record.receipt is not None or record.error:
                         continue
                     try:
-                        if self._prepare is not None:
-                            self._prepare(request)
-                        reservation = self._reserve(request.revised_input)
+                        reservation = None
+                        if (
+                            self._reserve_isolated is not None
+                            and not record.source_only
+                            and request.revised_input.destination is None
+                            and request.revised_input.transfer is None
+                        ):
+                            reservation = self._reserve_isolated(request)
+                        record.isolated = reservation is not None
+                        if reservation is None:
+                            if self._prepare is not None:
+                                self._prepare(request)
+                            reservation = self._reserve(request.revised_input)
                         record.reservation = reservation
                         count = reservation.num_tokens
                         if (
@@ -369,6 +386,26 @@ class WorkerAlignmentState:
                 raise RuntimeError(f"ALIGN failed: {record.error}") from record.error
             return record.receipt
 
+    def has_isolated_prefix(self, request: AlignmentRequest) -> bool:
+        """Check the engine's live isolated-prefix proof without touching CUDA.
+
+        Attachment transfers the hold to the exact successor, so an accepted
+        RESUME retry remains valid after the extra reservation is reclaimed.
+        """
+        with self._lock:
+            if self._unsafe_error is not None:
+                raise self._unsafe_error
+            receipt = self.poll(request)
+            record = self._records.get(request)
+            return (
+                receipt is not None
+                and record is not None
+                and record.isolated
+                and not record.source_only
+                and not record.source_released
+                and (record.reservation is not None or record.attached)
+            )
+
     def snapshot(self) -> dict:
         """Copy logical reservation ownership without querying native KV or CUDA.
 
@@ -397,6 +434,7 @@ class WorkerAlignmentState:
                         "failed": record.error is not None,
                         "source_only": record.source_only,
                         "source_released": record.source_released,
+                        "isolated": record.isolated,
                     }
                 )
             held = [record for record in records if record["has_reservation"]]
@@ -424,6 +462,8 @@ class WorkerAlignmentState:
             record = self._records[receipt.request]
             if record.source_only:
                 raise RuntimeError("a prefix source cannot RESUME successor execution")
+            if record.isolated and prefix_length is None:
+                prefix_length = receipt.reusable_prefix_length
             if record.resumed and record.resume_prefix_length != prefix_length:
                 raise RuntimeError("RESUME cannot change the agreed prefix")
             record.resume_prefix_length = prefix_length
@@ -483,9 +523,9 @@ class WorkerAlignmentState:
             if record.request_id is not None and record.request_id != request_id:
                 raise RuntimeError("RESUME already belongs to another request")
             record.request_id = request_id
-            # Collective RESUME fixes an exact common prefix. Otherwise the
-            # reservation guarantees a floor, while the runtime's bound also
-            # permits compatible cache entries acquired after ALIGN.
+            # Collective and isolated RESUME fix an exact prefix. Otherwise
+            # the reservation guarantees a floor, while the runtime's bound
+            # also permits compatible cache entries acquired after ALIGN.
             return (
                 record.resume_prefix_length
                 if record.resume_prefix_length is not None

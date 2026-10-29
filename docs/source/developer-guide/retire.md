@@ -759,7 +759,8 @@ ADVANCE closes old admission and output
   -> terminal cleanup completes
   -> FENCE receipt is returned
 
-Successor stays pending -> ALIGN -> RESUME
+Successor stays pending until ALIGN -> RESUME; eligible local isolation can
+complete those steps while the drain above is still pending.
 ```
 
 The receipt requires both closed worker admission and an empty drain record for
@@ -785,7 +786,8 @@ unknown GPU completion or failed cleanup never removes the pending request.
 FENCE uses ordinary terminal cleanup. It proves that the old execution has
 finished accessing its resources, but by itself does not reserve KV. When the
 revision includes ALIGN input, the worker acquires a separate native hold before
-releasing the old owner's resources, after the GPU completion wait. A fence receipt is neither an allocation-generation token nor
+releasing the old owner's resources. The local isolated path can acquire that
+hold before old GPU completion. A fence receipt is neither an allocation-generation token nor
 permission to run the successor. It also does not wait for obsolete IPC responses
 to disappear; existing output gates prevent those responses from being delivered.
 
@@ -926,7 +928,7 @@ revised_input = AlignmentInput(
     lora_task_id=None,
 )
 result = control.advance(Revision("edit-123", old, new), alignment=revised_input)
-result.fence.wait(timeout=5)
+result.publication.wait(timeout=5)
 aligned = result.alignment.wait(timeout=5)
 print(aligned.reusable_prefix_length)
 ```
@@ -937,7 +939,6 @@ The runtime can also revoke first and supply the revised input later:
 revision = Revision("edit-123", old, new)
 advance = control.advance(revision)
 advance.publication.wait(timeout=5)
-advance.fence.wait(timeout=5)
 
 # The runtime may wait for a tool or obtain the revised input here.
 # No successor reservation protects the cache during this gap.
@@ -951,8 +952,49 @@ Separate ALIGN searches what remains in the cache at that time. Evicted KV is
 recomputed unless `min_reuse_tokens` requires a hit. It uses the same V1/V2
 reservation, multi-rank prefix agreement and RESUME checks as input supplied
 with ADVANCE. It cannot align an unknown or superseded revision, change input
-on a retry, or admit work before FENCE and acknowledged RESUME. Once supplied,
+on a retry, or admit work before successor-safe ALIGN and acknowledged RESUME. Once supplied,
 the revised input is immutable regardless of which call supplied it.
+
+### Local handoff before old cleanup
+
+Eligible single-rank V2 overlap execution can return ALIGN and acknowledge RESUME
+while obsolete GPU work and terminal cleanup remain pending. It shares only
+already committed, immutable full blocks, obtained through a separate suspended
+native cache. It does not publish the old request's unfinished context or activate
+the reservation. Normal native readiness dependencies still order successor reads.
+The successor receives its own execution slot and writable suffix, with reuse
+fixed to the acquired prefix length even if the cache tree subsequently grows.
+
+The engine stops scheduling each obsolete source and retains its exact allocation,
+slot, completion events and context receipts. Every admitted old request through
+the replaced epoch must be isolated or finished; unknown queue entries and
+independent resource accessors prevent early readiness. New accessors cannot be
+added to a certified old scope. FENCE keeps its full-drain meaning and completes
+only after resource cleanup succeeds.
+
+After normal result handling retires an old request, the engine polls its latest
+GPU event and context receipts at scheduling safe points. It also retains the
+request while a previous overlap batch still refers to its sampler rows. Ready
+owners are released independently of successor attachment. Pending owners count
+against admission capacity, prevent idle blocking and shutdown, and defer cache
+rebalancing and control actions. Cleanup failure preserves ownership and fails
+readiness and drain checks.
+
+This path uses the existing native-guarded asynchronous-context eligibility:
+dense reusable V2, single rank, overlap enabled, no speculative decoding or joint
+reuse, and no conversation state. Device-guard restrictions also exclude KV
+transfers/connectors, multimodal requests and recurrent state. Unsupported modes,
+LoRA sources, partial-block matches or insufficient retained prefixes use the existing drained
+preparation path. The early path may reuse less KV because it cannot publish a
+just-completed source frontier by waiting. `min_reuse_tokens` can require that
+frontier and therefore select the drained path.
+
+Wait for publication, ALIGN and acknowledged RESUME before submitting the
+successor. Observe `result.fence.wait()` later when full old-resource cleanup is
+needed; waiting for it before RESUME intentionally serializes the handoff. Retired
+suffixes still occupy memory and slots, so early readiness does not guarantee
+immediate scheduling or a measured speedup. CUDA and serving qualification are
+required for this implementation.
 
 The worker matches the revised tokens in its existing cache tree, using the
 supplied salt and LoRA identity. Its manager fixes the model and KV layout.
@@ -994,7 +1036,9 @@ the bound. On a single worker, the acquired reservation is the guaranteed
 minimum; the runtime's maximum remains the successor's lookup limit. For
 example, a 2K-token reservation with a 12K-token maximum permits a later 6K
 compatible cache hit, but never reuse beyond 12K. Multi-worker RESUME still
-requires the exact agreed common prefix. The suffix is recomputed. Other
+requires the exact agreed common prefix. The isolated local handoff also fixes
+the exact acquired prefix, rather than allowing a larger later cache hit.
+The suffix is recomputed. Other
 requests keep their own ordinary cache access.
 
 V2 also enforces the bound when committing computed KV. Committing can adopt
@@ -1017,9 +1061,12 @@ cannot change the bound.
 ADVANCE(new version, revised input)
   -> mailbox arms the reservation plan and revokes old work
   -> engine matches revised tokens and acquires native KV holds
-  -> old request drains and releases its own resources
-  -> FENCE completes
+  -> engine proves source isolation OR waits for full old-resource drain
   -> ALIGN returns a reservation ID and the held prefix length
+  -> acknowledged RESUME opens successor admission
+
+Old cleanup independently completes FENCE. Unsupported isolation paths wait
+for FENCE before returning ALIGN.
 
 Successor remains pending until RESUME.
 ```

@@ -266,7 +266,7 @@ class WorkerVersionTable:
             return FenceReceipt(request)
 
     def poll_alignment(self, request: AlignmentRequest) -> AlignmentReceipt | None:
-        """A prepared prefix is usable only after the revision's drain completes."""
+        """Require a prepared prefix and full drain or explicitly isolated old owners."""
         with self._lock:
             self._require_open()
             if request.session_id != self.session_id:
@@ -298,11 +298,14 @@ class WorkerVersionTable:
                 copies += 1
             if request.revised_input.transfer is not None and not copies:
                 return None
-            if (
-                receipt is None
-                or self.poll_fence(FenceRequest(self.session_id, request.revision)) is None
-            ):
+            if receipt is None:
                 return None
+            if self.poll_fence(FenceRequest(self.session_id, request.revision)) is None:
+                if not self.alignment_state.has_isolated_prefix(request):
+                    return None
+                assert self.drain_tracker is not None
+                if not self.drain_tracker.isolated(request.revision.expected_version):
+                    return None
             return receipt
 
     def bind_device_publisher(self, publisher: DeviceVersionPublisher) -> None:
@@ -378,7 +381,7 @@ class WorkerVersionTable:
                     raise ValueError("newer publication sequence would rewind authority")
             if update.resume is not None:
                 if self.poll_alignment(update.resume.request) != update.resume:
-                    raise RuntimeError("RESUME requires the live ALIGN receipt and completed FENCE")
+                    raise RuntimeError("RESUME requires a live successor-safe ALIGN receipt")
                 assert self.alignment_state is not None
                 self.alignment_state.authorize_resume(update.resume, update.resume_prefix_length)
             if update.release_source:
@@ -757,7 +760,8 @@ class ExecutionController:
         Until this call, ADVANCE without alignment does not reserve any prefix.
         ALIGN looks up whatever compatible KV remains when the engine processes
         it. It can therefore return fewer tokens, including zero, than an ALIGN
-        supplied with ADVANCE. Its receipt still requires completed FENCE.
+        supplied with ADVANCE. Its receipt requires full drain or explicit
+        engine isolation of every remaining old owner.
 
         Wait for publication and alignment, then resume the receipt before
         submitting the successor. Exact retries keep the same request and hold;
@@ -815,7 +819,7 @@ class ExecutionController:
         return aligned
 
     def resume(self, aligned: AlignmentReceipt) -> VersionPublication:
-        """Open successor admission after a live worker recheck of ALIGN and FENCE.
+        """Open successor admission after a live worker recheck of safe ALIGN ownership.
 
         Wait for the returned publication before submitting exactly the aligned
         input with its successor execution version. A timeout is retryable with

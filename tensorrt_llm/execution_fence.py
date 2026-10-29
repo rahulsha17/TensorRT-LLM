@@ -96,12 +96,15 @@ class RequestDrainTracker:
         self._requests: dict[int, ExecutionVersion] = {}
         self._resources: dict[RequestResourceClaim | ScopeResourceClaim, ExecutionVersion] = {}
         self._broadcasted: set[int] = set()
+        self._isolated: dict[int, tuple[ExecutionVersion, object]] = {}
+        self._sealed_epochs: dict[tuple[str, str], int] = {}
         self._error: Exception | None = None
 
     def enqueue(self, version: ExecutionVersion, submit: Callable[[], int]) -> int:
         """Register an enqueue atomically with terminal completion."""
         with self._lock:
             self._require_healthy()
+            self._require_unsealed(version)
             try:
                 request_id = submit()
                 if request_id in self._requests:
@@ -118,6 +121,9 @@ class RequestDrainTracker:
         """Expand a still-pending parent before any of its children can execute."""
         with self._lock:
             self._require_healthy()
+            self._require_unsealed(version)
+            if parent_id in self._isolated:
+                raise RuntimeError("isolated execution cannot admit a child")
             if self._requests.get(parent_id) != version or child_id in self._requests:
                 self._error = RuntimeError("child execution has no unique pending parent")
                 raise self._error
@@ -145,6 +151,9 @@ class RequestDrainTracker:
                 for request_id, version in requests:
                     if type(request_id) is not int or not isinstance(version, ExecutionVersion):
                         raise TypeError("invalid broadcast execution identity")
+                    self._require_unsealed(version)
+                    if request_id in self._isolated:
+                        raise RuntimeError("isolated execution cannot be broadcast")
                     if request_id in identities or request_id in self._broadcasted:
                         raise RuntimeError("request was broadcast more than once")
                     identities.add(request_id)
@@ -186,6 +195,9 @@ class RequestDrainTracker:
             raise ValueError("resource owner must be a nonempty string")
         with self._lock:
             self._require_healthy()
+            self._require_unsealed(version)
+            if request_id in self._isolated:
+                raise RuntimeError("isolated execution cannot acquire a resource")
             if parent is None:
                 valid = self._requests.get(request_id) == version
             else:
@@ -210,6 +222,7 @@ class RequestDrainTracker:
             raise ValueError("resource owner must be a nonempty string")
         with self._lock:
             self._require_healthy()
+            self._require_unsealed(version)
             claim = ScopeResourceClaim(version, owner)
             self._resources[claim] = version
             return claim
@@ -242,6 +255,60 @@ class RequestDrainTracker:
                 raise self._error
             self._requests.pop(request_id, None)
             self._broadcasted.discard(request_id)
+            self._isolated.pop(request_id, None)
+
+    def isolate(self, request_id: int, version: ExecutionVersion, owner: object) -> None:
+        """Seal one live owner against new access without certifying completion.
+
+        The engine must first prevent further submission and retain the exact
+        allocation and outstanding GPU uses independently of the successor.
+        The opaque owner identifies that retained execution; this method does
+        not perform native ownership or GPU completion checks.
+        """
+        if (
+            type(request_id) is not int
+            or not isinstance(version, ExecutionVersion)
+            or owner is None
+        ):
+            raise TypeError("isolation requires a request ID, execution version and owner")
+        with self._lock:
+            self._require_healthy()
+            if self._requests.get(request_id) != version:
+                self._error = RuntimeError("isolation has no matching live execution")
+                raise self._error
+            previous = self._isolated.get(request_id)
+            if previous is not None and (previous[0] != version or previous[1] is not owner):
+                self._error = RuntimeError("isolation changed its retained execution owner")
+                raise self._error
+            self._isolated[request_id] = (version, owner)
+
+    def isolated(self, version: ExecutionVersion) -> bool:
+        """Certify safe coexistence through an epoch while physical drain stays pending.
+
+        Every admitted execution must have an explicit engine isolation proof.
+        Resource-only accessors remain conservative blockers. A successful check
+        seals older admissions and resource registration so later access cannot
+        invalidate the proof after RESUME.
+        """
+        with self._lock:
+            self._require_healthy()
+            key = (version.tenant_id, version.scope_id)
+
+            def includes(candidate: ExecutionVersion) -> bool:
+                return (
+                    candidate.tenant_id,
+                    candidate.scope_id,
+                ) == key and candidate.epoch <= version.epoch
+
+            if any(includes(v) for v in self._resources.values()):
+                return False
+            if any(
+                includes(v) and request_id not in self._isolated
+                for request_id, v in self._requests.items()
+            ):
+                return False
+            self._sealed_epochs[key] = max(self._sealed_epochs.get(key, -1), version.epoch)
+            return True
 
     def drained(self, version: ExecutionVersion) -> bool:
         """Check all epochs through version; callers must already exclude new admission."""
@@ -256,3 +323,7 @@ class RequestDrainTracker:
     def _require_healthy(self) -> None:
         if self._error is not None:
             raise RuntimeError("request drain is unknown; restart required") from self._error
+
+    def _require_unsealed(self, version: ExecutionVersion) -> None:
+        if version.epoch <= self._sealed_epochs.get((version.tenant_id, version.scope_id), -1):
+            raise RuntimeError("isolated scope cannot acquire older execution access")

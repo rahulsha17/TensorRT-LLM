@@ -26,6 +26,118 @@ NEW = replace(OLD, epoch=8)
 REVISION = Revision("edit", OLD, NEW)
 
 
+def test_isolation_keeps_full_fence_pending_and_seals_older_admission():
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 1)
+    owner = object()
+    assert not tracker.isolated(OLD)
+    tracker.isolate(1, OLD, owner)
+    tracker.isolate(1, OLD, owner)
+    assert tracker.isolated(OLD)
+    assert not tracker.drained(OLD)
+    with pytest.raises(RuntimeError, match="isolated scope"):
+        tracker.enqueue(OLD, lambda: pytest.fail("sealed enqueue called submit"))
+    tracker.enqueue(NEW, lambda: 2)
+    tracker.complete(1, OLD)
+    assert tracker.drained(OLD)
+    assert not tracker.drained(NEW)
+
+
+def test_isolation_waits_for_every_older_request_and_resource():
+    tracker = RequestDrainTracker()
+    older = replace(OLD, epoch=6)
+    tracker.enqueue(older, lambda: 1)
+    tracker.enqueue(OLD, lambda: 2)
+    claim = tracker.acquire_resource(1, older, "unknown-copy")
+    tracker.isolate(2, OLD, object())
+    assert not tracker.isolated(OLD)
+    tracker.isolate(1, older, object())
+    assert not tracker.isolated(OLD)
+    tracker.release_resource(claim)
+    assert tracker.isolated(OLD)
+    assert not tracker.drained(OLD)
+
+
+def test_isolation_ignores_other_scopes_and_later_epochs():
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 1)
+    for request_id, version in enumerate(
+        (NEW, replace(OLD, tenant_id="other"), replace(OLD, scope_id="other")), start=2
+    ):
+        tracker.enqueue(version, lambda: request_id)
+        tracker.acquire_resource(request_id, version, "copy")
+    tracker.isolate(1, OLD, object())
+    assert tracker.isolated(OLD)
+    assert not tracker.isolated(NEW)
+
+
+@pytest.mark.parametrize("access", ["resource", "child", "broadcast"])
+def test_isolated_request_cannot_register_new_access_before_scope_readiness(access):
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 1)
+    tracker.enqueue(OLD, lambda: 2)
+    tracker.isolate(1, OLD, object())
+    assert not tracker.isolated(OLD)
+    with pytest.raises(RuntimeError, match="isolated execution"):
+        if access == "resource":
+            tracker.acquire_resource(1, OLD, "late-copy")
+        elif access == "child":
+            tracker.add_child(1, 3, OLD)
+        else:
+            tracker.observe_broadcast(((1, OLD),), source_rank=True)
+
+
+@pytest.mark.parametrize("access", ["scope", "resource", "child"])
+def test_ready_scope_rejects_unclassified_access_after_request_cleanup(access):
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 1)
+    tracker.isolate(1, OLD, object())
+    assert tracker.isolated(OLD)
+    tracker.complete(1, OLD)
+    with pytest.raises(RuntimeError, match="isolated scope"):
+        if access == "scope":
+            tracker.acquire_scope_resource(OLD, "late-copy")
+        elif access == "resource":
+            tracker.acquire_resource(1, OLD, "late-copy")
+        else:
+            tracker.add_child(1, 2, OLD)
+
+
+def test_isolation_does_not_survive_request_id_reuse():
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 1)
+    first = object()
+    tracker.isolate(1, OLD, first)
+    tracker.complete(1, OLD)
+    tracker.enqueue(OLD, lambda: 1)
+    assert not tracker.isolated(OLD)
+    tracker.isolate(1, OLD, object())
+    assert tracker.isolated(OLD)
+
+
+@pytest.mark.parametrize("fault", ["missing", "version", "owner", "failed"])
+def test_invalid_isolation_evidence_cannot_certify_readiness_or_drain(fault):
+    tracker = RequestDrainTracker()
+    tracker.enqueue(OLD, lambda: 1)
+    owner = object()
+    tracker.isolate(1, OLD, owner)
+    with pytest.raises(RuntimeError):
+        if fault == "missing":
+            tracker.isolate(2, OLD, owner)
+        elif fault == "version":
+            tracker.isolate(1, NEW, owner)
+        elif fault == "owner":
+            tracker.isolate(1, OLD, object())
+        else:
+            tracker.fail(RuntimeError("device failed"))
+            tracker.isolate(1, OLD, owner)
+    tracker.complete(1, OLD)
+    with pytest.raises(RuntimeError, match="unknown"):
+        tracker.isolated(OLD)
+    with pytest.raises(RuntimeError, match="unknown"):
+        tracker.drained(OLD)
+
+
 @pytest.fixture(params=["local", "ipc"])
 def control(request):
     table = WorkerVersionTable("session")

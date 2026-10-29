@@ -2065,7 +2065,22 @@ class PyExecutor:
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
+            self._num_execution_pending_releases() == 0
+
+    def _num_execution_pending_releases(self) -> int:
+        guard = getattr(self, '_execution_guard', None)
+        return guard.pending_releases if guard is not None else 0
+
+    def _process_execution_releases(self) -> None:
+        guard = getattr(self, '_execution_guard', None)
+        if guard is None:
+            return
+        previous = getattr(self, 'previous_batch', None)
+        retained = (tuple(previous.scheduled_requests.all_requests())
+                    if previous is not None else ())
+        guard.process_releases(self._finish_terminated_request,
+                               retained=retained)
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -2867,6 +2882,7 @@ class PyExecutor:
         guard = getattr(self, '_execution_guard', None)
         if guard is not None:
             guard.close_alignment()
+            guard.process_releases(self._finish_terminated_request, block=True)
 
         # The loop may exit while the benchmark fill gate is still closed.
         keepalive = getattr(self, "_gpu_keepalive", None)
@@ -4080,6 +4096,7 @@ class PyExecutor:
         self._execution_guard = guard
 
     def _prepare_and_schedule_batch(self):
+        self._process_execution_releases()
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
@@ -4943,6 +4960,10 @@ class PyExecutor:
 
         pending = self.control_requests[0]
 
+        # Even a non-draining action must not mutate pools that still retain
+        # retired owners. The overlap loop first consumes their CPU samples.
+        if self._num_execution_pending_releases():
+            return
         if pending.control_requires_drain and (
                 len(self.active_requests) != 0 or len(self.waiting_queue) != 0
                 or self._has_pending_connector_transfers()):
@@ -4960,6 +4981,7 @@ class PyExecutor:
         torch.cuda.synchronize()
         guard = getattr(self, '_execution_guard', None)
         if guard is not None:
+            guard.process_releases(self._finish_terminated_request, block=True)
             guard.close_alignment()
         self.control_requests.pop(0)
         control_id = getattr(pending, "control_id", None)
@@ -5049,6 +5071,8 @@ class PyExecutor:
         return early here cannot carry a lasting cadence offset out of it.
         """
         if not self.enable_kv_pool_rebalance:
+            return False
+        if self._num_execution_pending_releases():
             return False
         if self.kv_cache_transceiver is not None:
             return False
@@ -5276,6 +5300,11 @@ class PyExecutor:
 
         torch.cuda.current_stream().synchronize()
         self._consume_previous_batch_for_rebalance()
+        # Consuming the batch can retire an isolated owner after the initial
+        # rebalance gate. Reclaim it before changing pools, or defer adjustment.
+        self._process_execution_releases()
+        if self._num_execution_pending_releases():
+            return
         self._rebalance_kv_pools_now()
 
     def _rebalance_kv_pools_now(self) -> None:
@@ -6353,7 +6382,10 @@ class PyExecutor:
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
-            total_num_active_requests = len(active_requests)
+            # Retired RETIRE owners retain their sequence slots. Count them
+            # against admission and keep polling even with no live inference.
+            total_num_active_requests = (len(active_requests) +
+                                         self._num_execution_pending_releases())
             total_num_live_requests = total_num_active_requests
             all_ranks_num_active_requests = None
             all_rank_states = None
@@ -8507,6 +8539,12 @@ class PyExecutor:
         self.disagg.forget_request(request.py_request_id)
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None and guard.defer_release(request):
+            return
+        self._finish_terminated_request(request)
+
+    def _finish_terminated_request(self, request: LlmRequest) -> None:
         self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.

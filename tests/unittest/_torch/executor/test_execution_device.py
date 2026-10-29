@@ -846,6 +846,225 @@ def test_native_v1_alignment_release_never_publishes_unexecuted_blocks(cached, m
     assert probe(tokens, None, "other") == 0
 
 
+def test_native_v2_isolated_handoff_preserves_prefix_while_source_cleanup_is_pending() -> None:
+    """Keep native ownership across early RESUME and a host-controlled CUDA gate."""
+    import faulthandler
+    from threading import Event
+    from types import SimpleNamespace
+
+    import cuda.bindings.runtime as cudart
+
+    from tensorrt_llm._torch.pyexecutor.execution_alignment import KVAlignmentAdapter
+    from tensorrt_llm._torch.pyexecutor.execution_guard import ExecutionDeviceGuard
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+    from tensorrt_llm.bindings.internal import runtime as runtime_bindings
+    from tensorrt_llm.execution_alignment import (
+        AlignmentInput,
+        AlignmentRequest,
+        WorkerAlignmentState,
+    )
+    from tensorrt_llm.execution_authority import Revision
+    from tensorrt_llm.execution_fence import FenceRequest, RequestDrainTracker
+    from tensorrt_llm.execution_mailbox import VersionUpdate, WorkerVersionTable
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        AttentionLayerConfig,
+        BufferConfig,
+        GpuCacheTierConfig,
+        HostCacheTierConfig,
+        KVCacheManager,
+        KVCacheManagerConfig,
+        ReuseScope,
+    )
+
+    torch.empty(1, device="cuda")
+    producer_stream, successor_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    entered, release_gate, timed_out = Event(), Event(), Event()
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=4,
+            cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+            layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096)])],
+            enable_partial_reuse=True,
+        )
+    )
+    old = ExecutionVersion("tenant", "native-isolated-handoff", 7)
+    new = replace(old, epoch=8)
+    tokens, prefix = list(range(12)), 8
+    scope = ReuseScope(salt=11)
+    owner = successor = state = None
+    faulthandler.dump_traceback_later(120, exit=True)
+    try:
+        owner = core.create_kv_cache(scope, expected_prompt_length=len(tokens))
+        assert owner.resume(producer_stream.cuda_stream) and owner.resize(len(tokens))
+        (desc,) = core.get_aggregated_pages(list(core.all_buffer_ids))
+
+        def indices(cache):
+            return list(cache.get_aggregated_page_indices(desc.layer_group_id))
+
+        def fill(index, value, stream):
+            (error,) = cudart.cudaMemsetAsync(
+                int(desc.base) + index * desc.stride, value, desc.size, stream.cuda_stream
+            )
+            assert int(error) == 0
+
+        def read(cache_indices, output, stream):
+            for ordinal, index in enumerate(cache_indices):
+                (error,) = cudart.cudaMemcpyAsync(
+                    output.data_ptr() + ordinal * desc.size,
+                    int(desc.base) + index * desc.stride,
+                    desc.size,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                    stream.cuda_stream,
+                )
+                assert int(error) == 0
+
+        for index in indices(owner):
+            fill(index, 37, producer_stream)
+        producer_stream.synchronize()
+        owner.commit(tokens[:prefix])
+        original = indices(owner)
+        assert len(original) == 3 and owner.num_committed_tokens == prefix
+        source_output = torch.empty((2, desc.size), dtype=torch.uint8, device="cuda")
+        successor_output = torch.empty((3, desc.size), dtype=torch.uint8, device="cuda")
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.impl, manager._stream = core, successor_stream
+        manager.enable_block_reuse = manager._can_publish_block_reuse = True
+        manager.tokens_per_block, manager.max_seq_len = 4, 32
+        manager.kv_cache_map = {1: owner}
+        manager._derive_reuse_salt = lambda salt: 11
+        adapter = KVAlignmentAdapter(
+            SimpleNamespace(kv_cache_manager=manager, max_seq_len=32, _is_kv_manager_v2=True),
+            keep_resident=True,
+        )
+        guard = object.__new__(ExecutionDeviceGuard)
+        guard.table = table = WorkerVersionTable("session")
+        guard.device = DeviceExecutionAuthority(torch.cuda.current_device())
+        table.bind_device_publisher(guard.device)
+        table.apply(VersionUpdate("session", 1, old))
+        assert guard.device.check([old]) == [True]
+        guard._kv_manager, guard._v1_manager = manager, None
+        guard._rank_consensus, guard._async_context = None, True
+        guard._alignment_adapter = adapter
+        guard._uses, guard._kv_frontiers = {}, {}
+        guard._context_owners, guard._context_chunks = {}, {}
+        guard._isolated_requests, guard._pending_releases = {}, {}
+        guard._release_error = None
+        table.drain_tracker = RequestDrainTracker()
+        table.drain_tracker.enqueue(old, lambda: 1)
+        table.alignment_state = state = WorkerAlignmentState(
+            adapter.reserve,
+            lambda: None,
+            prepare=guard._prepare_prefix,
+            reserve_isolated=guard._reserve_isolated_prefix,
+        )
+        request = SimpleNamespace(
+            py_request_id=1,
+            py_execution_version=old,
+            lora_task_id=None,
+            is_dummy_request=False,
+            is_finished=False,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+            py_decoding_iter=0,
+            context_current_position=prefix,
+            context_remaining_length=0,
+            get_num_tokens=lambda beam: prefix + 1,
+        )
+
+        def finish(reason):
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            request.is_finished = True
+
+        request.finish_by_reason = finish
+        guard._kv_frontiers[id(request)] = prefix
+        torch.cuda.synchronize()
+
+        def gate():
+            # CUDA APIs must not be called inside a CUDA host callback.
+            entered.set()
+            if not release_gate.wait(30):
+                timed_out.set()
+
+        with (
+            torch.cuda.stream(producer_stream),
+            guard.sampling(SimpleNamespace(all_requests=lambda: [request])),
+        ):
+            runtime_bindings.launch_hostfunc(producer_stream.cuda_stream, True, False, gate)
+            read(original[:2], source_output, producer_stream)
+            fill(original[2], 71, producer_stream)
+        completion = guard._uses[id(request)].event
+        assert entered.wait(30), "CUDA host gate did not start"
+        assert not completion.query()
+
+        revised = AlignmentInput(tuple(tokens[:prefix] + [99, 98, 97, 96]), cache_salt="scope")
+        alignment = AlignmentRequest("session", Revision("edit", old, new), revised)
+        table.apply(VersionUpdate("session", 2, new, alignment))
+        guard.process_alignment()
+        receipt = table.poll_alignment(alignment)
+        assert receipt is not None and receipt.reusable_prefix_length == prefix
+        assert not completion.query(), "early ALIGN waited for obsolete GPU work"
+        assert not timed_out.is_set()
+        assert not adapter.has_residency()
+        assert owner.is_active and owner.num_committed_tokens == prefix
+        fence = FenceRequest("session", alignment.revision)
+        assert table.poll_fence(fence) is None
+        table.apply(VersionUpdate("session", 3, new, alignment, resume=receipt))
+        assert state.claim(new, 2, revised.input_token_ids, revised.cache_salt, None) == prefix
+
+        successor = core.create_kv_cache(
+            scope, list(revised.input_token_ids[:prefix]), expected_prompt_length=12
+        )
+        assert successor.num_committed_tokens == prefix
+        assert successor.resume(successor_stream.cuda_stream) and successor.resize(12)
+        inherited = indices(successor)
+        assert inherited[:2] == original[:2] and inherited[2] != original[2]
+        fill(inherited[2], 93, successor_stream)
+        read(inherited, successor_output, successor_stream)
+        state.confirm_attachment(new, 2, prefix)
+        assert adapter._reserved_v2_blocks == 0
+        assert not completion.query(), "successor attachment drained the old owner"
+
+        released = []
+
+        def reclaim(retired):
+            guard.before_release(retired)
+            manager.kv_cache_map.pop(retired.py_request_id).close()
+            guard.terminal(retired.py_request_id, retired.py_execution_version)
+            released.append(retired)
+
+        assert guard.defer_release(request)
+        guard.process_releases(reclaim)
+        assert not released and guard.pending_releases == 1
+        assert table.poll_fence(fence) is None
+        release_gate.set()
+        producer_stream.synchronize()
+        successor_stream.synchronize()
+        assert not timed_out.is_set() and completion.query()
+        assert torch.all(source_output == 37).item()
+        assert torch.all(successor_output[:2] == 37).item()
+        assert torch.all(successor_output[2] == 93).item()
+        guard.process_releases(reclaim, retained=(request,))
+        assert not released and table.poll_fence(fence) is None
+        guard.process_releases(reclaim)
+        owner = None
+        assert released == [request] and guard.pending_releases == 0
+        assert table.poll_fence(fence) is not None
+        assert successor.is_active and indices(successor) == inherited
+    finally:
+        release_gate.set()
+        producer_stream.synchronize()
+        successor_stream.synchronize()
+        if state is not None:
+            state.close()
+            state.process()
+        for cache in (successor, owner):
+            if cache is not None:
+                cache.close()
+        core.shutdown()
+        faulthandler.cancel_dump_traceback_later()
+
+
 def test_breakable_graph_revocation_preserves_unsubmitted_segments() -> None:
     from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import BreakableCUDAGraph
     from tensorrt_llm._torch.pyexecutor.execution_early_exit import (
