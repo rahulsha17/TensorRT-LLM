@@ -287,7 +287,7 @@ def test_native_layer_buffers_are_checked_independently(candidate, fault) -> Non
     if fault == "sink":
         layer.num_sink_tokens = 128
     elif fault == "window":
-        layer.sliding_window_size = None
+        layer.sliding_window_size = 64
     elif fault == "sparse":
         buffers[0].is_sparse = True
     elif fault == "size":
@@ -319,7 +319,7 @@ def test_windowed_alignment_keeps_native_suspended_hold_without_dense_lock(candi
         get_storage_statistics=lambda level: [SimpleNamespace(total=16), SimpleNamespace(total=8)],
         create_kv_cache=Mock(return_value=cache),
     )
-    candidate.manager._derive_reuse_salt = lambda salt: salt
+    candidate.manager._derive_reuse_salt = Mock(return_value=42)
     adapter = KVAlignmentAdapter(candidate.executor, keep_resident=True)
     assert adapter._v2_reservation_block_limit() == 8
     revised = AlignmentInput(tuple(range(256)), cache_salt="test", max_reuse_tokens=128)
@@ -329,7 +329,9 @@ def test_windowed_alignment_keeps_native_suspended_hold_without_dense_lock(candi
     assert adapter._reserved_v2_blocks == 7
     assert not reservation.has_resident_prefix
     cache.resume.assert_not_called()
+    candidate.manager._derive_reuse_salt.assert_called_once_with("test")
     call = candidate.manager.impl.create_kv_cache.call_args
+    assert call.args[0].salt == 42
     assert call.args[1] == list(range(128))
     assert call.kwargs["expected_prompt_length"] == 256
     reservation.close()
