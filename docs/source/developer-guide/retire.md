@@ -1095,6 +1095,47 @@ teardown. Cache reset is rejected while ALIGN owns or prepares a prefix. Engine
 control actions that may change weights or cache storage invalidate ALIGN; a
 fresh executor is required for further alignment after those actions.
 
+### Experimental completion budget
+
+`TRTLLM_RETIRE_COMPLETION_BUDGET=1` enables a conservative admission policy when
+the executor installs its execution authority. It is off by default and is
+limited to single-rank dense reusable V2 caches with two tiers and one matching
+pool group in each tier. Configure authority before submitting the workload.
+The first scheduling pass fails closed if existing requests already exceed the
+budget; installing authority cannot undo capacity admitted earlier.
+
+The scheduler charges each admitted request, including untagged neighbors, for
+`ceil((prompt_length + max(max_new_tokens - 1, 0)) / tokens_per_block)` logical
+blocks. Their aggregate cannot exceed the GPU tier's usable logical capacity
+after internal reservations. One GPU block is always reserved for the
+non-speculative CUDA graph padding dummy, including before lazy creation and
+when graphs are disabled. A retained diagnostic guard page is charged
+separately. These exact internal owners are not charged again as requests;
+unexpected native owners and growth beyond the internal allowance fail closed.
+Shared prefixes are charged separately for every owner, so this is an upper
+bound on completion demand rather than a physical-page count. A request keeps
+its charge through decode and final sampling, until its exact native allocation
+is removed. Removing it from the active list alone does not return its credit.
+A queued request that cannot fit waits without creating or restoring a cache;
+the scheduler can still admit a later request that fits.
+
+ALIGN's aggregate hold budget is reduced to the first host tier's logical block
+capacity minus one. The unpromised block supplies migration slack; the GPU
+completion budget supplies room to finish admitted owners. Existing promises
+are never shortened or released to admit another request. An optional match can
+be smaller, including zero; an input whose minimum reuse requirement cannot fit
+fails before acquiring native ownership. A single request can consume the whole
+usable GPU completion budget. A request whose worst-case KV demand exceeds that
+usable capacity raises an explicit error under this experimental policy instead of
+waiting indefinitely. Unsupported topology or an unaccounted native owner also
+fails closed.
+
+This policy can reduce concurrent prefills, especially for long prompts or
+shared prefixes. It requires native pressure replay and matched throughput
+measurements before a default-on deployment, including a native graph-startup
+check for internal cache accounting. Host tests alone do not establish that the
+recorded pressure stalls are repaired.
+
 The receipt is a record of preparation, not a permanent right to use memory.
 RESUME must check that its version and reservation ID are still live, verify the
 submitted input, and acquire the successor's own KV before releasing this hold.

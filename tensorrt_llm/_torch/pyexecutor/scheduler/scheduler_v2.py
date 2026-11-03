@@ -286,6 +286,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             and self.enable_prefix_aware_scheduling
         )
         self._ordinary_prefill_wait: dict[int, tuple[LlmRequest, int]] = {}
+        self._completion_budget_blocks: int | None = None
+        self._completion_internal_blocks = 0
+        self._completion_claims: dict[int, tuple[LlmRequest, object, int]] = {}
 
     def set_execution_suspend_guard(self, guard: Callable[[LlmRequest], None]) -> None:
         """Bind the execution owner's completion check for lossless suspension.
@@ -296,7 +299,111 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         if self._execution_suspend_guard is not None and self._execution_suspend_guard != guard:
             raise RuntimeError("scheduler already has an execution suspension guard")
+        if (
+            self._completion_budget_blocks is None
+            and os.environ.get("TRTLLM_RETIRE_COMPLETION_BUDGET", "0") == "1"
+        ):
+            self._enable_completion_budget()
         self._execution_suspend_guard = guard
+
+    def _enable_completion_budget(self) -> None:
+        manager = self.kv_cache_manager
+        impl = manager.impl
+        if (
+            not self._recovery_drain_enabled
+            or manager.supports_execution_context_overlap() is not True
+            or len(impl.cache_tier_list) != 2
+        ):
+            raise ValueError("RETIRE completion budget requires dense single-rank two-tier V2")
+        gpu = impl.get_storage_statistics(0)
+        host = impl.get_storage_statistics(1)
+        groups = impl.get_life_cycle_pool_group_indices(0)
+        if (
+            len(gpu) != 1
+            or len(host) != 1
+            or not groups
+            or any(group != 0 for group in groups)
+            or impl.get_life_cycle_pool_group_indices(1) != groups
+        ):
+            raise ValueError("RETIRE completion budget requires one matching pool group per tier")
+        internal_blocks, _ = manager.execution_completion_internal_reservation()
+        capacity = gpu[0].total // len(groups) - internal_blocks
+        if capacity <= 0:
+            raise ValueError(
+                "RETIRE completion budget has no usable GPU capacity after internal reservations"
+            )
+        self._completion_internal_blocks = internal_blocks
+        self._completion_budget_blocks = capacity
+        manager._execution_completion_budget = True
+        logger.info("RETIRE completion budget enabled: %s usable logical GPU blocks", capacity)
+
+    def _completion_blocks(self, req: LlmRequest) -> int:
+        # The final sampled token never needs a KV write. Count shared prefixes
+        # separately for each owner: this is a conservative completion bound,
+        # not a measurement of distinct physical pages.
+        tokens = req.prompt_len + max(req.max_new_tokens - 1, 0)
+        blocks = (tokens + self.tokens_per_block - 1) // self.tokens_per_block
+        if blocks > self._completion_budget_blocks:
+            raise ValueError(
+                f"Request {req.py_request_id} needs {blocks} completion blocks, exceeding "
+                f"the opt-in RETIRE usable GPU completion budget {self._completion_budget_blocks} "
+                "after internal reservations; "
+                "reduce its maximum output length or increase GPU KV capacity"
+            )
+        return blocks
+
+    def _refresh_completion_claims(self, requests: RequestList) -> None:
+        if self._completion_budget_blocks is None:
+            return
+        caches = self.kv_cache_manager.kv_cache_map
+        internal_blocks, internal_ids = (
+            self.kv_cache_manager.execution_completion_internal_reservation()
+        )
+        if internal_blocks > self._completion_internal_blocks:
+            raise RuntimeError(
+                "RETIRE completion budget internal reservation grew after installation"
+            )
+        # A request may leave active_requests before deferred native cleanup.
+        # Keep its charge until that exact allocation has actually disappeared.
+        self._completion_claims = {
+            key: claim
+            for key, claim in self._completion_claims.items()
+            if caches.get(key) is claim[1]
+        }
+        for req in requests:
+            cache = caches.get(req.py_request_id)
+            if (
+                cache is not None
+                and req.py_request_id not in internal_ids
+                and req.py_request_id not in self._completion_claims
+            ):
+                self._completion_claims[req.py_request_id] = (
+                    req,
+                    cache,
+                    self._completion_blocks(req),
+                )
+        if caches.keys() - self._completion_claims.keys() - internal_ids:
+            raise RuntimeError("RETIRE completion budget found an unaccounted native cache owner")
+        demand = sum(claim[2] for claim in self._completion_claims.values())
+        if demand > self._completion_budget_blocks:
+            raise RuntimeError(
+                f"RETIRE existing completion demand {demand} exceeds usable GPU budget "
+                f"{self._completion_budget_blocks}; install execution authority before submitting work"
+            )
+
+    def _can_complete_context(self, req: LlmRequest) -> bool:
+        if self._completion_budget_blocks is None or req.py_request_id in self._completion_claims:
+            return True
+        demand = self._completion_blocks(req)
+        return (
+            demand + sum(claim[2] for claim in self._completion_claims.values())
+            <= self._completion_budget_blocks
+        )
+
+    def _claim_context_completion(self, req: LlmRequest) -> None:
+        if self._completion_budget_blocks is not None:
+            cache = self.kv_cache_manager.kv_cache_map[req.py_request_id]
+            self._completion_claims[req.py_request_id] = (req, cache, self._completion_blocks(req))
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -366,6 +473,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
+        self._refresh_completion_claims(requests_list)
 
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
         # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
@@ -1202,6 +1310,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         A loading request remains outside the schedulable state range.
         """
         first_chunk = req.is_first_context_chunk
+        if not self._can_complete_context(req):
+            return ScheduleAction.SKIP, 0, False
         if self.chunking_enabled:
             result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
         else:
@@ -1211,6 +1321,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Failed admission must not retain prefix-reuse holds. Suspension
             # alone cannot release them when the last cache tier is full.
             self.release_context_admission(req)
+        elif result[0] is ScheduleAction.SCHEDULED:
+            self._claim_context_completion(req)
 
         return result
 
@@ -2326,6 +2438,8 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _is_recompute_pause_candidate(
         self, req: LlmRequest, inflight_request_ids: set[int]
     ) -> bool:
+        if self._completion_budget_blocks is not None and req.py_execution_version is not None:
+            return False
         if req.request_id in inflight_request_ids:
             return False
         if self._has_pending_connector_load(req):

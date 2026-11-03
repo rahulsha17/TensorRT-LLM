@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -39,12 +40,15 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
+    CapacitySchedulerPolicy,
+    ContextChunkingPolicy,
     DFlashDecodingConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
@@ -2325,6 +2329,103 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
             manager.free_resources(request)
         assert not manager.kv_cache_map
     finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("preallocated", [False, True])
+@pytest.mark.parametrize("guard_page", [False, True])
+def test_completion_budget_native_graph_padding_owners(
+    monkeypatch: pytest.MonkeyPatch, preallocated: bool, guard_page: bool
+) -> None:
+    """Real native padding allocations before and after authority installation.
+
+    The runner's graph registry only selects a captured batch size here; this
+    exercises its production padding allocation path, not model graph capture.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setenv("TRTLLM_RETIRE_COMPLETION_BUDGET", "1")
+    if guard_page:
+        monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "zero")
+    else:
+        monkeypatch.delenv("TRTLLM_KV_GUARD_PAGE", raising=False)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=True,
+            max_gpu_total_bytes=4 << 20,
+            host_cache_size=4 << 20,
+            max_util_for_resume=1.0,
+        ),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=512,
+        max_batch_size=2,
+        max_num_tokens=64,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        vocab_size=4096,
+    )
+    try:
+        runner = object.__new__(CUDAGraphRunner)
+        runner.enabled = runner.padding_enabled = True
+        runner.is_encoder_decoder = False
+        runner.spec_config = None
+        runner.supported_batch_sizes = [2]
+        runner.dynamic_draft_len_mapping = None
+        runner.max_supported_batch_size = 2
+        runner.padding_dummy_requests = {}
+        runner.graphs = {KeyType(2, 0, False): object()}
+        runner.config = SimpleNamespace(
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            use_mrope=False,
+            max_beam_width=1,
+            batch_size=2,
+            max_num_tokens=64,
+        )
+        resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+        if preallocated:
+            runner.preallocate_padding_dummies(resources)
+            assert 0 in runner.padding_dummy_requests
+        scheduler = KVCacheV2Scheduler(
+            max_batch_size=2,
+            max_num_tokens=64,
+            kv_cache_manager=manager,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 32),
+        )
+        scheduler.set_execution_suspend_guard(lambda req: None)
+        gpu_slots = manager.impl.get_storage_statistics(0)[0].total
+        group_count = len(manager.impl.get_life_cycle_pool_group_indices(0))
+        usable = gpu_slots // group_count - 1 - int(guard_page)
+        assert scheduler._completion_budget_blocks == usable
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=list(range(64)),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+        result = scheduler.schedule_request([request], set())
+        assert result.context_requests == [request]
+        if not preallocated:
+            assert runner._get_or_create_padding_dummy(resources, 0) is not None
+        dummy = runner.padding_dummy_requests[0]
+        assert manager.kv_cache_map[dummy.py_request_id].capacity == 1
+        scheduler._refresh_completion_claims([request])
+        assert set(scheduler._completion_claims) == {1}
+        assert scheduler._completion_budget_blocks == usable
+        manager.free_resources(request)
+        scheduler._refresh_completion_claims([])
+        assert not scheduler._completion_claims
+        assert runner.release_padding_dummy(resources, 0)
+        scheduler._refresh_completion_claims([])
+        assert scheduler._completion_budget_blocks == usable
+    finally:
+        torch.cuda.synchronize()
         manager.shutdown()
 
 
