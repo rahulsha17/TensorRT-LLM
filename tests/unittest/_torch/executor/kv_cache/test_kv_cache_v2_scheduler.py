@@ -23,6 +23,8 @@ from unittest.mock import Mock, PropertyMock, call, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _GUARD_PAGE_REQUEST_ID,
+    CUDA_GRAPH_DUMMY_REQUEST_ID,
     BlockReusePolicy,
     KVCacheManagerV2,
 )
@@ -588,6 +590,184 @@ def make_scheduler(
             enable_recompute_pause=enable_recompute_pause,
             **kwargs,
         )
+
+
+def _completion_scheduler(monkeypatch, blocks: int = 8, *, bind_guard: bool = True):
+    monkeypatch.setenv("TRTLLM_RETIRE_COMPLETION_BUDGET", "1")
+    manager = make_kv_cache_manager(enable_block_reuse=True, can_evict=True)
+    manager.mapping.world_size = 1
+    manager._supports_dense_resume_capacity.return_value = True
+    manager.supports_execution_context_overlap.return_value = True
+    manager.impl.get_storage_statistics.return_value = [Mock(total=blocks + 1, free=blocks + 1)]
+    manager.impl.get_life_cycle_pool_group_indices.return_value = [0]
+    manager.execution_completion_internal_reservation.side_effect = (
+        lambda: KVCacheManagerV2.execution_completion_internal_reservation(manager)
+    )
+
+    def prepare(req, reuse_limit=None, **kwargs):
+        manager.kv_cache_map[req.py_request_id]
+        return True
+
+    manager.prepare_context.side_effect = prepare
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=256,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64),
+    )
+    if bind_guard:
+        scheduler.set_execution_suspend_guard(Mock())
+    return manager, scheduler
+
+
+def _completion_request(request_id: int, prompt_len: int, *, tagged: bool = True):
+    req = make_ctx_request(request_id, prompt_len)
+    req.max_new_tokens = 1
+    req.py_execution_version = object() if tagged else None
+    return req
+
+
+def test_completion_budget_defers_large_prefill_until_native_cleanup(monkeypatch):
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    first = _completion_request(1, 384)
+    second = _completion_request(2, 384)
+    assert scheduler.schedule_request([first, second], set()).context_requests == [first]
+    assert 2 not in manager.kv_cache_map
+
+    first.state_value = GEN_TO_COMPLETE
+    first.is_context_init_state = False
+    first.is_generation_in_progress_state = True
+    # Final response/active-list removal alone cannot return the completion
+    # credit: native ownership can still outlive the logical request.
+    assert scheduler.schedule_request([first, second], set()).context_requests == []
+    assert scheduler.schedule_request([second], set()).context_requests == []
+    del manager.kv_cache_map[1]
+    assert scheduler.schedule_request([second], set()).context_requests == [second]
+
+
+def test_completion_budget_scans_and_charges_untagged_neighbors(monkeypatch):
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    first = _completion_request(1, 384)
+    blocked = _completion_request(2, 384)
+    neighbor = _completion_request(3, 128, tagged=False)
+    result = scheduler.schedule_request([first, blocked, neighbor], set())
+    # The first pass spends its compute budget on first; a later pass can
+    # still admit a fitting ordinary neighbor past the blocked large row.
+    assert result.context_requests == [first]
+    first.is_first_context_chunk = False
+    first.context_current_position = 256
+    first.context_remaining_length = 128
+    result = scheduler.schedule_request([first, blocked, neighbor], set())
+    assert result.context_requests == [first, neighbor]
+    assert set(scheduler._completion_claims) == {1, 3}
+    assert 2 not in manager.kv_cache_map
+
+
+def test_completion_budget_counts_existing_decode_and_preserves_tagged_owner(monkeypatch):
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    generation = make_gen_request(1)
+    generation.prompt_len = 256
+    generation.max_new_tokens = 65
+    generation.py_execution_version = object()
+    manager.kv_cache_map[1]
+    context = _completion_request(2, 256)
+    result = scheduler.schedule_request([generation, context], set())
+    assert result.generation_requests == [generation]
+    assert result.context_requests == []
+    assert not scheduler._is_recompute_pause_candidate(generation, set())
+    generation.py_execution_version = None
+    assert scheduler._is_recompute_pause_candidate(generation, set())
+
+
+def test_completion_budget_admits_full_usable_request_and_rejects_impossible_bound(monkeypatch):
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    whole_pool = _completion_request(1, 512)
+    assert scheduler.schedule_request([whole_pool], set()).context_requests == [whole_pool]
+    del manager.kv_cache_map[1]
+    impossible = _completion_request(2, 512)
+    impossible.max_new_tokens = 2
+    with pytest.raises(ValueError, match="needs 9 completion blocks"):
+        scheduler.schedule_request([impossible], set())
+    assert 2 not in manager.kv_cache_map
+
+
+def test_completion_budget_does_not_estimate_shared_physical_pages(monkeypatch):
+    _, scheduler = _completion_scheduler(monkeypatch)
+    requests = [_completion_request(i, 384) for i in (1, 2)]
+    for req in requests:
+        req.get_tokens.return_value = list(range(384))
+    assert scheduler.schedule_request(requests, set()).context_requests == requests[:1]
+    assert sum(claim[2] for claim in scheduler._completion_claims.values()) == 6
+
+
+def test_completion_budget_requires_opt_in_and_execution_owner(monkeypatch):
+    monkeypatch.delenv("TRTLLM_RETIRE_COMPLETION_BUDGET", raising=False)
+    manager = make_kv_cache_manager()
+    scheduler = make_scheduler(manager)
+    scheduler.set_execution_suspend_guard(Mock())
+    assert scheduler._completion_budget_blocks is None
+    manager.impl.get_storage_statistics.assert_not_called()
+    monkeypatch.setenv("TRTLLM_RETIRE_COMPLETION_BUDGET", "1")
+    scheduler = make_scheduler(manager)
+    assert scheduler._completion_budget_blocks is None
+
+
+def test_completion_budget_rejects_unsupported_topology(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_COMPLETION_BUDGET", "1")
+    scheduler = make_scheduler(make_kv_cache_manager())
+    with pytest.raises(ValueError, match="dense single-rank two-tier V2"):
+        scheduler.set_execution_suspend_guard(Mock())
+    assert scheduler._execution_suspend_guard is None
+
+
+def test_completion_budget_fails_closed_for_unknown_native_owner(monkeypatch):
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    manager.kv_cache_map[99]
+    with pytest.raises(RuntimeError, match="unaccounted native cache owner"):
+        scheduler.schedule_request([_completion_request(1, 64)], set())
+    manager.prepare_context.assert_not_called()
+
+
+def test_completion_budget_fails_closed_for_overcommitted_late_binding(monkeypatch):
+    manager, scheduler = _completion_scheduler(monkeypatch, bind_guard=False)
+    existing = [_completion_request(i, 384) for i in (1, 2)]
+    for req in existing:
+        manager.kv_cache_map[req.py_request_id]
+    scheduler.set_execution_suspend_guard(Mock())
+    with pytest.raises(
+        RuntimeError, match="existing completion demand 12 exceeds usable GPU budget 8"
+    ):
+        scheduler.schedule_request(existing, set())
+    manager.prepare_context.assert_not_called()
+    manager.suspend_request.assert_not_called()
+
+
+@pytest.mark.parametrize("preallocated", [False, True])
+def test_completion_budget_accounts_graph_dummy_once(monkeypatch, preallocated):
+    manager, scheduler = _completion_scheduler(monkeypatch, bind_guard=False)
+    dummy = Mock(capacity=1)
+    if preallocated:
+        manager.kv_cache_map[CUDA_GRAPH_DUMMY_REQUEST_ID] = dummy
+    scheduler.set_execution_suspend_guard(Mock())
+    assert scheduler._completion_budget_blocks == 8
+    req = _completion_request(1, 512)
+    assert scheduler.schedule_request([req], set()).context_requests == [req]
+    # Lazy creation consumes the block reserved at installation, without
+    # double charging it or treating an engine-owned dummy as an unknown row.
+    manager.kv_cache_map[CUDA_GRAPH_DUMMY_REQUEST_ID] = dummy
+    scheduler._refresh_completion_claims([req])
+    assert set(scheduler._completion_claims) == {1}
+    assert scheduler._completion_budget_blocks == 8
+
+
+def test_completion_budget_accounts_guard_and_rejects_internal_growth(monkeypatch):
+    manager, scheduler = _completion_scheduler(monkeypatch, bind_guard=False)
+    manager.kv_cache_map[_GUARD_PAGE_REQUEST_ID] = Mock(capacity=1)
+    scheduler.set_execution_suspend_guard(Mock())
+    assert scheduler._completion_budget_blocks == 7
+    scheduler._refresh_completion_claims([])
+    manager.kv_cache_map[CUDA_GRAPH_DUMMY_REQUEST_ID] = Mock(capacity=65)
+    with pytest.raises(RuntimeError, match="internal cache exceeds its one-block reservation"):
+        scheduler._refresh_completion_claims([])
 
 
 def make_encoder_scheduler(kv_cache_manager, cross_kv_cache_manager=None, **kwargs):

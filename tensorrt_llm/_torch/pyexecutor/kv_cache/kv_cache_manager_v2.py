@@ -1810,6 +1810,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
 
         self._allocated_draft_lens: dict[int, int] = {}
+        self._execution_completion_budget = False
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -3354,6 +3355,29 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._gpu_max_tokens is not None:
             clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
+
+    def execution_completion_internal_reservation(self) -> tuple[int, frozenset[int]]:
+        """Charge internal owners for the opt-in dense completion budget.
+
+        Non-speculative graph padding retains one one-token native cache and
+        can create it lazily after workload admission. Reserve its block even
+        before creation. The diagnostic guard, if enabled, is already created
+        during manager construction. Neither owner appears in active_requests.
+        """
+        internal_ids = _RESERVED_REQUEST_IDS | {CUDA_GRAPH_DUMMY_REQUEST_ID}
+        guard_blocks = 0
+        for request_id in internal_ids:
+            cache = self.kv_cache_map.get(request_id)
+            if cache is None:
+                continue
+            blocks = (cache.capacity + self.tokens_per_block - 1) // self.tokens_per_block
+            if blocks > 1:
+                raise RuntimeError(
+                    "RETIRE completion budget internal cache exceeds its one-block reservation"
+                )
+            if request_id == _GUARD_PAGE_REQUEST_ID:
+                guard_blocks += blocks
+        return 1 + guard_blocks, internal_ids
 
     def get_num_free_blocks(self) -> int:
         # NOTE This method is used to get the number of blocks in the primary pool not the FREE blocks.

@@ -64,6 +64,33 @@ def test_v2_owns_a_suspended_cache_with_exact_namespace_and_last_token_excluded(
     cache.close.assert_called_once()
 
 
+def test_completion_budget_retains_migration_slack_without_releasing_promises(engine):
+    manager = engine.kv_cache_manager
+    manager._execution_completion_budget = True
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=4)]
+    manager.impl.create_kv_cache.return_value = Mock(num_committed_tokens=12)
+    adapter = KVAlignmentAdapter(engine)
+    hold = adapter.reserve(INPUT)
+    assert hold.num_tokens == 12
+    assert manager.impl.create_kv_cache.call_args.args[1] == list(range(12))
+    assert adapter._reserved_v2_blocks == 3
+    manager.impl.create_kv_cache.reset_mock()
+    assert adapter.reserve(INPUT).num_tokens == 0
+    manager.impl.create_kv_cache.assert_not_called()
+    assert not hold._closed
+    hold.close()
+    assert adapter._reserved_v2_blocks == 0
+
+
+def test_completion_budget_rejects_unsatisfied_minimum_before_native_acquisition(engine):
+    manager = engine.kv_cache_manager
+    manager._execution_completion_budget = True
+    manager.impl.get_storage_statistics.return_value = [SimpleNamespace(total=4)]
+    with pytest.raises(RuntimeError, match="required prefix exceeds"):
+        KVAlignmentAdapter(engine).reserve(replace(INPUT, min_reuse_tokens=13))
+    manager.impl.create_kv_cache.assert_not_called()
+
+
 @pytest.mark.parametrize("v2", [False, True])
 def test_zero_limit_never_acquires_cached_pages(engine, v2):
     engine._is_kv_manager_v2 = v2

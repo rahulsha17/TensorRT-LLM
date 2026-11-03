@@ -127,7 +127,13 @@ class KVAlignmentAdapter:
             return 0
         groups = Counter(impl.get_life_cycle_pool_group_indices(1))
         stats = impl.get_storage_statistics(1)
-        return min((stats[group].total // count for group, count in groups.items()), default=0)
+        limit = min((stats[group].total // count for group, count in groups.items()), default=0)
+        # The opt-in scheduler bounds admitted owners by GPU completion demand.
+        # One backing-tier block remains unpromised so incremental promotion
+        # can exchange held pages even at that completion bound.
+        if getattr(self._manager, "_execution_completion_budget", False) is True:
+            limit = max(0, limit - 1)
+        return limit
 
     def _reserve_v2(self, revised: AlignmentInput) -> PrefixReservation:
         from ...runtime.kv_cache_manager_v2 import ReuseScope
