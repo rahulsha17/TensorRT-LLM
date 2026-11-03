@@ -143,6 +143,13 @@ class ExecutionDeviceGuard:
         if early_exit not in ("0", "1"):
             raise ValueError("TRTLLM_RETIRE_EARLY_EXIT must be 0 or 1")
         self._early_exit_enabled = early_exit == "1"
+        for flag in ("TRTLLM_RETIRE_EARLY_ALIGNMENT", "TRTLLM_RETIRE_NONBLOCKING_ALIGN"):
+            if os.environ.get(flag, "0") not in ("0", "1"):
+                raise ValueError(f"{flag} must be 0 or 1")
+        self._early_alignment_enabled = os.environ.get("TRTLLM_RETIRE_EARLY_ALIGNMENT", "0") == "1"
+        self._nonblocking_alignment_enabled = (
+            rank_consensus is None and os.environ.get("TRTLLM_RETIRE_NONBLOCKING_ALIGN", "0") == "1"
+        )
         self.validate_executor(executor, tensor_parallel=rank_consensus is not None)
         self._model_engine = executor.model_engine
         self._speculative_tokens_per_step = (
@@ -195,6 +202,10 @@ class ExecutionDeviceGuard:
             else lambda: None,
             prepare=self._prepare_prefix,
             reserve_isolated=self._reserve_isolated_prefix,
+            prepare_ready=(
+                self._prefix_preparation_ready if self._nonblocking_alignment_enabled else None
+            ),
+            notify_ready=table.notify_readiness,
         )
         if self._kv_manager is not None and rank_consensus is None:
             self._kv_manager._execution_resident_recovery = self._has_resident_recovery
@@ -207,6 +218,36 @@ class ExecutionDeviceGuard:
             and state is not None
             and state.has_resident_recovery(version, request.py_request_id)
         )
+
+    def _prefix_preparation_ready(self, alignment: AlignmentRequest) -> bool:
+        """Inspect all source uses without waiting or changing their ownership.
+
+        Called on the engine thread under the alignment lock. The later prepare
+        runs on that same thread, so no newer sampling use can appear between
+        this proof and settlement. Unknown completion still poisons ALIGN.
+        """
+        old = alignment.revision.expected_version
+        ready = True
+        try:
+            for use in self._uses.values():
+                request = use.request
+                version = request.py_execution_version
+                if (
+                    version is None
+                    or (version.tenant_id, version.scope_id) != (old.tenant_id, old.scope_id)
+                    or version.epoch > old.epoch
+                ):
+                    continue
+                if use.event is None:
+                    raise RuntimeError("source GPU completion is unknown")
+                if not use.event.query():
+                    ready = False
+                for chunk in getattr(self, "_context_chunks", {}).get(id(request), []):
+                    if not chunk.ticket.query():
+                        ready = False
+        except Exception as error:
+            raise AlignmentSafetyError("source KV preparation failed; restart required") from error
+        return ready
 
     def _prepare_prefix(self, alignment: AlignmentRequest) -> None:
         # Prepare only this scope's obsolete sources. Unrelated work must not
@@ -341,6 +382,26 @@ class ExecutionDeviceGuard:
         if self.table.alignment_state is not None:
             self.table.alignment_state.process()
 
+    @property
+    def nonblocking_alignment_enabled(self) -> bool:
+        """Whether regular engine safe points must retry deferred preparation."""
+        return getattr(self, "_nonblocking_alignment_enabled", False)
+
+    def process_isolated_alignment(self) -> None:
+        """Try local isolation after sampling submission, before input-copy waits.
+
+        Sampling must already have recorded its latest use event: isolation can
+        mark the source cancelled. This pass never prepares fallback prefixes
+        or reclaims native holds whose input metadata may still be in flight.
+        """
+        if (
+            getattr(self, "_early_alignment_enabled", False)
+            and getattr(self, "_async_context", False)
+            and self._rank_consensus is None
+            and self.table.alignment_state is not None
+        ):
+            self.table.alignment_state.process(isolated_only=True)
+
     @contextmanager
     def releasing_resources(self) -> Iterator[None]:
         """Keep the old KV owner until an observed revision has acquired its hold."""
@@ -416,6 +477,7 @@ class ExecutionDeviceGuard:
             self.table.alignment_state.terminal(version, request_id)
         if self.table.drain_tracker is not None:
             self.table.drain_tracker.complete(request_id, version)
+        self.table.notify_readiness()
 
     @staticmethod
     def validate_request(request: LlmRequest) -> None:
@@ -525,6 +587,7 @@ class ExecutionDeviceGuard:
         """Invalidate readiness and drain evidence before the engine's fatal cleanup."""
         if self.table.drain_tracker is not None:
             self.table.drain_tracker.fail(error)
+        self.table.notify_readiness()
         if self._rank_consensus is not None:
             self._rank_consensus.fail(error)
             self.table.close()

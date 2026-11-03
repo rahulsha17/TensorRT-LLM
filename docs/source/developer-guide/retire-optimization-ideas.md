@@ -13,6 +13,15 @@ reference. Its ownership and fallback contract is documented in
 [Local handoff before old cleanup](retire.md#local-handoff-before-old-cleanup).
 Host tests do not establish CUDA correctness or a serving speedup.
 
+The November 3 implementation adds opt-in nonblocking preparation, completion
+wakeups, an earlier isolated safe point, adaptive chunks, revision cohorts,
+native shared-page capacity accounting, bounded isolated-prefix residency,
+strict partial-prefix isolation, internal scratch pooling and queued ADVANCE
+coalescing. See [Experimental performance switches](retire.md#experimental-performance-switches)
+for their contracts. The table below retains the motivation and tradeoffs;
+these switches still require GPU qualification and measured comparisons.
+GPU-conditional layer groups remain a separate proposal.
+
 ## Existing mechanisms and benchmark context
 
 The reference implementation already includes capacity-aware V2 resume, bounded

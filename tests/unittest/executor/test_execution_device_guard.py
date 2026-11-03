@@ -1235,6 +1235,8 @@ def test_authority_binds_lossless_suspension_only_to_single_rank_v2(
     )
     scheduler = object.__new__(KVCacheV2Scheduler) if v2 else SimpleNamespace()
     scheduler._execution_suspend_guard = None
+    scheduler._completion_budget_blocks = None
+    scheduler._revision_policy = None
     executor = SimpleNamespace(
         _execution_guard=None,
         async_transfer_manager=Mock(),
@@ -1961,6 +1963,67 @@ def _retiring_executor(guard, request):
     executor.gather_all_responses = True
     executor.result_wait_queues = {request.py_request_id: object()}
     return executor
+
+
+@pytest.mark.parametrize("pending", ["event", "receipt", "none"])
+def test_fallback_preparation_probe_does_not_wait_or_mutate_sources(guard, pending):
+    request, _, alignment = _isolated_handoff(guard)
+    guard._uses[id(request)].event.query.return_value = pending != "event"
+    ticket = Mock()
+    ticket.query.return_value = pending != "receipt"
+    guard._context_chunks = {id(request): [SimpleNamespace(ticket=ticket)]}
+    guard._settle_prefix = Mock()
+    assert guard._prefix_preparation_ready(alignment) == (pending == "none")
+    guard.device.wait_event.assert_not_called()
+    ticket.wait.assert_not_called()
+    guard._settle_prefix.assert_not_called()
+    request.finish_by_reason.assert_not_called()
+    assert id(request) in guard._uses
+
+
+@pytest.mark.parametrize("failure", ["unknown", "query"])
+def test_fallback_preparation_probe_unknown_completion_fails_closed(guard, failure):
+    from tensorrt_llm.execution_alignment import AlignmentSafetyError
+
+    request, _, alignment = _isolated_handoff(guard)
+    if failure == "unknown":
+        guard._uses[id(request)].event = None
+    else:
+        guard._uses[id(request)].event.query.side_effect = RuntimeError("lost device")
+    with pytest.raises(AlignmentSafetyError, match="preparation failed"):
+        guard._prefix_preparation_ready(alignment)
+    assert id(request) in guard._uses
+    request.finish_by_reason.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled,async_context", [(False, True), (True, False), (True, True)])
+def test_early_alignment_entry_is_opt_in_and_isolated_only(guard, enabled, async_context):
+    guard._early_alignment_enabled = enabled
+    guard._async_context = async_context
+    guard.table.alignment_state = Mock()
+    guard.process_isolated_alignment()
+    if enabled and async_context:
+        guard.table.alignment_state.process.assert_called_once_with(isolated_only=True)
+    else:
+        guard.table.alignment_state.process.assert_not_called()
+
+
+def test_terminal_readiness_is_signalled_only_after_actual_tracker_completion(guard):
+    observations = []
+    tracker = guard.table.drain_tracker = RequestDrainTracker()
+    tracker.enqueue(VERSION, lambda: 42)
+    guard.table._subscribe_readiness(lambda: observations.append(tracker.drained(VERSION)))
+    guard.terminal(42, VERSION)
+    assert observations == [True]
+
+
+@pytest.mark.parametrize(
+    "flag", ["TRTLLM_RETIRE_EARLY_ALIGNMENT", "TRTLLM_RETIRE_NONBLOCKING_ALIGN"]
+)
+def test_private_alignment_flags_reject_ambiguous_values(monkeypatch, flag):
+    monkeypatch.setenv(flag, "true")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        ExecutionDeviceGuard(Mock(), WorkerVersionTable("session"))
 
 
 def test_isolated_alignment_resumes_while_old_gpu_work_and_cleanup_remain(guard):
@@ -3019,6 +3082,77 @@ def test_overlap_accepts_missing_sample_only_for_fully_revoked_batch(monkeypatch
     with pytest.raises(ReachedCommit if finished else AssertionError):
         PyExecutor._executor_loop_overlap(executor)
     executor._sample_async.assert_called_once_with(batch, None)
+
+
+def test_overlap_isolation_follows_latest_sampler_use_before_input_copy_wait(guard, monkeypatch):
+    from unittest.mock import MagicMock
+
+    class ReachedInputWait(Exception):
+        pass
+
+    for name in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
+        monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{name}", Mock())
+    request = _request()
+    batch = _batch(request, context=True)
+    guard._early_alignment_enabled = True
+    guard._async_context = True
+    guard.table.alignment_state = Mock()
+    order = []
+    original_isolate = guard.process_isolated_alignment
+
+    def isolate():
+        assert order == ["sample_submitted"]
+        assert guard._uses[id(request)].event is not None
+        guard._uses[id(request)].event.record.assert_called_once()
+        order.append("isolate")
+        original_isolate()
+
+    def sample(*args):
+        with guard.sampling(batch):
+            assert guard._uses[id(request)].event is None
+            order.append("sample_submitted")
+        return object()
+
+    def input_wait():
+        if order:
+            assert order == ["sample_submitted", "isolate"]
+            raise ReachedInputWait
+
+    guard.process_isolated_alignment = isolate
+    executor = MagicMock()
+    for flag in (
+        "enable_iter_perf_stats",
+        "is_benchmark_disagg",
+        "_resource_governor_enabled",
+        "_mm_encoder_item_scheduling_enabled",
+        "use_spec_decode",
+        "has_previous_draft_tokens",
+        "enable_early_first_token_response",
+    ):
+        setattr(executor, flag, False)
+    for field in (
+        "kv_connector_manager",
+        "kv_cache_transceiver",
+        "drafter",
+        "guided_decoder",
+        "previous_batch",
+        "speculation_gate",
+    ):
+        setattr(executor, field, None)
+    executor._execution_guard = guard
+    executor._is_kv_manager_v2 = True
+    executor._can_pause_for_rebalance.return_value = False
+    executor._profiler.return_value = nullcontext(Mock())
+    executor._prepare_and_schedule_batch.return_value = (batch, None)
+    executor._check_benchmark_disagg_gate.return_value = (True, False)
+    executor._can_queue.return_value = (True, True)
+    executor._sample_async.side_effect = sample
+    executor._wait_for_model_engine_input_copy.side_effect = input_wait
+    executor.perf_manager.create_timing_events.return_value = (None, None, None)
+    with pytest.raises(ReachedInputWait):
+        PyExecutor._executor_loop_overlap(executor)
+    guard.table.alignment_state.process.assert_called_once_with(isolated_only=True)
+    guard.device.wait_event.assert_not_called()
 
 
 def test_v1_old_native_wheel_rejected_before_device_setup(monkeypatch):

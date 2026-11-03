@@ -3,7 +3,7 @@
 """ALIGN ownership, revision binding, and IPC status without native dependencies."""
 
 from dataclasses import replace
-from threading import Event, get_ident
+from threading import Event, Thread, get_ident
 from unittest.mock import Mock
 
 import pytest
@@ -34,6 +34,134 @@ OLD = ExecutionVersion("tenant", "scope", 7)
 NEW = replace(OLD, epoch=8)
 REVISION = Revision("edit", OLD, NEW)
 INPUT = AlignmentInput((1, 2, 3, 4, 5), cache_salt="shared")
+
+
+def test_pending_preparation_returns_without_blocking_supersession_or_acquiring_kv():
+    ready = Mock(return_value=False)
+    prepare = Mock()
+    reserve = Mock(return_value=Mock(num_tokens=3))
+    state = WorkerAlignmentState(reserve, lambda: None, prepare=prepare, prepare_ready=ready)
+    first = AlignmentRequest("session", REVISION, INPUT)
+    state.observe(NEW, first)
+    state.process()
+    assert state.poll(first) is None
+    prepare.assert_not_called()
+    reserve.assert_not_called()
+    newer = replace(NEW, epoch=9)
+    second = AlignmentRequest("session", Revision("again", NEW, newer), INPUT)
+    published = Event()
+
+    def supersede():
+        state.observe(newer, second)
+        published.set()
+
+    thread = Thread(target=supersede)
+    thread.start()
+    assert published.wait(5)
+    thread.join(5)
+    ready.return_value = True
+    state.process()
+    reserve.assert_called_once_with(INPUT)
+    prepare.assert_called_once_with(second)
+    with pytest.raises(RuntimeError, match="superseded"):
+        state.poll(first)
+    assert state.poll(second).reusable_prefix_length == 3
+    state.close()
+    state.process()
+
+
+def test_release_boundary_captures_pending_fallback_before_owner_disappears():
+    ready = Mock(return_value=False)
+    order = []
+    state = WorkerAlignmentState(
+        lambda _: (order.append("reserve") or Mock(num_tokens=3)),
+        lambda: None,
+        prepare=lambda _: order.append("prepare"),
+        prepare_ready=ready,
+    )
+    request = AlignmentRequest("session", REVISION, INPUT)
+    state.observe(NEW, request)
+    state.process()
+    assert not order
+    with state.releasing_owner():
+        assert state.poll(request) is not None
+        order.append("release")
+    assert order == ["prepare", "reserve", "release"]
+    state.close()
+    state.process()
+
+
+@pytest.mark.parametrize("isolated", [True, False])
+def test_early_alignment_never_prepares_fallback_or_reclaims_old_holds(isolated):
+    first = AlignmentRequest("session", REVISION, INPUT)
+    newer = replace(NEW, epoch=9)
+    second = AlignmentRequest("session", Revision("again", NEW, newer), INPUT)
+    old_hold, new_hold = Mock(num_tokens=3), Mock(num_tokens=2)
+    reserve = Mock(return_value=old_hold)
+    prepare = Mock()
+    probe = Mock(return_value=None)
+    state = WorkerAlignmentState(reserve, lambda: None, prepare=prepare, reserve_isolated=probe)
+    state.observe(NEW, first)
+    state.process()
+    prepare.reset_mock()
+    reserve.reset_mock()
+    probe.return_value = new_hold if isolated else None
+    state.observe(newer, second)
+    state.process(isolated_only=True)
+    old_hold.close.assert_not_called()
+    prepare.assert_not_called()
+    reserve.assert_not_called()
+    assert (state.poll(second) is not None) == isolated
+    state.close()
+    state.process()
+    old_hold.close.assert_called_once()
+
+
+def test_failed_preparation_probe_notifies_and_keeps_source_owner():
+    error = AlignmentSafetyError("unknown source event")
+    notify, reserve, prepare = Mock(), Mock(), Mock()
+    state = WorkerAlignmentState(
+        reserve,
+        lambda: None,
+        prepare=prepare,
+        prepare_ready=Mock(side_effect=error),
+        notify_ready=notify,
+    )
+    request = AlignmentRequest("session", REVISION, INPUT)
+    state.observe(NEW, request)
+    with pytest.raises(AlignmentSafetyError, match="unknown source event"):
+        state.process()
+    notify.assert_called_once()
+    reserve.assert_not_called()
+    prepare.assert_not_called()
+    with pytest.raises(AlignmentSafetyError, match="unknown source event"):
+        with state.releasing_owner():
+            pytest.fail("unknown source ownership was released")
+
+
+def test_pending_preparation_keeps_superseded_hold_until_successor_acquires():
+    old_hold, new_hold = Mock(num_tokens=3), Mock(num_tokens=3)
+    order = []
+    old_hold.close.side_effect = lambda: order.append("old_close")
+    reserve = Mock(side_effect=(old_hold, new_hold))
+    ready = Mock(return_value=True)
+    state = WorkerAlignmentState(reserve, lambda: None, prepare_ready=ready)
+    first = AlignmentRequest("session", REVISION, INPUT)
+    state.observe(NEW, first)
+    state.process()
+    second = AlignmentRequest("session", Revision("again", NEW, replace(NEW, epoch=9)), INPUT)
+    ready.return_value = False
+    state.observe(second.revision.successor_version, second)
+    state.process()
+    old_hold.close.assert_not_called()
+    assert state.poll(second) is None
+    ready.return_value = True
+    reserve.side_effect = lambda _: (order.append("new_reserve") or new_hold)
+    state.process()
+    assert order == ["new_reserve", "old_close"]
+    assert state.poll(second).reusable_prefix_length == 3
+    state.close()
+    state.process()
 
 
 @pytest.mark.parametrize("limit", [-1, 5, True, 1.5, "2"])

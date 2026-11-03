@@ -278,6 +278,12 @@ public:
 
     // Independent per-pool values sampled together under the shared API lock.
     TypedVec<PoolGroupIndex, StorageStatistics> getStorageStatistics(CacheLevel cacheLevel = kHotLevel) const;
+
+    //! Completion demand in physical GPU slots per pool, deduplicating only immutable full pages.
+    //! Each exact live owner retains at least its allocated capacity; partial-tail copies and all
+    //! future growth remain private charges. The caller serializes its cache owners across admission.
+    std::vector<int64_t> getCompletionDemand(
+        std::vector<std::shared_ptr<KvCache>> const& caches, std::vector<int> const& finalCapacities) const;
     // Pool-group numbering is level-specific; cold grouping can differ from the hot layout.
     TypedVec<LifeCycleId, PoolGroupIndex> getLifeCyclePoolGroupIndices(CacheLevel cacheLevel = kHotLevel) const;
 

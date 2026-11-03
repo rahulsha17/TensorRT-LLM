@@ -145,6 +145,7 @@ l0_cpu:
   - unittest/executor/test_execution_authority.py
   - unittest/executor/test_execution_alignment.py
   - unittest/executor/test_execution_alignment_adapter.py
+  - unittest/executor/test_execution_completion_accounting.py
   - unittest/executor/test_execution_fence.py
   - unittest/executor/test_execution_mailbox.py
   - unittest/executor/test_execution_collective.py

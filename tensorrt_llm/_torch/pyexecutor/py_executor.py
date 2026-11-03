@@ -4096,6 +4096,11 @@ class PyExecutor:
         self._execution_guard = guard
 
     def _prepare_and_schedule_batch(self):
+        guard = getattr(self, '_execution_guard', None)
+        if guard is not None and guard.nonblocking_alignment_enabled:
+            # A nonblocking ALIGN attempt can outlive its one queue wakeup.
+            # Input-copy waits precede this safe point in the overlap loop.
+            guard.process_alignment()
         self._process_execution_releases()
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
@@ -5755,6 +5760,13 @@ class PyExecutor:
                         and all(r.is_finished
                                 for r in scheduled_batch.all_requests())
                     ), "Sampling failed"
+
+                    guard = getattr(self, '_execution_guard', None)
+                    if guard is not None:
+                        # The sampler's final use event is now recorded. This
+                        # pass may isolate owners, but cannot mutate the page
+                        # table or reclaim input storage still being copied.
+                        guard.process_isolated_alignment()
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
                     # If called before, failed requests would be marked as GENERATION_COMPLETE,

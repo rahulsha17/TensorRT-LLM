@@ -267,6 +267,7 @@ def test_sparse_publication_failure_stops_metadata_preparation() -> None:
 def test_dense_metadata_preparation_uses_existing_offsets() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = None
     manager.max_copy_beam_width = 1
     manager.kv_cache_type = CacheTypeCpp.SELF
     manager._use_per_layer_page_tables = False
@@ -592,6 +593,241 @@ def make_scheduler(
         )
 
 
+def _revision_scheduler(monkeypatch, *, adaptive=True, cohort=False, **kwargs):
+    monkeypatch.setenv("TRTLLM_RETIRE_ADAPTIVE_PREFILL", str(int(adaptive)))
+    monkeypatch.setenv("TRTLLM_RETIRE_REVISION_COHORT", str(int(cohort)))
+    monkeypatch.setenv("TRTLLM_RETIRE_REVISION_CHUNK_TOKENS", "128")
+    monkeypatch.setenv("TRTLLM_RETIRE_REVISION_STABLE_TOKENS", "256")
+    manager = make_kv_cache_manager(**kwargs)
+    manager.mapping.world_size = 1
+    manager._supports_dense_resume_capacity.return_value = True
+    scheduler = make_scheduler(
+        manager, ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64)
+    )
+    scheduler.set_execution_suspend_guard(Mock())
+    return manager, scheduler
+
+
+def _revision_request(request_id, *, scope=None, epoch=0):
+    from tensorrt_llm.execution_version import ExecutionVersion
+
+    request = make_ctx_request(request_id, 4096, is_last_context_chunk=False)
+    request.py_execution_version = ExecutionVersion("tenant", scope or str(request_id), epoch)
+    request.py_multimodal_data = None
+    return request
+
+
+def _advance_revision_context(request):
+    request.context_current_position += request.context_chunk_size
+    request.context_remaining_length -= request.context_chunk_size
+    request.is_first_context_chunk = False
+
+
+def test_revision_chunk_cap_relaxes_only_after_observed_computation(monkeypatch):
+    _, scheduler = _revision_scheduler(monkeypatch)
+    request = _revision_request(1)
+    for expected in (128, 128, 1024):
+        result = scheduler.schedule_request([request], set())
+        assert result.context_requests == [request]
+        assert request.context_chunk_size == expected
+        _advance_revision_context(request)
+
+
+def test_revision_prefix_hit_does_not_count_as_stable_computation(monkeypatch):
+    def reuse(request, **kwargs):
+        if request.is_first_context_chunk:
+            request.context_current_position = 4096
+        return True
+
+    _, scheduler = _revision_scheduler(monkeypatch, prepare_context_fn=reuse)
+    request = _revision_request(1)
+    scheduler.schedule_request([request], set())
+    assert request.context_current_position == 4096
+    assert request.context_chunk_size == 128
+    _advance_revision_context(request)
+    scheduler.schedule_request([request], set())
+    assert request.context_chunk_size == 128
+
+
+@pytest.mark.parametrize("change", ["epoch", "request", "rewind"])
+def test_revision_stability_does_not_survive_new_owner_or_rewind(monkeypatch, change):
+    from tensorrt_llm.execution_version import ExecutionVersion
+
+    _, scheduler = _revision_scheduler(monkeypatch)
+    request = _revision_request(1)
+    for _ in range(3):
+        scheduler.schedule_request([request], set())
+        _advance_revision_context(request)
+    if change == "epoch":
+        request.py_execution_version = ExecutionVersion("tenant", "1", 1)
+    elif change == "request":
+        request = _revision_request(1)
+    else:
+        request.context_current_position = 0
+    scheduler.schedule_request([request], set())
+    assert request.context_chunk_size == 128
+    assert len(scheduler._revision_policy._progress) == 1
+
+
+def test_revision_cap_preserves_stable_neighbor_and_total_budget(monkeypatch):
+    _, scheduler = _revision_scheduler(monkeypatch)
+    young = _revision_request(1)
+    stable = make_ctx_request(2, 4096, is_last_context_chunk=False)
+    result = scheduler.schedule_request([young, stable], set())
+    assert result.context_requests == [young, stable]
+    assert (young.context_chunk_size, stable.context_chunk_size) == (128, 896)
+
+
+def test_revision_cohorts_rotate_and_bound_decode_deferral(monkeypatch):
+    _, scheduler = _revision_scheduler(monkeypatch, cohort=True)
+    first, second = _revision_request(1), _revision_request(2)
+    live = make_gen_request(3)
+    for expected_ctx, expected_gen in (([first], []), ([], [live]), ([second], []), ([], [live])):
+        result = scheduler.schedule_request([first, second, live], set())
+        assert result.context_requests == expected_ctx
+        assert result.generation_requests == expected_gen
+        assert sum(req.context_chunk_size for req in expected_ctx) <= 128
+
+
+def test_revision_cohort_combines_same_authority_with_one_batch_cap(monkeypatch):
+    _, scheduler = _revision_scheduler(monkeypatch, cohort=True)
+    first, second = [_revision_request(i, scope="same") for i in (1, 2)]
+    first.context_remaining_length = 64
+    first.is_last_context_chunk = True
+    result = scheduler.schedule_request([first, second], set())
+    assert result.context_requests == [second, first]
+    assert first.context_chunk_size + second.context_chunk_size == 128
+
+
+def test_failed_revision_cohort_admission_does_not_idle_live_decode(monkeypatch):
+    manager, scheduler = _revision_scheduler(
+        monkeypatch, cohort=True, prepare_context_fn=lambda req, **kwargs: False
+    )
+    young, live = _revision_request(1), make_gen_request(2)
+    result = scheduler.schedule_request([young, live], set())
+    assert result.context_requests == []
+    assert result.generation_requests == [live]
+    manager.try_allocate_generation.assert_called_once_with(live)
+
+
+def test_revision_cohort_retains_finished_and_inflight_owners(monkeypatch):
+    _, scheduler = _revision_scheduler(monkeypatch, cohort=True)
+    retired, inflight, current = [_revision_request(i) for i in (1, 2, 3)]
+    retired.state_value = GEN_TO_COMPLETE
+    result = scheduler.schedule_request([retired, inflight, current], {2})
+    assert result.context_requests == [current]
+    assert result.paused_requests == result.recompute_paused_requests == []
+
+
+@pytest.mark.parametrize(
+    "flag", ["TRTLLM_RETIRE_ADAPTIVE_PREFILL", "TRTLLM_RETIRE_REVISION_COHORT"]
+)
+def test_revision_flags_reject_ambiguous_values(monkeypatch, flag):
+    monkeypatch.setenv(flag, "yes")
+    scheduler = make_scheduler(make_kv_cache_manager())
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        scheduler.set_execution_suspend_guard(Mock())
+
+
+@pytest.mark.parametrize("unsupported", ["tp", "forced", "no_chunks", "peft", "sparse"])
+def test_revision_policy_preserves_unsupported_execution_modes(monkeypatch, unsupported):
+    monkeypatch.setenv("TRTLLM_RETIRE_ADAPTIVE_PREFILL", "1")
+    monkeypatch.setenv("TRTLLM_RETIRE_REVISION_COHORT", "1")
+    manager = make_kv_cache_manager()
+    manager.mapping.world_size = 2 if unsupported == "tp" else 1
+    manager._supports_dense_resume_capacity.return_value = unsupported != "sparse"
+    policy = (
+        ContextChunkingPolicy.FORCE_CHUNK
+        if unsupported == "forced"
+        else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
+    )
+    scheduler = make_scheduler(
+        manager,
+        ctx_chunk_config=None if unsupported == "no_chunks" else (policy, 64),
+        peft_cache_manager=Mock() if unsupported == "peft" else None,
+    )
+    scheduler.set_execution_suspend_guard(Mock())
+    assert scheduler._revision_policy is None
+
+
+def test_revision_host_counters_describe_admission_and_bound_tokens(monkeypatch):
+    _, scheduler = _revision_scheduler(monkeypatch, cohort=True)
+    young, live = _revision_request(1), make_gen_request(2)
+    scheduler.schedule_request([young, live], set())
+    scheduler.schedule_request([young, live], set())
+    snapshot = scheduler.execution_scheduling_snapshot()
+    assert snapshot["sensitive_passes"] == snapshot["stable_passes"] == 1
+    assert snapshot["context_tokens"] == snapshot["sensitive_tokens"] == 128
+    assert snapshot["max_sensitive_tokens"] == snapshot["chunk_tokens"] == 128
+    assert snapshot["normal_passes"] == snapshot["cohort_fallbacks"] == 0
+    assert snapshot["adaptive_prefill"] and snapshot["revision_cohort"]
+    snapshot["context_tokens"] = -1
+    assert scheduler.execution_scheduling_snapshot()["context_tokens"] == 128
+
+
+def test_revision_cohort_does_not_evict_live_owner_to_form_small_batch(monkeypatch):
+    manager, scheduler = _revision_scheduler(
+        monkeypatch,
+        cohort=True,
+        can_evict=True,
+        prepare_context_fn=lambda req, **kwargs: False,
+    )
+    young, live = _revision_request(1), make_gen_request(2)
+    manager.kv_cache_map[2].is_active = True
+    result = scheduler.schedule_request([young, live], set())
+    assert result.generation_requests == [live]
+    assert result.paused_requests == result.recompute_paused_requests == []
+    manager.suspend_request.assert_not_called()
+    manager.preempt_request.assert_not_called()
+    assert scheduler.execution_scheduling_snapshot()["cohort_fallbacks"] == 1
+
+
+def test_revision_resource_recovery_still_progresses_after_cohort_retry(monkeypatch):
+    manager, scheduler = _revision_scheduler(
+        monkeypatch,
+        cohort=True,
+        can_evict=True,
+        prepare_context_fn=lambda req, **kwargs: False,
+    )
+    young = _revision_request(1)
+    victim = make_ctx_request(2, 1024, is_first_context_chunk=False)
+    manager.kv_cache_map[2].is_active = True
+    manager._yield_execution_residency.return_value = False
+    manager.prepare_context.side_effect = lambda req, **kwargs: (
+        req is young and not manager.kv_cache_map[2].is_active
+    )
+    result = scheduler.schedule_request([young, victim], set())
+    assert result.context_requests == [young]
+    assert result.paused_requests == [victim]
+    assert result.recompute_paused_requests == []
+    manager.suspend_request.assert_called_once_with(victim)
+    assert scheduler.execution_scheduling_snapshot()["cohort_fallbacks"] == 1
+
+
+@pytest.mark.parametrize("kind", ["lora", "multimodal"])
+def test_revision_preserves_specialized_request_batching(monkeypatch, kind):
+    _, scheduler = _revision_scheduler(monkeypatch, cohort=True)
+    request, live = _revision_request(1), make_gen_request(2)
+    if kind == "lora":
+        request.lora_task_id = 7
+    else:
+        request.py_multimodal_data = {}
+    result = scheduler.schedule_request([request, live], set())
+    assert result.generation_requests == [live]
+    assert result.context_requests == [request]
+    assert request.context_chunk_size > 128
+
+
+@pytest.mark.parametrize("adaptive,cohort", [(False, False), (False, True), (True, False)])
+def test_revision_ablation_flags_are_independent(monkeypatch, adaptive, cohort):
+    _, scheduler = _revision_scheduler(monkeypatch, adaptive=adaptive, cohort=cohort)
+    young, live = _revision_request(1), make_gen_request(2)
+    result = scheduler.schedule_request([young, live], set())
+    assert result.generation_requests == ([] if cohort else [live])
+    assert young.context_chunk_size == (128 if adaptive or cohort else 960)
+    assert (scheduler._revision_policy is not None) == (adaptive or cohort)
+
+
 def _completion_scheduler(monkeypatch, blocks: int = 8, *, bind_guard: bool = True):
     monkeypatch.setenv("TRTLLM_RETIRE_COMPLETION_BUDGET", "1")
     manager = make_kv_cache_manager(enable_block_reuse=True, can_evict=True)
@@ -600,8 +836,8 @@ def _completion_scheduler(monkeypatch, blocks: int = 8, *, bind_guard: bool = Tr
     manager.supports_execution_context_overlap.return_value = True
     manager.impl.get_storage_statistics.return_value = [Mock(total=blocks + 1, free=blocks + 1)]
     manager.impl.get_life_cycle_pool_group_indices.return_value = [0]
-    manager.execution_completion_internal_reservation.side_effect = (
-        lambda: KVCacheManagerV2.execution_completion_internal_reservation(manager)
+    manager.execution_completion_internal_reservation.side_effect = lambda: (
+        KVCacheManagerV2.execution_completion_internal_reservation(manager)
     )
 
     def prepare(req, reuse_limit=None, **kwargs):
@@ -624,6 +860,118 @@ def _completion_request(request_id: int, prompt_len: int, *, tagged: bool = True
     req.max_new_tokens = 1
     req.py_execution_version = object() if tagged else None
     return req
+
+
+def test_shared_completion_budget_uses_native_union_and_exact_owner_claims(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", "1")
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    requests = [_completion_request(i, 384) for i in (1, 2)]
+    caches = {req.py_request_id: manager.kv_cache_map[req.py_request_id] for req in requests}
+    manager.execution_completion_demand.return_value = 8
+    scheduler._refresh_completion_claims(requests)
+    assert sum(claim[2] for claim in scheduler._completion_claims.values()) == 12
+    assert all(claim[1] is caches[key] for key, claim in scheduler._completion_claims.items())
+    manager.execution_completion_demand.assert_called_once_with(
+        list(scheduler._completion_claims.values())
+    )
+    manager.execution_completion_demand.return_value = 9
+    with pytest.raises(RuntimeError, match="demand 9 exceeds usable GPU budget 8"):
+        scheduler._refresh_completion_claims(requests)
+
+
+def test_shared_completion_rejection_does_not_enter_normal_admission(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", "1")
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    manager.execution_completion_demand.return_value = 0
+    manager.execution_completion_try_admit.return_value = False
+    request = _completion_request(1, 384)
+    result = scheduler.schedule_request([request], set())
+    assert result.context_requests == []
+    manager.execution_completion_try_admit.assert_called_once_with([], request, 8)
+    manager.prepare_context.assert_not_called()
+    assert manager.kv_cache_map == {}
+
+
+def test_shared_completion_failed_prefill_releases_accepted_candidate(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", "1")
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    manager.execution_completion_demand.return_value = 0
+    candidate = Mock(is_active=False)
+
+    def admit(claims, request, capacity):
+        assert claims == [] and capacity == 8
+        manager.kv_cache_map[request.py_request_id] = candidate
+        return True
+
+    manager.execution_completion_try_admit.side_effect = admit
+    manager.prepare_context.return_value = False
+    manager.prepare_context.side_effect = lambda req, **kwargs: False
+    manager.free_resources.side_effect = lambda req: manager.kv_cache_map.pop(req.py_request_id)
+    request = _completion_request(1, 384)
+    result = scheduler.schedule_request([request], set())
+    assert result.context_requests == []
+    manager.free_resources.assert_called_once_with(request)
+    assert manager.kv_cache_map == {} and scheduler._completion_claims == {}
+
+
+def test_shared_completion_success_keeps_exact_candidate_through_terminal_cleanup(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", "1")
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    manager.execution_completion_demand.return_value = 0
+    candidate = Mock(is_active=False)
+    request = _completion_request(1, 384)
+
+    def admit(claims, req, capacity):
+        assert claims == [] and capacity == 8
+        manager.kv_cache_map[req.py_request_id] = candidate
+        return True
+
+    manager.execution_completion_try_admit.side_effect = admit
+    assert scheduler.schedule_request([request], set()).context_requests == [request]
+    assert scheduler._completion_claims[1][1] is candidate
+    request.is_finished = True
+    scheduler._refresh_completion_claims([])
+    assert scheduler._completion_claims[1][1] is candidate
+    assert manager.execution_completion_demand.call_args.args[0][0][0] is request
+    manager.free_resources.assert_not_called()
+    del manager.kv_cache_map[1]
+    scheduler._refresh_completion_claims([])
+    assert scheduler._completion_claims == {}
+
+
+def test_shared_completion_preparation_exception_frees_candidate(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", "1")
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    manager.execution_completion_demand.return_value = 0
+    request = _completion_request(1, 384)
+
+    def admit(claims, req, capacity):
+        manager.kv_cache_map[req.py_request_id] = Mock(is_active=False)
+        return True
+
+    manager.execution_completion_try_admit.side_effect = admit
+    manager.prepare_context.side_effect = RuntimeError("injected preparation failure")
+    manager.free_resources.side_effect = lambda req: manager.kv_cache_map.pop(req.py_request_id)
+    with pytest.raises(RuntimeError, match="injected preparation failure"):
+        scheduler.schedule_request([request], set())
+    manager.free_resources.assert_called_once_with(request)
+    assert manager.kv_cache_map == {} and scheduler._completion_claims == {}
+
+
+@pytest.mark.parametrize("problem", ["budget_off", "native_missing", "invalid"])
+def test_shared_completion_requires_explicit_budget_and_native_api(monkeypatch, problem):
+    monkeypatch.setenv(
+        "TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", "invalid" if problem == "invalid" else "1"
+    )
+    monkeypatch.setenv("TRTLLM_RETIRE_COMPLETION_BUDGET", "0" if problem == "budget_off" else "1")
+    manager = make_kv_cache_manager()
+    if problem == "native_missing":
+        manager.impl.get_completion_demand = None
+    scheduler = make_scheduler(manager)
+    with pytest.raises(
+        ValueError, match="must be 0 or 1|requires the completion budget|rebuilt native"
+    ):
+        scheduler.set_execution_suspend_guard(Mock())
 
 
 def test_completion_budget_defers_large_prefill_until_native_cleanup(monkeypatch):

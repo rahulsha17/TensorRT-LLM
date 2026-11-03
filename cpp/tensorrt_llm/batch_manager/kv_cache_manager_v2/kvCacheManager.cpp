@@ -616,6 +616,63 @@ TypedVec<PoolGroupIndex, StorageStatistics> KvCacheManager::getStorageStatistics
     return result;
 }
 
+std::vector<int64_t> KvCacheManager::getCompletionDemand(
+    std::vector<std::shared_ptr<KvCache>> const& caches, std::vector<int> const& finalCapacities) const
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockShared();
+    if (caches.size() != finalCapacities.size())
+        throw std::invalid_argument("Completion owners and capacities must have equal lengths");
+    std::vector<int64_t> demand(mStorage->numPoolGroups(kHotLevel).value(), 0);
+    std::unordered_set<KvCache const*> owners;
+    std::unordered_set<Page const*> sharedPages;
+    for (size_t i = 0; i < caches.size(); ++i)
+    {
+        auto const& cache = caches[i];
+        if (!cache || &cache->manager() != this || cache->isClosed() || !owners.insert(cache.get()).second
+            || finalCapacities[i] < 0 || cache->beamWidth() != BeamIndex{1})
+            throw std::invalid_argument("Completion demand requires distinct live single-beam owners of this manager");
+        int const capacity = std::max(cache->capacity(), finalCapacities[i]);
+        int const blocks = divUp(capacity, tokensPerBlock());
+        for (auto const& [lcId, lifeCycle] : mLifeCycles)
+        {
+            auto const* attention = std::get_if<AttnLifeCycle>(&lifeCycle);
+            if (attention == nullptr || attention->isSparse
+                || (attention->windowSize && *attention->windowSize < capacity))
+                throw std::invalid_argument("Completion demand requires dense full-history attention");
+            demand[mStorage->getPoolGroupIndex(kHotLevel, lcId).value()] += blocks;
+        }
+        int const fullBlocks = cache->numCommittedTokens() / tokensPerBlock();
+        for (BlockOrdinal ordinal{0}; ordinal < cache->numBlocks(); ++ordinal)
+        {
+            auto const& block = cache->blocks()[ordinal];
+            for (auto const& [lcId, lifeCycle] : mLifeCycles)
+            {
+                auto const& page = blockPageGetPage(block.pages[kDefaultBeamIndex][lcId]);
+                if (!page || !page->isCommitted())
+                    continue;
+                // Page identity is used only under this lock; no pointers escape the query.
+                bool const firstOwner = sharedPages.insert(page.get()).second;
+                auto& poolDemand = demand[mStorage->getPoolGroupIndex(kHotLevel, lcId).value()];
+                if (ordinal.value() < fullBlocks
+                    && static_cast<CommittedPage const&>(*page).numTokensInBlock == tokensPerBlock())
+                {
+                    if (!firstOwner)
+                        --poolDemand;
+                }
+                else if (firstOwner)
+                {
+                    // First resume copies a matched partial tail into a private destination.
+                    // Keep the immutable source charged during that copy, even when the
+                    // match is a short prefix of a fully committed backing page.
+                    ++poolDemand;
+                }
+            }
+        }
+    }
+    return demand;
+}
+
 TypedVec<LifeCycleId, PoolGroupIndex> KvCacheManager::getLifeCyclePoolGroupIndices(CacheLevel cacheLevel) const
 {
     TypedVec<LifeCycleId, PoolGroupIndex> result;

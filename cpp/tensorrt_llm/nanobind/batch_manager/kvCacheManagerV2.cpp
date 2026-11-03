@@ -1898,6 +1898,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
             nb::arg("capacity_hint") = nb::none())
         .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
+        .def("isolated_prefix_ready", &kv::KvCache::isolatedPrefixReady, nb::arg("allow_partial") = false,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "try_pin_resident_prefix",
+            [](kv::KvCache& self, intptr_t stream)
+            { return self.tryPinResidentPrefix(reinterpret_cast<CUstream>(stream)); },
+            nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
         .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("page_storage_dirty", &kv::KvCache::pageStorageDirty, nb::call_guard<nb::gil_scoped_release>())
@@ -2678,6 +2685,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager const& self, int cacheLevel)
             { return self.getStorageStatistics(kv::CacheLevel{cacheLevel}).raw(); },
             nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_completion_demand", &kv::KvCacheManager::getCompletionDemand, nb::arg("caches"),
+            nb::arg("final_capacities"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_and_reset_iteration_disk_prefetch_blocks",
             &kv::KvCacheManager::getAndResetIterationDiskPrefetchBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(

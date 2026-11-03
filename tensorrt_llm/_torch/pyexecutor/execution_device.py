@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Device authority and asynchronous token-commit guards for RETIRE execution."""
 
+import os
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -15,6 +16,7 @@ import triton.language as tl
 from ..._utils import prefer_pinned
 from ...execution_version import ExecutionVersion
 from .execution_early_exit import trace_execution
+from .execution_scratch import ExecutionScratchPool, ScratchLease
 
 __all__ = [
     "DeviceAttentionRows",
@@ -87,6 +89,7 @@ def _epoch_word(epoch: int) -> int:
 class _PendingUse:
     tensors: list[torch.Tensor]
     event: torch.cuda.Event | None = None
+    scratch: list[ScratchLease] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -230,6 +233,10 @@ class DeviceExecutionAuthority:
         self._slots: dict[tuple[str, str], int] = {}
         self._published: dict[tuple[str, str], tuple[int, torch.cuda.Event]] = {}
         self._pending: list[_PendingUse] = []
+        scratch_pool = os.getenv("TRTLLM_RETIRE_SCRATCH_POOL", "0")
+        if scratch_pool not in ("0", "1"):
+            raise ValueError("TRTLLM_RETIRE_SCRATCH_POOL must be 0 or 1")
+        self._scratch_pool = ExecutionScratchPool() if scratch_pool == "1" else None
         self._failure: BaseException | None = None
         self._token_commit_metadata: _TokenCommitMetadata | None = None
         with torch.cuda.device(self.device):
@@ -286,7 +293,36 @@ class DeviceExecutionAuthority:
         self._pending.append(use)
         return use
 
-    def _upload(self, values: list[int], dtype: torch.dtype, use: _PendingUse) -> torch.Tensor:
+    def _scratch(
+        self, count: int, dtype: torch.dtype, use: _PendingUse, *, host: bool = False
+    ) -> torch.Tensor:
+        target = torch.device("cpu") if host else self.device
+        pinned = host and prefer_pinned()
+
+        def allocate():
+            return torch.empty(count, dtype=dtype, device=target, pin_memory=pinned)
+
+        pool = getattr(self, "_scratch_pool", None)
+        if pool is None:
+            tensor = allocate()
+        else:
+            tensor, lease = pool.acquire(
+                (count, dtype, target, pinned), count * dtype.itemsize, allocate
+            )
+            if lease is not None:
+                use.scratch.append(lease)
+        use.tensors.append(tensor)
+        return tensor
+
+    def _upload(
+        self, values: list[int], dtype: torch.dtype, use: _PendingUse, *, reusable: bool = False
+    ) -> torch.Tensor:
+        if reusable and getattr(self, "_scratch_pool", None) is not None:
+            host = self._scratch(len(values), dtype, use, host=True)
+            host.copy_(torch.tensor(values, dtype=dtype))
+            device = self._scratch(len(values), dtype, use)
+            device.copy_(host, non_blocking=True)
+            return device
         host = torch.tensor(values, dtype=dtype, pin_memory=prefer_pinned())
         use.tensors.append(host)
         device = host.to(self.device, non_blocking=True)
@@ -297,6 +333,7 @@ class DeviceExecutionAuthority:
         event = torch.cuda.Event()
         event.record(stream)
         use.event = event
+        ExecutionScratchPool.submitted(use.scratch, event)
         self._table.record_stream(stream)
         self._collect_completed()
 
@@ -352,6 +389,8 @@ class DeviceExecutionAuthority:
                     raise ValueError("device authority cannot move backwards")
                 if version.epoch == previous[0]:
                     return
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("device authority publication must run outside capture")
             if key not in self._slots:
                 if len(self._slots) == self.capacity:
                     raise RuntimeError("device authority scope capacity exhausted")
@@ -359,7 +398,9 @@ class DeviceExecutionAuthority:
             use = self._start_use([])
             try:
                 with torch.cuda.stream(self._stream):
-                    epoch = self._upload([_epoch_word(version.epoch)], torch.int64, use)
+                    epoch = self._upload(
+                        [_epoch_word(version.epoch)], torch.int64, use, reusable=True
+                    )
                     _publish_epoch[(1,)](self._table, epoch, self._slots[key], num_warps=1)
                     self._record(use, self._stream)
                 assert use.event is not None
@@ -394,7 +435,10 @@ class DeviceExecutionAuthority:
         self, versions: Sequence[ExecutionVersion | None], use: _PendingUse
     ) -> tuple[torch.Tensor, torch.Tensor]:
         slots, epochs = self._input_values(versions)
-        return self._upload(slots, torch.int32, use), self._upload(epochs, torch.int64, use)
+        return (
+            self._upload(slots, torch.int32, use, reusable=True),
+            self._upload(epochs, torch.int64, use, reusable=True),
+        )
 
     def _token_commit_inputs(
         self,
@@ -482,8 +526,14 @@ class DeviceExecutionAuthority:
                 if not hit:
                     rows._layout = None
                     for target, values in ((rows.slots, slots), (rows.expected, expected)):
-                        host = torch.tensor(values, dtype=target.dtype, pin_memory=prefer_pinned())
-                        use.tensors.append(host)
+                        if getattr(self, "_scratch_pool", None) is not None:
+                            host = self._scratch(len(values), target.dtype, use, host=True)
+                            host.copy_(torch.tensor(values, dtype=target.dtype))
+                        else:
+                            host = torch.tensor(
+                                values, dtype=target.dtype, pin_memory=prefer_pinned()
+                            )
+                            use.tensors.append(host)
                         target.copy_(host, non_blocking=True)
                     storage = (_row_storage(rows.slots), _row_storage(rows.expected))
                 # Hits keep publication waits, pending limits and completion/error
@@ -516,11 +566,12 @@ class DeviceExecutionAuthority:
         identities = tuple(versions)
         with self._lock, torch.cuda.device(self.device):
             self._healthy()
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("device authority receipts must run outside capture")
             use = self._start_use([])
             try:
                 slots, expected = self._inputs(identities, use)
-                allowed = torch.empty(len(identities), dtype=torch.bool, device=self.device)
-                use.tensors.append(allowed)
+                allowed = self._scratch(len(identities), torch.bool, use)
                 _check_versions[(triton.cdiv(len(identities), 128),)](
                     self._table, slots, expected, allowed, len(identities), 128
                 )
@@ -598,15 +649,12 @@ class DeviceExecutionAuthority:
                     # their verdicts. Each ticket owns its storage until the
                     # completion event; later batches cannot overwrite it.
                     token_bytes = len(versions) * candidates.element_size()
-                    packed = torch.empty(
-                        token_bytes + len(versions), dtype=torch.uint8, device=self.device
-                    )
+                    packed = self._scratch(token_bytes + len(versions), torch.uint8, use)
                     tokens = packed[:token_bytes].view(candidates.dtype)
                     allowed = packed[token_bytes:].view(torch.bool)
-                    use.tensors.append(packed)
                 else:
                     tokens = committed
-                    allowed = torch.empty(len(versions), dtype=torch.bool, device=self.device)
+                    allowed = self._scratch(len(versions), torch.bool, use)
                 use.tensors.extend([committed, allowed])
                 _commit_tokens[(len(versions),)](
                     self._table,

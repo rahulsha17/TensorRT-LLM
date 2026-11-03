@@ -9,8 +9,49 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import execution_device as device
+from tensorrt_llm._torch.pyexecutor.execution_scratch import ExecutionScratchPool
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_scratch_pool_requires_completed_submission_and_respects_capacity():
+    pool = ExecutionScratchPool(max_entries=2, max_bytes=16)
+    event = SimpleNamespace(query=lambda: False)
+    first, lease = pool.acquire("a", 8, object)
+    second, other = pool.acquire("a", 8, object)
+    assert first is not second
+    overflow, absent = pool.acquire("a", 8, object)
+    assert absent is None and overflow is not first and pool.bytes == 16
+    pool.submitted([lease], event)
+    assert pool.acquire("a", 8, object)[1] is None
+    event.query = lambda: True
+    reused, same = pool.acquire("a", 8, object)
+    assert reused is first and same is lease
+    assert other.reserved and same.reserved
+    assert pool.acquire("b", 8, object)[1] is None
+    assert pool.hits == 1 and pool.bytes == 16
+
+
+def test_scratch_pool_failed_submission_and_event_error_never_recycle():
+    pool = ExecutionScratchPool(max_entries=2, max_bytes=16)
+    first, lease = pool.acquire("a", 8, object)
+    # No completion event can be recorded after a failed submission.
+    second, other = pool.acquire("a", 8, object)
+    assert second is not first and lease.reserved
+
+    def failed_query():
+        raise RuntimeError("device failure")
+
+    pool.submitted([other], SimpleNamespace(query=failed_query))
+    with pytest.raises(RuntimeError, match="device failure"):
+        pool.acquire("a", 8, object)
+    assert lease.reserved and pool.hits == 0
+
+
+def test_scratch_pool_never_retains_oversize_allocation():
+    pool = ExecutionScratchPool(max_entries=2, max_bytes=8)
+    assert pool.acquire("a", 9, object)[1] is None
+    assert pool.entries == [] and pool.bytes == 0
 
 
 class Clock:

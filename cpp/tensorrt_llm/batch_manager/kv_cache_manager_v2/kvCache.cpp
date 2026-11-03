@@ -423,6 +423,67 @@ bool KvCache::_canFitDenseCapacity(int capacity) const
     return true;
 }
 
+bool KvCache::isolatedPrefixReady(bool allowPartial) const
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockShared();
+    int const tokens = numCommittedTokens();
+    if (mStatus != Status::SUSPENDED || !mNeverResumed || mBeamWidth != BeamIndex{1} || tokens <= 0
+        || tokens != mCapacity || (!allowPartial && tokens % mTokensPerBlock != 0))
+        return false;
+    for (auto const& [lcId, lifeCycle] : mManager->lifeCycles())
+    {
+        auto const* attention = std::get_if<AttnLifeCycle>(&lifeCycle);
+        if (attention == nullptr || attention->isSparse || (attention->windowSize && *attention->windowSize < tokens))
+            return false;
+        for (BlockOrdinal ordinal{0}; ordinal < mBlocks.size(); ++ordinal)
+        {
+            auto const& page = blockPageGetPage(mBlocks[ordinal].pages[kDefaultBeamIndex][lcId]);
+            int const needed = std::min(mTokensPerBlock, tokens - ordinal.value() * mTokensPerBlock);
+            if (!page || !page->isCommitted() || !page->hasValidSlot()
+                || static_cast<CommittedPage const&>(*page).numTokensInBlock < needed
+                || !page->readyEvent.queryComplete())
+                return false;
+        }
+    }
+    return true;
+}
+
+bool KvCache::tryPinResidentPrefix(CUstream stream)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    // Nested shared acquisition is allowed only while this thread owns the exclusive lock.
+    if (!isolatedPrefixReady(false))
+        return false;
+    for (auto const& block : mBlocks)
+        for (auto const& page : block.pages[kDefaultBeamIndex])
+            if (blockPageGetPage(page)->cacheLevel != kHotLevel)
+                return false;
+
+    // This owner has submitted no work. A failed lock acquisition therefore has a null finish
+    // event; other owners' events remain attached to their own shared locks.
+    mCudaStream = stream;
+    mFinishEvent = CachedCudaEvent::makeNull();
+    auto clearFinish = FuncGuard([this]() { mFinishEvent.reset(); });
+    std::vector<SharedPageLock> locks;
+    locks.reserve(mBlocks.size().value() * mManager->lifeCycles().size().value());
+    for (BlockOrdinal ordinal{0}; ordinal < mBlocks.size(); ++ordinal)
+        for (auto const& [lcId, lifeCycle] : mManager->lifeCycles())
+        {
+            auto const& holder = std::get<SharedPtr<PageHolder>>(mBlocks[ordinal].pages[kDefaultBeamIndex][lcId]);
+            locks.push_back(holder->lock(*this, kDefaultBeamIndex, ordinal, lcId, /*skipWait=*/true));
+        }
+    size_t index = 0;
+    for (BlockOrdinal ordinal{0}; ordinal < mBlocks.size(); ++ordinal)
+        for (auto const& [lcId, lifeCycle] : mManager->lifeCycles())
+            mBlocks[ordinal].pages[kDefaultBeamIndex][lcId] = std::move(locks[index++]);
+    mStatus = Status::ACTIVE;
+    mNeverResumed = false;
+    onPageStorageChanged();
+    return true;
+}
+
 bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding, std::optional<int> capacityHint)
 {
     KVCM2_API_GUARD();

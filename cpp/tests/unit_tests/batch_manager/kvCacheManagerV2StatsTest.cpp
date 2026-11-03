@@ -208,6 +208,148 @@ TEST(KvCacheManagerV2StatsTest, DisabledStatsSuppressManagerCommit)
     EXPECT_TRUE(manager->getAndResetIterationStats().empty());
 }
 
+TEST(KvCacheManagerV2StatsTest, CompletionDemandSharesOnlyImmutableIdentityAndRetainsObsoleteCapacity)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    std::vector<TokenIdExt> tokens;
+    for (int token = 0; token < 8; ++token)
+        tokens.emplace_back(TokenId{token});
+    auto old = manager->createKvCache();
+    ASSERT_TRUE(old->resume(CUstream{}));
+    ASSERT_TRUE(old->resize(12));
+    old->commit(toSpan(tokens));
+    auto successor = manager->createKvCache({}, toSpan(tokens));
+    ASSERT_EQ(successor->numCommittedTokens(), 8);
+
+    // Old owns three blocks; successor needs four at completion. Their two full
+    // committed pages are identical, but both private suffixes remain charged.
+    EXPECT_EQ(manager->getCompletionDemand({old, successor}, {0, 16}), std::vector<int64_t>{5});
+    EXPECT_EQ(manager->getCompletionDemand({successor, old}, {16, 0}), std::vector<int64_t>{5});
+    auto otherScope = manager->createKvCache(ReuseScope{std::nullopt, 99}, toSpan(tokens));
+    EXPECT_EQ(otherScope->numCommittedTokens(), 0);
+    EXPECT_EQ(manager->getCompletionDemand({old, successor, otherScope}, {0, 16, 16}), std::vector<int64_t>{9});
+    EXPECT_THROW(manager->getCompletionDemand({old, old}, {12, 12}), std::invalid_argument);
+    EXPECT_THROW(manager->getCompletionDemand({old}, {}), std::invalid_argument);
+    EXPECT_THROW(manager->getCompletionDemand({old}, {-1}), std::invalid_argument);
+    auto otherManager = std::make_shared<KvCacheManager>(makeConfig());
+    EXPECT_THROW(otherManager->getCompletionDemand({old}, {12}), std::invalid_argument);
+    successor->close();
+    EXPECT_THROW(manager->getCompletionDemand({successor}, {16}), std::invalid_argument);
+    otherScope->close();
+    old->close();
+}
+
+TEST(KvCacheManagerV2StatsTest, CompletionDemandChargesPrivatePartialCopyAndRetainedSnapshot)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    std::vector<TokenIdExt> tokens;
+    for (int token = 0; token < 7; ++token)
+        tokens.emplace_back(TokenId{token});
+    auto old = manager->createKvCache();
+    ASSERT_TRUE(old->resume(CUstream{}));
+    ASSERT_TRUE(old->resize(8));
+    old->commit(toSpan(tokens));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    auto first = manager->createKvCache({}, toSpan(tokens));
+    auto second = manager->createKvCache({}, toSpan(tokens));
+    ASSERT_EQ(first->numCommittedTokens(), 7);
+    ASSERT_EQ(second->numCommittedTokens(), 7);
+    EXPECT_TRUE(first->isolatedPrefixReady(true));
+    EXPECT_FALSE(first->isolatedPrefixReady(false));
+    EXPECT_FALSE(first->tryPinResidentPrefix(CUstream{}));
+    // One common full page, the old private tail, one immutable partial source,
+    // and one future private tail for each successor: five physical slots.
+    EXPECT_EQ(manager->getCompletionDemand({old, first, second}, {0, 8, 8}), std::vector<int64_t>{5});
+    EXPECT_EQ(manager->getCompletionDemand({second, first, old}, {8, 8, 0}), std::vector<int64_t>{5});
+    ASSERT_TRUE(first->resume(CUstream{}));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    EXPECT_EQ(manager->getCompletionDemand({old, first, second}, {0, 8, 8}), std::vector<int64_t>{5});
+    second->close();
+    // With no pending partial-source owner, the droppable snapshot no longer
+    // consumes the completion reservation; the two actual tails still do.
+    EXPECT_EQ(manager->getCompletionDemand({old, first}, {0, 8}), std::vector<int64_t>{3});
+    first->close();
+    old->close();
+}
+
+TEST(KvCacheManagerV2StatsTest, CompletionDemandChargesShortMatchOfFullBackingPage)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    std::vector<TokenIdExt> full;
+    for (int token = 0; token < 8; ++token)
+        full.emplace_back(TokenId{token});
+    auto old = manager->createKvCache();
+    ASSERT_TRUE(old->resume(CUstream{}));
+    ASSERT_TRUE(old->resize(8));
+    old->commit(toSpan(full));
+    auto partial = manager->createKvCache({}, toSpan(full), {}, {}, {}, {}, false, 7);
+    ASSERT_EQ(partial->numCommittedTokens(), 7);
+    EXPECT_EQ(manager->getCompletionDemand({old, partial}, {0, 8}), std::vector<int64_t>{3});
+    EXPECT_EQ(manager->getCompletionDemand({partial, old}, {8, 0}), std::vector<int64_t>{3});
+    EXPECT_EQ(manager->getCompletionDemand({partial}, {8}), std::vector<int64_t>{3});
+    partial->close();
+    old->close();
+}
+
+TEST(KvCacheManagerV2StatsTest, ResidentPrefixPinUsesOnlyReadyHotFullPagesAndReleasesLocks)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    std::vector<TokenIdExt> tokens;
+    for (int token = 0; token < 8; ++token)
+        tokens.emplace_back(TokenId{token});
+    auto old = manager->createKvCache();
+    ASSERT_TRUE(old->resume(CUstream{}));
+    ASSERT_TRUE(old->resize(8));
+    old->commit(toSpan(tokens));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    auto hold = manager->createKvCache({}, toSpan(tokens));
+    ASSERT_TRUE(hold->isolatedPrefixReady());
+    auto const before = manager->getStorageStatistics(kHotLevel);
+    ASSERT_TRUE(hold->tryPinResidentPrefix(CUstream{}));
+    EXPECT_TRUE(hold->isActive());
+    EXPECT_EQ(hold->numCommittedTokens(), 8);
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[PoolGroupIndex{0}].free, before[PoolGroupIndex{0}].free);
+    EXPECT_FALSE(hold->tryPinResidentPrefix(CUstream{}));
+    hold->suspend();
+    EXPECT_FALSE(hold->isActive());
+    EXPECT_EQ(hold->numCommittedTokens(), 8);
+    hold->close();
+    old->close();
+}
+
+TEST(KvCacheManagerV2StatsTest, ResidentPrefixPinNeverRestoresColdPages)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig());
+    std::vector<TokenIdExt> tokens;
+    for (int token = 0; token < 8; ++token)
+        tokens.emplace_back(TokenId{token});
+    auto old = manager->createKvCache();
+    ASSERT_TRUE(old->resume(CUstream{}));
+    ASSERT_TRUE(old->resize(8));
+    old->commit(toSpan(tokens));
+    old->suspend();
+    auto hold = manager->createKvCache({}, toSpan(tokens));
+    auto pressure = manager->createKvCache();
+    ASSERT_TRUE(pressure->resume(CUstream{}));
+    ASSERT_TRUE(pressure->resize(8));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    ASSERT_TRUE(hold->isolatedPrefixReady());
+    auto const before = manager->getStorageStatistics(kHotLevel);
+    EXPECT_FALSE(hold->tryPinResidentPrefix(CUstream{}));
+    EXPECT_FALSE(hold->isActive());
+    EXPECT_EQ(manager->getStorageStatistics(kHotLevel)[PoolGroupIndex{0}].free, before[PoolGroupIndex{0}].free);
+    pressure->close();
+    hold->close();
+    old->close();
+}
+
 TEST(KvCacheManagerV2StatsTest, PeakBlockStatsResetStartsNextIntervalFromCurrentSnapshot)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);

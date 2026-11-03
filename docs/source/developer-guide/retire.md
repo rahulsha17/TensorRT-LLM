@@ -1550,7 +1550,42 @@ These are logical ownership counters, not HBM bytes or physical occupancy.
 Use the separate V2 page-residency query for page locations. Both reports are
 observations and cannot authorize reuse.
 
-## Next steps
+## Experimental performance switches
+
+The following private startup switches default to `0` and accept `0` or `1`.
+They are independently selectable for controlled comparisons. Their presence
+does not establish a model correctness result or a performance improvement.
+Set them before constructing the controller and worker.
+
+| Switch (`TRTLLM_RETIRE_` prefix) | Behavior and boundary |
+| --- | --- |
+| `NONBLOCKING_ALIGN` | Eligible single-rank fallback preparation first queries recorded completion. An unready source is retried at later engine safe points, without waiting under the shared alignment lock. Owner release still captures an armed promise before dropping its allocation. |
+| `READY_NOTIFY` | Local worker lifecycle changes wake the controller. Receipts still require independent polling and validation; remote control retains bounded polling. |
+| `EARLY_ALIGNMENT` | Try isolated handoff after the sampler's final use event is recorded and before the input-copy wait. This pass cannot prepare fallback KV or reclaim prior holds. |
+| `ADAPTIVE_PREFILL` | Newly active tagged versions use smaller chunks. Only subsequently observed progress from scheduled chunks earns the return to normal chunk sizes; reused prefixes do not. |
+| `REVISION_COHORT` | Alternate one bounded prefill cohort sharing an authority version with normal work. The sensitive pass cannot evict unrelated owners; failed admission retries ordinary scheduling. This bounds scheduling opportunities, not memory admission or wall time. |
+| `SHARED_COMPLETION_BUDGET` | Requires `COMPLETION_BUDGET=1` and the rebuilt native API. Charge actual retained allocation capacity and future growth; count identical immutable pages once. Private destinations and partial-copy sources remain charged. Candidate credit retains the exact matched cache through admission. |
+| `ISOLATED_RESIDENCY` | Briefly protect already-ready, full GPU prefix pages for an isolated successor. Optional protection is capped at one quarter of logical GPU capacity and uses the existing bounded yield policy. It does not restore cold pages or wait for old GPU work. |
+| `ISOLATED_PARTIAL` | Permit an exact partial prefix when native committed-page coverage and completion prove it safe. Resume creates a private writable tail. Insufficient published coverage falls back to drained preparation; a strict promise is never rounded down. |
+| `SCRATCH_POOL` | Reuse only internal device scratch and pinned upload buffers after recorded device completion. Bound retention to 64 allocations and 4 MiB; exhaustion allocates normally without waiting. Returned token buffers, host verdicts, cached metadata, graph inputs, and events remain independently owned. |
+| `COALESCE_ADVANCE` | Coalesce eligible queued local non-admitting advances. Never cross a pending same-scope admission, RESUME or transfer barrier. Historical publication/FENCE futures and superseded ALIGN outcomes remain explicit. |
+
+Adaptive prefill and cohort scheduling initially require dense, single-rank,
+prefix-aware chunked execution without forced chunks, PEFT, draft/cross caches,
+or a KV connector. Unsupported modes retain ordinary scheduling. With either
+switch enabled, `TRTLLM_RETIRE_REVISION_CHUNK_TOKENS` defaults to `1024`, and
+`TRTLLM_RETIRE_REVISION_STABLE_TOKENS` defaults to `4096`. The chunk cap must
+align to the scheduler's chunk unit. `execution_scheduling_snapshot()` reports
+host scheduling counters; these are not evidence of completed GPU work.
+
+The new native methods require rebuilding the library, Python bindings and
+native test consumers together. Tests extend the existing CPU protocol/guard
+and H100 device/scheduler/KV suites. In addition to exact cold-reference output,
+qualification must cover rapid revisions, strict partial handoff, retained
+obsolete allocations, pending copies, live neighbors, cache pressure and
+eventual cleanup. Measure ordinary request latency alongside useful throughput.
+
+## Remaining qualification
 
 Validate the complete lifecycle on native GPU runs across V1/V2 and execution
 modes. Distributed authority, disaggregated transfers, scope-history compaction,

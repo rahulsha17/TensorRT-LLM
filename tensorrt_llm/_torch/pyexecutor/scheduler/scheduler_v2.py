@@ -27,6 +27,7 @@ from ..llm_request import (
     get_draft_token_length,
     rewind_context_after_cache_drop,
 )
+from .execution_policy import RevisionSchedulingPolicy
 from .scheduler import (
     RequestList,
     RequestScheduler,
@@ -289,6 +290,20 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._completion_budget_blocks: int | None = None
         self._completion_internal_blocks = 0
         self._completion_claims: dict[int, tuple[LlmRequest, object, int]] = {}
+        self._shared_completion_budget = False
+        self._revision_policy: RevisionSchedulingPolicy | None = None
+        self._adaptive_prefill = False
+        self._revision_cohort = False
+        self._revision_metrics = dict(
+            adaptive_caps=0,
+            sensitive_passes=0,
+            stable_passes=0,
+            normal_passes=0,
+            cohort_fallbacks=0,
+            context_tokens=0,
+            sensitive_tokens=0,
+            max_sensitive_tokens=0,
+        )
 
     def set_execution_suspend_guard(self, guard: Callable[[LlmRequest], None]) -> None:
         """Bind the execution owner's completion check for lossless suspension.
@@ -299,12 +314,99 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         if self._execution_suspend_guard is not None and self._execution_suspend_guard != guard:
             raise RuntimeError("scheduler already has an execution suspension guard")
+        shared = os.environ.get("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", "0")
+        if shared not in ("0", "1"):
+            raise ValueError("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET must be 0 or 1")
+        if shared == "1":
+            if os.environ.get("TRTLLM_RETIRE_COMPLETION_BUDGET", "0") != "1":
+                raise ValueError(
+                    "shared RETIRE completion accounting requires the completion budget"
+                )
+            if not callable(getattr(self.kv_cache_manager.impl, "get_completion_demand", None)):
+                raise ValueError(
+                    "shared RETIRE completion accounting requires rebuilt native bindings"
+                )
+            self._shared_completion_budget = True
         if (
             self._completion_budget_blocks is None
             and os.environ.get("TRTLLM_RETIRE_COMPLETION_BUDGET", "0") == "1"
         ):
             self._enable_completion_budget()
         self._execution_suspend_guard = guard
+        if self._revision_policy is None:
+            self._enable_revision_policy()
+
+    def _enable_revision_policy(self) -> None:
+        settings = [
+            os.environ.get(name, "0")
+            for name in ("TRTLLM_RETIRE_ADAPTIVE_PREFILL", "TRTLLM_RETIRE_REVISION_COHORT")
+        ]
+        if any(value not in ("0", "1") for value in settings):
+            raise ValueError("RETIRE revision scheduling flags must be 0 or 1")
+        if "1" not in settings:
+            return
+        manager = self.kv_cache_manager
+        if not (
+            self.chunking_enabled
+            and self.chunking_policy != ContextChunkingPolicy.FORCE_CHUNK
+            and self.enable_prefix_aware_scheduling
+            and manager.mapping.world_size == 1
+            and manager._supports_dense_resume_capacity() is True
+            and not self.has_cp_helix
+            and manager.kv_connector_manager is None
+            and self.draft_kv_cache_manager is None
+            and self.cross_kv_cache_manager is None
+            and self.peft_cache_manager is None
+        ):
+            logger.warning("RETIRE revision scheduling disabled for unsupported execution mode")
+            return
+        chunk = int(os.environ.get("TRTLLM_RETIRE_REVISION_CHUNK_TOKENS", "1024"))
+        stable = int(os.environ.get("TRTLLM_RETIRE_REVISION_STABLE_TOKENS", "4096"))
+        if chunk < self.chunk_unit_size or chunk % self.chunk_unit_size:
+            raise ValueError(
+                "RETIRE revision chunk cap must be a positive multiple of chunk_unit_size"
+            )
+        self._revision_policy = RevisionSchedulingPolicy(chunk, stable)
+        self._adaptive_prefill, self._revision_cohort = (value == "1" for value in settings)
+
+    def _revision_selection(
+        self, requests: RequestList, inflight_request_ids: set[int]
+    ) -> tuple[set[int] | None, int | None]:
+        policy = self._revision_policy
+        if policy is None:
+            return None, None
+        policy.refresh(requests)
+        if not self._revision_cohort or any(
+            req.lora_task_id is not None
+            or isinstance(req.py_multimodal_data, dict)
+            or req.state_value
+            in (self._encoder_init_state_value, self._disagg_gen_init_state_value)
+            for req in requests
+        ):
+            return None, None
+        eligible = [
+            req
+            for req in requests
+            if req.request_id not in inflight_request_ids
+            and self._no_schedule_until_state_value
+            <= req.state_value
+            < self._no_schedule_after_state_value
+        ]
+        contexts = [req for req in eligible if req.state_value == self._context_init_state_value]
+        stable = [req for req in eligible if req.state_value != self._context_init_state_value]
+        return policy.cohort(contexts, stable)
+
+    def execution_scheduling_snapshot(self) -> dict[str, int | bool]:
+        """Return host admission counters; these do not prove GPU execution."""
+        policy = self._revision_policy
+        return dict(
+            self._revision_metrics,
+            adaptive_prefill=self._adaptive_prefill,
+            revision_cohort=self._revision_cohort,
+            chunk_tokens=0 if policy is None else policy.chunk_tokens,
+            stable_tokens=0 if policy is None else policy.stable_tokens,
+            shared_completion_budget=self._shared_completion_budget,
+        )
 
     def _enable_completion_budget(self) -> None:
         manager = self.kv_cache_manager
@@ -384,7 +486,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
         if caches.keys() - self._completion_claims.keys() - internal_ids:
             raise RuntimeError("RETIRE completion budget found an unaccounted native cache owner")
-        demand = sum(claim[2] for claim in self._completion_claims.values())
+        demand = (
+            self.kv_cache_manager.execution_completion_demand(
+                list(self._completion_claims.values())
+            )
+            if self._shared_completion_budget
+            else sum(claim[2] for claim in self._completion_claims.values())
+        )
         if demand > self._completion_budget_blocks:
             raise RuntimeError(
                 f"RETIRE existing completion demand {demand} exceeds usable GPU budget "
@@ -395,6 +503,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._completion_budget_blocks is None or req.py_request_id in self._completion_claims:
             return True
         demand = self._completion_blocks(req)
+        if self._shared_completion_budget:
+            return self.kv_cache_manager.execution_completion_try_admit(
+                list(self._completion_claims.values()), req, self._completion_budget_blocks
+            )
         return (
             demand + sum(claim[2] for claim in self._completion_claims.values())
             <= self._completion_budget_blocks
@@ -453,7 +565,9 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Main scheduling loop ----
 
-    def _schedule_loop(self, active_requests, inflight_request_ids):
+    def _schedule_loop(
+        self, active_requests, inflight_request_ids, *, revision_cohort: bool = True
+    ):
         scheduled_ctx: RequestList = []
         scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
@@ -464,16 +578,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         has_chunking = False
         blocked_generation = None
 
-        budget = BudgetTracker(
-            self.max_num_tokens,
-            self.max_num_requests,
-            self.peft_cache_manager,
-        )
-
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
         self._refresh_completion_claims(requests_list)
+        selected, cohort_tokens = (
+            self._revision_selection(requests_list, inflight_request_ids)
+            if revision_cohort
+            else (None, None)
+        )
+        token_limit = self.max_num_tokens
+        if cohort_tokens is not None:
+            token_limit = cohort_tokens if token_limit is None else min(token_limit, cohort_tokens)
+        budget = BudgetTracker(token_limit, self.max_num_requests, self.peft_cache_manager)
 
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
         # py_decoding_iter == 0 covers DISAGG_GENERATION_INIT /
@@ -524,6 +641,9 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             # --- Filter ---
             if req.request_id in inflight_request_ids:
+                req_it += 1
+                continue
+            if selected is not None and id(req) not in selected:
                 req_it += 1
                 continue
 
@@ -638,7 +758,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             blocked_ctx.append(req)
             if req.py_request_id in promised_recovery_ids:
                 promised_recovery_blocked = True
-            if pending_completion:
+            if pending_completion or cohort_tokens is not None:
+                # A small sensitive cohort is a compute preference, not a
+                # reason to displace an unrelated owner. The normal retry
+                # below retains ordinary memory-pressure recovery.
                 return False
             if self.kv_cache_manager.has_execution_residency:
                 # Try other contexts before context growth displaces a
@@ -845,6 +968,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if (
             self._recovery_fair_share
+            and selected is None
             and not (recovery_ids or promised_recovery_blocked or pending_completion)
             and not (evicted or recompute_paused)
             and not self.kv_cache_manager.has_execution_residency
@@ -890,6 +1014,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         deferred_handoff_repoll = False
         if (
             blocked_ctx
+            and cohort_tokens is None
             and not pending_completion
             and (self.kv_cache_manager.can_evict or self.kv_cache_manager.has_execution_residency)
             and self.kv_cache_manager.mapping.pp_size == 1
@@ -944,6 +1069,32 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         if self._recovery_fair_share:
             self._account_prefill_wait(requests_list, pending_ctx, scheduled_ctx)
+
+        if selected is not None and not (
+            scheduled_gen
+            or scheduled_ctx
+            or scheduled_encoder
+            or disagg_candidates
+            or evicted
+            or recompute_paused
+        ):
+            # A cohort is only a compute preference. If its admission fails,
+            # retry all owners without a cap before declaring a scheduler stall.
+            self._revision_metrics["cohort_fallbacks"] += 1
+            return self._schedule_loop(active_requests, inflight_request_ids, revision_cohort=False)
+
+        if self._revision_policy is not None and (scheduled_gen or scheduled_ctx):
+            tokens = sum(req.context_chunk_size for req in scheduled_ctx)
+            self._revision_metrics["context_tokens"] += tokens
+            if cohort_tokens is not None:
+                self._revision_metrics["sensitive_passes"] += 1
+                self._revision_metrics["sensitive_tokens"] += tokens
+                self._revision_metrics["max_sensitive_tokens"] = max(
+                    self._revision_metrics["max_sensitive_tokens"], tokens
+                )
+            else:
+                kind = "stable_passes" if selected is not None else "normal_passes"
+                self._revision_metrics[kind] += 1
 
         self._detect_deadlock(
             active_requests,
@@ -1312,10 +1463,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         first_chunk = req.is_first_context_chunk
         if not self._can_complete_context(req):
             return ScheduleAction.SKIP, 0, False
-        if self.chunking_enabled:
-            result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
-        else:
-            result = self._try_schedule_context_full(req, budget, preempt_for_pages)
+        try:
+            if self.chunking_enabled:
+                result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
+            else:
+                result = self._try_schedule_context_full(req, budget, preempt_for_pages)
+        except Exception:
+            if first_chunk and self._shared_completion_budget:
+                # Precise admission retained a suspended native candidate.
+                # It must not escape bookkeeping if later preparation fails.
+                self.release_context_admission(req)
+            raise
 
         if first_chunk and result[0] is not ScheduleAction.SCHEDULED:
             # Failed admission must not retain prefix-reuse holds. Suspension
@@ -1323,6 +1481,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.release_context_admission(req)
         elif result[0] is ScheduleAction.SCHEDULED:
             self._claim_context_completion(req)
+            if self._revision_policy is not None:
+                self._revision_policy.scheduled(req)
 
         return result
 
@@ -1465,6 +1625,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunk_size = min(
             chunk_size, remaining_budget if remaining_budget is not None else chunk_size
         )
+        if (
+            self._adaptive_prefill
+            and self._revision_policy is not None
+            and req.lora_task_id is None
+            and req.py_multimodal_data is None
+            and self._revision_policy.sensitive(req)
+        ):
+            if chunk_size > self._revision_policy.chunk_tokens:
+                self._revision_metrics["adaptive_caps"] += 1
+            chunk_size = min(chunk_size, self._revision_policy.chunk_tokens)
 
         # Round down to chunk_unit_size boundary only when not hitting the end
         # or a checkpoint.

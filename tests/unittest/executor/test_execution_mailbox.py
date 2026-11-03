@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as WaitTimeout
 from dataclasses import replace
-from threading import Barrier, Event
+from queue import Queue
+from threading import Barrier, Event, Lock
+from unittest.mock import Mock
 
 import pytest
 
@@ -13,6 +15,7 @@ from tensorrt_llm.execution_mailbox import (
     ExecutionController,
     LocalPublicationTransport,
     PublicationReceipt,
+    VersionPublication,
     VersionUpdate,
     WorkerVersionTable,
 )
@@ -193,6 +196,320 @@ class _BlockedTransport(LocalPublicationTransport):
             if stop.is_set():
                 raise RuntimeError("closed")
         return super().publish(update, stop)
+
+
+@pytest.mark.parametrize("local,enabled", [(True, True), (True, False), (False, True)])
+def test_queued_local_advances_coalesce_without_losing_historical_lifetimes(
+    monkeypatch, local, enabled
+):
+    from tensorrt_llm.execution_alignment import AlignmentInput, WorkerAlignmentState
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    monkeypatch.setenv("TRTLLM_RETIRE_COALESCE_ADVANCE", "1" if enabled else "0")
+    table = WorkerVersionTable("session")
+    table.drain_tracker = RequestDrainTracker()
+    table.drain_tracker.enqueue(VERSION, lambda: 42)
+    reserve = Mock(return_value=Mock(num_tokens=2))
+    table.alignment_state = WorkerAlignmentState(reserve, lambda: None)
+    transport = _BlockedTransport(table)
+    applied = []
+    original = table.apply
+
+    def apply(update):
+        applied.append(update)
+        return original(update)
+
+    monkeypatch.setattr(table, "apply", apply)
+
+    class RemoteTransport:
+        publish = transport.publish
+        poll_fence = transport.poll_fence
+        poll_alignment = transport.poll_alignment
+        close = transport.close
+
+    controller = ExecutionController("session", transport if local else RemoteTransport())
+    try:
+        initial = controller.register(VERSION)
+        assert transport.entered.wait(5)
+        revisions = []
+        for epoch in (8, 9, 10):
+            revisions.append(
+                controller.advance(
+                    Revision(
+                        str(epoch), replace(VERSION, epoch=epoch - 1), replace(VERSION, epoch=epoch)
+                    ),
+                    alignment=AlignmentInput((1, 2, 3)),
+                )
+            )
+        transport.release.set()
+        initial.wait()
+        for revision in revisions:
+            receipt = revision.publication.wait()
+            assert receipt.update == revision.publication.update
+            assert receipt.observed_version.epoch == (
+                10 if local and enabled else receipt.update.version.epoch
+            )
+            assert not revision.fence._future.done()
+        assert [update.version.epoch for update in applied] == (
+            [7, 10] if local and enabled else [7, 8, 9, 10]
+        )
+        assert table.observe_allowed((replace(VERSION, epoch=10),)) == (False,)
+        table.alignment_state.process()
+        reserve.assert_called_once()
+        for revision in revisions[:-1]:
+            with pytest.raises(RuntimeError, match="superseded"):
+                revision.alignment.wait()
+        table.drain_tracker.complete(42, VERSION)
+        for revision in revisions:
+            assert revision.fence.wait().request == revision.fence.request
+        assert revisions[-1].alignment.wait().reusable_prefix_length == 2
+    finally:
+        transport.release.set()
+        controller.close()
+        table.close()
+        table.alignment_state.process()
+
+
+def test_coalesced_publication_failure_completes_every_waiter_and_retry_recovers(monkeypatch):
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    monkeypatch.setenv("TRTLLM_RETIRE_COALESCE_ADVANCE", "1")
+    table = WorkerVersionTable("session")
+    table.drain_tracker = RequestDrainTracker()
+    table.drain_tracker.enqueue(VERSION, lambda: 42)
+    transport = _BlockedTransport(table)
+    original = transport.publish
+    failed = []
+
+    def publish(update, stop):
+        if update.version.epoch == 9 and not failed:
+            failed.append(update)
+            raise RuntimeError("injected publish failure")
+        return original(update, stop)
+
+    monkeypatch.setattr(transport, "publish", publish)
+    controller = ExecutionController("session", transport)
+    try:
+        initial = controller.register(VERSION)
+        assert transport.entered.wait(5)
+        first_revision = Revision("first", VERSION, replace(VERSION, epoch=8))
+        first = controller.advance(first_revision)
+        second = controller.advance(
+            Revision("second", replace(VERSION, epoch=8), replace(VERSION, epoch=9))
+        )
+        transport.release.set()
+        initial.wait()
+        for publication in (first.publication, second.publication):
+            with pytest.raises(RuntimeError, match="injected publish failure"):
+                publication.wait()
+        assert not first.fence._future.done()
+        assert not second.fence._future.done()
+        retry = controller.advance(first_revision)
+        assert retry.publication.update == second.publication.update
+        assert retry.publication.wait().observed_version.epoch == 9
+        assert controller.snapshot("tenant", "scope").current_version.epoch == 9
+        assert retry.fence is first.fence
+        assert not second.fence._future.done()
+        table.drain_tracker.complete(42, VERSION)
+        assert first.fence.wait().request == first.fence.request
+        assert second.fence.wait().request == second.fence.request
+    finally:
+        transport.release.set()
+        controller.close()
+
+
+@pytest.mark.parametrize("kind", ["admission", "resume", "source_release", "transfer"])
+def test_advance_coalescing_cannot_overtake_same_scope_barrier(kind):
+    from tensorrt_llm.execution_alignment import (
+        AlignmentInput,
+        AlignmentReceipt,
+        AlignmentRequest,
+        ExecutionPlacement,
+        PrefixTransferPlan,
+    )
+
+    old, new = replace(VERSION, epoch=8), replace(VERSION, epoch=9)
+    revision = Revision("edit", VERSION, old)
+    revised = AlignmentInput((1, 2, 3))
+    if kind in ("source_release", "transfer"):
+        revised = replace(
+            revised,
+            destination=ExecutionPlacement("session", "destination"),
+            transfer=PrefixTransferPlan(ExecutionPlacement("session", "source"), 2),
+        )
+    alignment = AlignmentRequest("session", revision, revised)
+    barrier = VersionUpdate(
+        "session",
+        3,
+        old,
+        alignment=alignment,
+        resume=AlignmentReceipt(alignment, "hold", 2) if kind == "resume" else None,
+        admit_requests=kind in ("admission", "resume"),
+        source_only=kind == "source_release",
+        release_source=kind == "source_release",
+    )
+    first = VersionPublication(VersionUpdate("session", 2, old, admit_requests=False), Future())
+    middle = VersionPublication(barrier, Future())
+    latest = VersionPublication(VersionUpdate("session", 4, new, admit_requests=False), Future())
+    controller = object.__new__(ExecutionController)
+    controller._lock = Lock()
+    controller._coalesce_advances = True
+    controller._latest = {("tenant", "scope"): latest}
+    controller._pending = {first, middle, latest}
+    assert controller._select_publication(first) == (first, (first,))
+    controller._pending.remove(middle)
+    selected, covered = controller._select_publication(first)
+    assert selected is latest
+    assert set(covered) == {first, latest}
+
+
+@pytest.mark.parametrize("kind", ["fence", "alignment", "failure", "worker_close"])
+def test_local_readiness_wakes_waiters_without_timer_polling(monkeypatch, kind):
+    from tensorrt_llm import execution_mailbox as module
+    from tensorrt_llm.execution_alignment import AlignmentInput, WorkerAlignmentState
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    monkeypatch.setenv("TRTLLM_RETIRE_READY_NOTIFY", "1")
+    waiting = Event()
+
+    class NoTimerQueue(Queue):
+        def get(self, block=True, timeout=None):
+            if timeout is not None and timeout > 0 and self.empty():
+                waiting.set()
+                timeout = None
+            return super().get(block=block, timeout=timeout)
+
+    monkeypatch.setattr(module, "Queue", NoTimerQueue)
+    table = WorkerVersionTable("session")
+    table.drain_tracker = RequestDrainTracker()
+    if kind != "alignment":
+        table.drain_tracker.enqueue(VERSION, lambda: 42)
+    table.alignment_state = WorkerAlignmentState(
+        lambda _: Mock(num_tokens=2), lambda: None, notify_ready=table.notify_readiness
+    )
+    controller = ExecutionController("session", LocalPublicationTransport(table))
+    try:
+        controller.register(VERSION).wait()
+        revised = controller.advance(
+            Revision("edit", VERSION, replace(VERSION, epoch=8)),
+            alignment=AlignmentInput((1, 2, 3)) if kind == "alignment" else None,
+        )
+        revised.publication.wait()
+        assert waiting.wait(5)
+        if kind == "alignment":
+            table.alignment_state.process()
+            assert revised.alignment.wait().reusable_prefix_length == 2
+        elif kind == "fence":
+            table.drain_tracker.complete(42, VERSION)
+            table.notify_readiness()
+            assert revised.fence.wait().request == revised.fence.request
+        elif kind == "failure":
+            table.drain_tracker.fail(RuntimeError("lost owner"))
+            table.notify_readiness()
+            with pytest.raises(RuntimeError, match="unknown"):
+                revised.fence.wait()
+        else:
+            table.close()
+            with pytest.raises(RuntimeError, match="closed"):
+                revised.fence.wait()
+    finally:
+        controller.close()
+        assert not table._readiness_listeners
+        table.notify_readiness()
+        table.close()
+        table.alignment_state.process()
+
+
+def test_readiness_storm_is_coalesced_and_shutdown_detaches_listener(monkeypatch):
+    from tensorrt_llm.execution_mailbox import _ReadinessWake
+
+    monkeypatch.setenv("TRTLLM_RETIRE_READY_NOTIFY", "1")
+    table = WorkerVersionTable("session")
+    transport = _BlockedTransport(table)
+    controller = ExecutionController("session", transport)
+    initial = controller.register(VERSION)
+    assert transport.entered.wait(5)
+    try:
+        # An engine notification must never acquire the controller or worker
+        # authority lock. These locks are deliberately held during the storm.
+        with controller._lock, table._lock:
+            for _ in range(1000):
+                table.notify_readiness()
+        with controller._queue.mutex:
+            assert sum(isinstance(item, _ReadinessWake) for item in controller._queue.queue) == 1
+        controller.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            initial.wait()
+        assert not table._readiness_listeners
+        assert not controller._thread.is_alive()
+        before = controller._queue.qsize()
+        table.notify_readiness()
+        assert controller._queue.qsize() == before
+    finally:
+        transport.release.set()
+        controller.close()
+
+
+@pytest.mark.parametrize("flag", ["TRTLLM_RETIRE_READY_NOTIFY", "TRTLLM_RETIRE_COALESCE_ADVANCE"])
+def test_private_control_flags_reject_ambiguous_values(monkeypatch, flag):
+    monkeypatch.setenv(flag, "true")
+    table = WorkerVersionTable("session")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        ExecutionController("session", LocalPublicationTransport(table))
+    assert not table._readiness_listeners
+
+
+def test_early_advance_coalescing_keeps_existing_promises_until_engine_reclaim(monkeypatch):
+    from tensorrt_llm.execution_alignment import AlignmentInput, WorkerAlignmentState
+    from tensorrt_llm.execution_fence import RequestDrainTracker
+
+    monkeypatch.setenv("TRTLLM_RETIRE_COALESCE_ADVANCE", "1")
+    table = WorkerVersionTable("session")
+    table.drain_tracker = RequestDrainTracker()
+    first_hold, latest_hold = Mock(num_tokens=2), Mock(num_tokens=2)
+    holds = iter((first_hold, latest_hold))
+    state = table.alignment_state = WorkerAlignmentState(lambda _: next(holds), lambda: None)
+    transport = _BlockedTransport(table)
+    transport.release.set()
+    controller = ExecutionController("session", transport)
+    try:
+        controller.register(VERSION).wait()
+        first = controller.advance(
+            Revision("first", VERSION, replace(VERSION, epoch=8)),
+            alignment=AlignmentInput((1, 2, 3)),
+        )
+        first.publication.wait()
+        state.process()
+        first_receipt = first.alignment.wait()
+        transport.entered.clear()
+        transport.release.clear()
+        unrelated = controller.register(replace(VERSION, scope_id="other"))
+        assert transport.entered.wait(5)
+        second = controller.advance(
+            Revision("second", replace(VERSION, epoch=8), replace(VERSION, epoch=9)),
+            alignment=AlignmentInput((1, 2, 3)),
+        )
+        third = controller.advance(
+            Revision("third", replace(VERSION, epoch=9), replace(VERSION, epoch=10)),
+            alignment=AlignmentInput((1, 2, 3)),
+        )
+        transport.release.set()
+        unrelated.wait()
+        assert second.publication.wait().observed_version.epoch == 10
+        third.publication.wait()
+        first_hold.close.assert_not_called()
+        with pytest.raises(RuntimeError, match="superseded"):
+            state.authorize_resume(first_receipt)
+        state.process(isolated_only=True)
+        first_hold.close.assert_not_called()
+        state.process()
+        first_hold.close.assert_called_once()
+        assert third.alignment.wait().reusable_prefix_length == 2
+    finally:
+        transport.release.set()
+        controller.close()
+        table.close()
+        state.process()
 
 
 def test_acceptance_can_advance_while_publication_is_pending() -> None:

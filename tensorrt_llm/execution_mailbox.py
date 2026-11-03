@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Publish execution authority and acknowledge revision lifecycle transitions."""
 
-from collections.abc import Iterator
+import os
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -248,6 +249,28 @@ class WorkerVersionTable:
         self.drain_tracker: RequestDrainTracker | None = None
         self.alignment_state: WorkerAlignmentState | None = None
         self._alignment_transfers: dict[AlignmentTransferPermit, _AlignmentTransfer] = {}
+        self._readiness_lock = Lock()
+        self._readiness_listeners: set[Callable[[], None]] = set()
+
+    def _subscribe_readiness(self, listener: Callable[[], None]) -> None:
+        with self._readiness_lock:
+            self._readiness_listeners.add(listener)
+
+    def _unsubscribe_readiness(self, listener: Callable[[], None]) -> None:
+        with self._readiness_lock:
+            self._readiness_listeners.discard(listener)
+
+    def notify_readiness(self) -> None:
+        """Wake local lifecycle waiters without taking the authority lock.
+
+        Listeners only enqueue a notification; they cannot inspect authority or
+        native state here. Receipts are still independently validated on poll.
+        Remote transports retain their bounded polling fallback.
+        """
+        with self._readiness_lock:
+            listeners = tuple(self._readiness_listeners)
+        for listener in listeners:
+            listener()
 
     def poll_fence(self, request: FenceRequest) -> FenceReceipt | None:
         """Check a drain without blocking publication or waiting on the GPU."""
@@ -604,6 +627,7 @@ class WorkerVersionTable:
             self._gate.close_locked()
             if self.alignment_state is not None:
                 self.alignment_state.close()
+            self.notify_readiness()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -635,6 +659,13 @@ class LocalPublicationTransport:
 
     def __init__(self, table: WorkerVersionTable) -> None:
         self._table = table
+        self._readiness_listener: Callable[[], None] | None = None
+
+    def _bind_readiness(self, listener: Callable[[], None]) -> None:
+        if self._readiness_listener is not None:
+            raise RuntimeError("local readiness listener is already bound")
+        self._readiness_listener = listener
+        self._table._subscribe_readiness(listener)
 
     def publish(self, update: VersionUpdate, stop: Event) -> PublicationReceipt:
         if stop.is_set():
@@ -652,7 +683,13 @@ class LocalPublicationTransport:
         return self._table.poll_alignment(request)
 
     def close(self) -> None:
-        pass
+        if self._readiness_listener is not None:
+            self._table._unsubscribe_readiness(self._readiness_listener)
+            self._readiness_listener = None
+
+
+class _ReadinessWake:
+    """Queue token with no authority or completion evidence."""
 
 
 class ExecutionController:
@@ -706,9 +743,33 @@ class ExecutionController:
         self._pending_alignments: dict[AlignmentRequest, RevisionAlignment] = {}
         self._alignment_current: dict[ExecutionVersion, AlignmentRequest] = {}
         self._resumes: dict[ExecutionVersion, AlignmentReceipt] = {}
-        self._queue: Queue[VersionPublication | FenceRequest | AlignmentRequest | None] = Queue()
+        self._queue: Queue[
+            VersionPublication | FenceRequest | AlignmentRequest | _ReadinessWake | None
+        ] = Queue()
+        for flag in ("TRTLLM_RETIRE_READY_NOTIFY", "TRTLLM_RETIRE_COALESCE_ADVANCE"):
+            if os.environ.get(flag, "0") not in ("0", "1"):
+                raise ValueError(f"{flag} must be 0 or 1")
+        self._coalesce_advances = (
+            isinstance(transport, LocalPublicationTransport)
+            and os.environ.get("TRTLLM_RETIRE_COALESCE_ADVANCE", "0") == "1"
+        )
+        self._readiness_lock = Lock()
+        self._readiness_pending = False
+        if (
+            isinstance(transport, LocalPublicationTransport)
+            and os.environ.get("TRTLLM_RETIRE_READY_NOTIFY", "0") == "1"
+        ):
+            transport._bind_readiness(self._notify_readiness)
         self._thread = Thread(target=self._run, name="retire_publication", daemon=True)
         self._thread.start()
+
+    def _notify_readiness(self) -> None:
+        # Separate from _lock: this can run while the engine owns alignment or
+        # the worker authority lock. Queue insertion never polls either state.
+        with self._readiness_lock:
+            if not self._stop.is_set() and not self._readiness_pending:
+                self._readiness_pending = True
+                self._queue.put(_ReadinessWake())
 
     @property
     def closed(self) -> bool:
@@ -1016,7 +1077,60 @@ class ExecutionController:
                 return True
             return False
 
+    @staticmethod
+    def _can_coalesce(update: VersionUpdate) -> bool:
+        return (
+            not update.admit_requests
+            and update.resume is None
+            and not update.source_only
+            and not update.release_source
+            and (
+                update.alignment is None
+                or (
+                    update.alignment.revised_input.destination is None
+                    and update.alignment.revised_input.transfer is None
+                )
+            )
+        )
+
+    def _select_publication(
+        self, publication: VersionPublication
+    ) -> tuple[VersionPublication, tuple[VersionPublication, ...]]:
+        # Only queued local revocations may be covered by a later revocation.
+        # Never skip admission, RESUME, a transfer role, or an in-flight publish.
+        # Historical FENCE/ALIGN futures remain in their independent poll queues.
+        with self._lock:
+            if not self._coalesce_advances or not self._can_coalesce(publication.update):
+                return publication, (publication,)
+            version = publication.update.version
+            latest = self._latest[(version.tenant_id, version.scope_id)]
+            if (
+                latest._future.done()
+                or latest.update.version.epoch <= version.epoch
+                or not self._can_coalesce(latest.update)
+            ):
+                return publication, (publication,)
+            if any(
+                queued.update.version.tenant_id == version.tenant_id
+                and queued.update.version.scope_id == version.scope_id
+                and publication.update.sequence < queued.update.sequence < latest.update.sequence
+                and not self._can_coalesce(queued.update)
+                for queued in self._pending
+            ):
+                return publication, (publication,)
+            covered = tuple(
+                queued
+                for queued in self._pending
+                if queued.update.version.tenant_id == version.tenant_id
+                and queued.update.version.scope_id == version.scope_id
+                and version.epoch <= queued.update.version.epoch <= latest.update.version.epoch
+                and queued.update.sequence <= latest.update.sequence
+                and self._can_coalesce(queued.update)
+            )
+            return latest, covered
+
     def _run(self) -> None:
+        readiness_polls = 0
         try:
             while not self._stop.is_set():
                 fence_done = self._poll_one_fence()
@@ -1028,10 +1142,15 @@ class ExecutionController:
                     # Pending work still sleeps; bounded polling keeps many
                     # scopes from multiplying a single scope's polling period.
                     timeout = (
-                        (0.0 if fence_done or alignment_done else max(0.001, 0.01 / pending))
+                        (
+                            0.0
+                            if fence_done or alignment_done or readiness_polls
+                            else max(0.001, 0.01 / pending)
+                        )
                         if pending
                         else None
                     )
+                readiness_polls = max(0, readiness_polls - 1)
                 try:
                     publication = self._queue.get(timeout=timeout)
                 except Empty:
@@ -1040,6 +1159,17 @@ class ExecutionController:
                     break
                 if isinstance(publication, (FenceRequest, AlignmentRequest)):
                     continue
+                if isinstance(publication, _ReadinessWake):
+                    with self._readiness_lock:
+                        self._readiness_pending = False
+                    with self._lock:
+                        readiness_polls = max(
+                            len(self._pending_fences), len(self._pending_alignments)
+                        )
+                    continue
+                if publication._future.done():
+                    continue
+                publication, covered = self._select_publication(publication)
                 try:
                     receipt = self._transport.publish(publication.update, self._stop)
                     if (
@@ -1055,23 +1185,29 @@ class ExecutionController:
                     # A transport failure completes the waiter; it must not kill
                     # the publisher silently or undo an accepted revision.
                     with self._lock:
-                        if not publication._future.done():
-                            publication._future.set_exception(error)
-                        self._pending.discard(publication)
+                        for pending_publication in covered:
+                            if not pending_publication._future.done():
+                                pending_publication._future.set_exception(error)
+                            self._pending.discard(pending_publication)
                 else:
                     with self._lock:
-                        if not publication._future.done():
-                            resume = publication.update.resume
-                            if resume is not None and not self._registry.is_current(
-                                publication.update.version
-                            ):
-                                publication._future.set_exception(
-                                    RuntimeError("RESUME was superseded before acknowledgement")
-                                )
-                            else:
-                                if resume is not None:
-                                    self._registry.resume(resume.request.revision)
-                                publication._future.set_result(receipt)
-                        self._pending.discard(publication)
+                        for pending_publication in covered:
+                            if not pending_publication._future.done():
+                                resume = pending_publication.update.resume
+                                if resume is not None and not self._registry.is_current(
+                                    pending_publication.update.version
+                                ):
+                                    pending_publication._future.set_exception(
+                                        RuntimeError("RESUME was superseded before acknowledgement")
+                                    )
+                                else:
+                                    if resume is not None:
+                                        self._registry.resume(resume.request.revision)
+                                    pending_publication._future.set_result(
+                                        PublicationReceipt(
+                                            pending_publication.update, receipt.observed_version
+                                        )
+                                    )
+                            self._pending.discard(pending_publication)
         finally:
             self._transport.close()

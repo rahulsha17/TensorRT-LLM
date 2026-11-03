@@ -240,11 +240,15 @@ class WorkerAlignmentState:
         *,
         prepare: Callable[[AlignmentRequest], None] | None = None,
         reserve_isolated: Callable[[AlignmentRequest], PrefixReservation | None] | None = None,
+        prepare_ready: Callable[[AlignmentRequest], bool] | None = None,
+        notify_ready: Callable[[], None] | None = None,
     ) -> None:
         self._lock = RLock()
         self._reserve = reserve
         self._prepare = prepare
         self._reserve_isolated = reserve_isolated
+        self._prepare_ready = prepare_ready
+        self._notify_ready = notify_ready
         self._wake = wake
         self._max_reservations = max_reservations
         self._current: dict[tuple[str, str], ExecutionVersion] = {}
@@ -311,10 +315,16 @@ class WorkerAlignmentState:
                 self._wake_pending = True
                 self._wake()
 
-    def process(self) -> None:
-        """Engine safe point: reserve successors before dropping superseded holds."""
+    def process(self, *, isolated_only: bool = False, block: bool = False) -> None:
+        """Reserve at an engine safe point; defer unready source preparation.
+
+        The early isolated-only pass cannot prepare fallback KV or reclaim any
+        older hold. Ordinary owner release uses block=True so an armed promise
+        is captured before the source allocation can disappear.
+        """
         with self._lock:
-            self._wake_pending = False
+            if not isolated_only:
+                self._wake_pending = False
             if self._unsafe_error is not None:
                 raise self._unsafe_error
             if not self._closed:
@@ -332,6 +342,14 @@ class WorkerAlignmentState:
                             reservation = self._reserve_isolated(request)
                         record.isolated = reservation is not None
                         if reservation is None:
+                            if isolated_only:
+                                continue
+                            if (
+                                not block
+                                and self._prepare_ready is not None
+                                and not self._prepare_ready(request)
+                            ):
+                                continue
                             if self._prepare is not None:
                                 self._prepare(request)
                             reservation = self._reserve(request.revised_input)
@@ -344,15 +362,36 @@ class WorkerAlignmentState:
                         ):
                             raise RuntimeError("reserved prefix does not satisfy revised input")
                         record.receipt = AlignmentReceipt(request, uuid4().hex, count)
+                        self._notify()
                     except AlignmentSafetyError as error:
                         record.error = error
                         self._unsafe_error = error
+                        self._notify()
                         raise
                     except Exception as error:
                         # Report a request-scoped acquisition error. Retain any
                         # partial ownership until the engine can close it below.
                         record.error = error
+                        self._notify()
+            if isolated_only:
+                return
+            preparing_scopes = {
+                (
+                    request.revision.successor_version.tenant_id,
+                    request.revision.successor_version.scope_id,
+                )
+                for request, record in self._records.items()
+                if not self._closed
+                and self._is_current(request)
+                and record.receipt is None
+                and record.error is None
+            }
             for request, record in list(self._records.items()):
+                version = request.revision.successor_version
+                if (version.tenant_id, version.scope_id) in preparing_scopes:
+                    # A deferred successor must acquire its prefix before this
+                    # scope loses a previous revision's last native hold.
+                    continue
                 if (
                     self._closed
                     or not self._is_current(request)
@@ -365,11 +404,17 @@ class WorkerAlignmentState:
             if self._closed and self._records:
                 raise RuntimeError("ALIGN transfers still retain KV; teardown must wait")
 
+    def _notify(self) -> None:
+        # Notification must only enqueue a wakeup, never reenter authority:
+        # publication holds the worker lock before acquiring this lock.
+        if self._notify_ready is not None:
+            self._notify_ready()
+
     @contextmanager
     def releasing_owner(self) -> Iterator[None]:
         """Capture any armed prefix before ordinary cleanup drops the old KV hold."""
         with self._lock:
-            self.process()
+            self.process(block=True)
             yield
 
     def poll(self, request: AlignmentRequest) -> AlignmentReceipt | None:
@@ -632,6 +677,7 @@ class WorkerAlignmentState:
                 "RECLAIM completion is unknown; restart required"
             )
             record.error = self._unsafe_error
+            self._notify()
             raise self._unsafe_error from error
         record.reservation = None
         return True
@@ -647,6 +693,7 @@ class WorkerAlignmentState:
                     # Cancellation may arrive before activation binds the input.
                     record.request_id = request_id
                     record.error = RuntimeError("RESUME request is terminal")
+                    self._notify()
                     if record.reservation is not None and not self._wake_pending:
                         self._wake_pending = True
                         self._wake()
@@ -669,6 +716,7 @@ class WorkerAlignmentState:
         """Invalidate immediately; the engine thread performs native cleanup."""
         with self._lock:
             self._closed = True
+            self._notify()
             if self._records and not self._wake_pending:
                 self._wake_pending = True
                 self._wake()

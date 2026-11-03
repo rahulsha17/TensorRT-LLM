@@ -13,6 +13,78 @@ from tensorrt_llm.execution_version import ExecutionVersion
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def test_scratch_pool_rejects_captured_receipts_and_publication_before_acquisition(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_SCRATCH_POOL", "1")
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "scratch-capture", 7)
+    authority.publish(old)
+    assert authority.check([old]) == [True]
+    pool = authority._scratch_pool
+    before = (pool.hits, pool.misses, len(authority._pending))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="outside capture"):
+        authority.enqueue_check([old])
+    with pytest.raises(RuntimeError, match="outside capture"):
+        authority.publish(replace(old, epoch=8))
+    assert (pool.hits, pool.misses, len(authority._pending)) == before
+    assert authority._failure is None
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_scratch_pool_reuses_internal_storage_without_mutating_retained_outputs(
+    monkeypatch, compact
+):
+    monkeypatch.setenv("TRTLLM_RETIRE_SCRATCH_POOL", "1")
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "scratch-retention", 7)
+    new = replace(old, epoch=8)
+    authority.publish(old)
+    receipt = authority.enqueue_check([old, None])
+    assert receipt.wait() == [True, True]
+    candidates = torch.tensor([[[11], [22], [33]]], device=authority.device, dtype=torch.int32)
+    before = authority.enqueue_token_commit([old, None], [0, 2], candidates, compact)
+    retained = before.wait()
+    expected_host = [11, 33] if compact else [[[11], [0], [33]]]
+    assert retained.tokens_host.tolist() == expected_host
+    assert retained.tokens_device.tolist() == [[[11], [0], [33]]]
+    initial_hits = authority._scratch_pool.hits
+    authority.publish(new)
+    for _ in range(3):
+        assert authority.enqueue_check([old, new]).wait() == [False, True]
+        after = authority.enqueue_token_commit([old, new], [0, 1], candidates + 100, compact)
+        assert after.wait().allowed == [False, True]
+        assert after.tokens_device.tolist() == [[[0], [122], [0]]]
+    assert authority._scratch_pool.hits > initial_hits
+    assert receipt.wait() == [True, True]
+    assert before.wait().allowed == [True, True]
+    assert retained.tokens_host.tolist() == expected_host
+    assert retained.tokens_device.tolist() == [[[11], [0], [33]]]
+    assert before.event is not after.event
+
+
+def test_scratch_pool_does_not_reuse_storage_from_pending_stream(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_SCRATCH_POOL", "1")
+    authority = DeviceExecutionAuthority(torch.cuda.current_device())
+    old = ExecutionVersion("tenant", "scratch-stream", 7)
+    new = replace(old, epoch=8)
+    authority.publish(old)
+    assert authority.check([old]) == [True]
+    stream = torch.cuda.Stream()
+    try:
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(1_000_000_000)
+            pending = authority.enqueue_check([old, None])
+        assert not pending.query()
+        pending_ptrs = {entry.storage.data_ptr() for entry in pending._use.scratch}
+        authority.publish(new)
+        current = authority.enqueue_check([old, new])
+        assert current.wait() == [False, True]
+        assert pending_ptrs.isdisjoint(entry.storage.data_ptr() for entry in current._use.scratch)
+        assert pending.wait() == [False, True]
+    finally:
+        stream.synchronize()
+
+
 @pytest.mark.parametrize("captured", [False, True])
 def test_stable_attention_rows_reject_revisions_and_refresh_reordered_padding(captured):
     from tensorrt_llm._torch.pyexecutor import execution_device as module

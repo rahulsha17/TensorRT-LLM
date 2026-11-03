@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Engine-thread adapters that own real KV while a RETIRE successor is pending."""
 
+import os
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ class _Reservation:
     _settle: Callable[[], None] = lambda: None
     _closed: bool = False
     _resident: Callable[[], bool] = lambda: False
+    _isolated_safe: bool = True
 
     @property
     def has_resident_prefix(self) -> bool:
@@ -50,6 +52,15 @@ class KVAlignmentAdapter:
         self._fresh_resident_v2: set[int] = set()
         self._idle_repoll_available = False
         self._failed_isolated_reservations: list[PrefixReservation] = []
+
+        def enabled(name: str) -> bool:
+            value = os.environ.get(name, "0")
+            if value not in ("0", "1"):
+                raise ValueError(f"{name} must be 0 or 1")
+            return value == "1"
+
+        self._isolated_partial = enabled("TRTLLM_RETIRE_ISOLATED_PARTIAL")
+        self._isolated_residency = enabled("TRTLLM_RETIRE_ISOLATED_RESIDENCY")
         if self._keep_resident:
             self._manager._execution_residency_reclaimer = self.yield_residency
             self._manager._execution_residency_pending = self.has_residency
@@ -117,11 +128,12 @@ class KVAlignmentAdapter:
         return self._reserve_v1(revised)
 
     def reserve_isolated(self, revised: AlignmentInput) -> PrefixReservation | None:
-        """Hold only existing full V2 blocks without waiting for obsolete work.
+        """Hold immutable V2 prefixes without waiting for obsolete work.
 
         The caller must establish that the execution mode preserves committed
         pages as immutable. This method never publishes an old owner's pending
-        progress, activates the reservation, or changes the old allocation.
+        progress or changes the old allocation. Optional native pinning only
+        locks ready full pages already on GPU; partial tails stay suspended.
         None requests the ordinary drained preparation path.
         """
         if self._failed_isolated_reservations:
@@ -137,7 +149,11 @@ class KVAlignmentAdapter:
         if reservation is None:
             return None
         if (
-            reservation.num_tokens % self._manager.impl.tokens_per_block
+            not reservation._isolated_safe
+            or (
+                reservation.num_tokens % self._manager.impl.tokens_per_block
+                and not self._isolated_partial
+            )
             or reservation.num_tokens < revised.required_prefix_length
         ):
             try:
@@ -174,14 +190,14 @@ class KVAlignmentAdapter:
 
     def _reserve_v2(
         self, revised: AlignmentInput, *, isolated: bool = False
-    ) -> PrefixReservation | None:
+    ) -> _Reservation | None:
         from ...runtime.kv_cache_manager_v2 import ReuseScope
 
         manager = self._manager
         block_size = manager.impl.tokens_per_block
         available = max(0, self._v2_reservation_block_limit() - self._reserved_v2_blocks)
         limit = min(revised.reuse_limit, available * block_size)
-        if isolated:
+        if isolated and not self._isolated_partial:
             limit = limit // block_size * block_size
         if limit < revised.required_prefix_length:
             if isolated:
@@ -205,6 +221,47 @@ class KVAlignmentAdapter:
                 raise RuntimeError("ALIGN acquired prefix exceeds its reservation limit")
             blocks = (count + block_size - 1) // block_size
             assert blocks <= available
+            isolated_safe = not isolated or count % block_size == 0
+            if isolated and count % block_size and self._isolated_partial:
+                ready = getattr(cache, "isolated_prefix_ready", None)
+                if not callable(ready):
+                    raise RuntimeError(
+                        "Isolated partial reuse requires rebuilt native KV readiness API"
+                    )
+                isolated_safe = ready(allow_partial=True) is True
+            if (
+                isolated
+                and isolated_safe
+                and count >= block_size
+                and count % block_size == 0
+                and self._keep_resident
+                and self._isolated_residency
+                and manager._supports_dense_resume_capacity() is True
+            ):
+                groups = Counter(manager.impl.get_life_cycle_pool_group_indices(0))
+                stats = manager.impl.get_storage_statistics(0)
+                # At most one quarter of logical GPU capacity may be protected
+                # by optional residency. Select only entire, already-hot holds.
+                budget = min(
+                    (
+                        stats[group].total // multiplicity // 4
+                        for group, multiplicity in groups.items()
+                    ),
+                    default=0,
+                )
+                resident_blocks = sum(
+                    (held.num_committed_tokens + block_size - 1) // block_size
+                    for held in self._resident_v2.values()
+                )
+                pin = getattr(cache, "try_pin_resident_prefix", None)
+                if not callable(pin):
+                    raise RuntimeError("Isolated residency requires rebuilt native KV pin API")
+                if resident_blocks + blocks <= budget and pin(manager._stream.cuda_stream) is True:
+                    resident_cache = cache
+                    if not self._resident_v2:
+                        self._idle_repoll_available = True
+                    self._resident_v2[id(cache)] = cache
+                    self._fresh_resident_v2.add(id(cache))
             dense = not isolated and manager._supports_dense_resume_capacity()
             if self._keep_resident and dense and count >= block_size:
                 # Only protect a prefix already recorded as resident. Optional
@@ -266,6 +323,7 @@ class KVAlignmentAdapter:
                 _resident=lambda: (
                     resident_cache is not None and id(resident_cache) in self._resident_v2
                 ),
+                _isolated_safe=isolated_safe,
             )
         except Exception:
             try:

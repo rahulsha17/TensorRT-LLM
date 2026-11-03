@@ -3379,6 +3379,79 @@ class KVCacheManagerV2(BaseResourceManager):
                 guard_blocks += blocks
         return 1 + guard_blocks, internal_ids
 
+    def execution_completion_demand(
+        self, claims: Sequence[tuple[LlmRequest, _KVCache, int]]
+    ) -> int:
+        """Native-backed completion demand in conservative logical-block units.
+
+        The scheduler owns these exact allocations until native cleanup. Retired
+        requests need no future growth, but the native query still charges their
+        actual capacity. Immutable sharing is identified inside the native lock;
+        token equality, page indices, and cache-hit counters never grant credit.
+        """
+        groups = self.impl.get_life_cycle_pool_group_indices(0)
+        if not groups or any(group != 0 for group in groups):
+            raise ValueError("Precise completion demand requires one dense GPU pool")
+        caches = []
+        capacities = []
+        for request, allocation, _ in claims:
+            if self.kv_cache_map.get(request.py_request_id) is not allocation:
+                raise RuntimeError("Completion allocation identity changed")
+            caches.append(allocation)
+            capacities.append(
+                0
+                if request.is_finished is True
+                else request.prompt_len + max(request.max_new_tokens - 1, 0)
+            )
+        query = getattr(self.impl, "get_completion_demand", None)
+        if not callable(query):
+            raise RuntimeError("Shared completion budget requires rebuilt native KV demand API")
+        demand = query(caches, capacities)
+        if len(demand) != 1 or type(demand[0]) is not int or demand[0] < 0:
+            raise RuntimeError("Invalid native completion demand")
+        return (demand[0] + len(groups) - 1) // len(groups)
+
+    def execution_completion_try_admit(
+        self,
+        claims: Sequence[tuple[LlmRequest, _KVCache, int]],
+        request: LlmRequest,
+        capacity_blocks: int,
+    ) -> bool:
+        """Retain the exact candidate match before granting immutable-page credit.
+
+        Successful admission leaves a suspended cache for prepare_context_cache.
+        Rejection releases only this newly created owner; it cannot change any
+        prior request or ALIGN promise. A later failed scheduling attempt follows
+        the existing first-chunk cleanup path.
+        """
+        if request.py_request_id in self.kv_cache_map:
+            raise RuntimeError("Unclaimed completion candidate already owns KV")
+        if self.conversation_manager is not None or not request.is_first_context_chunk:
+            raise ValueError("Precise completion admission requires a fresh text context")
+        allocation = self._create_kv_cache(
+            request.py_request_id,
+            request.lora_task_id,
+            self._context_reuse_tokens(request) if self.enable_block_reuse else None,
+            cache_salt=request.cache_salt,
+            max_reuse_tokens=request.execution_reuse_limit,
+            is_dummy=request.is_dummy,
+            enable_request_stats=request.return_perf_metrics,
+            expected_prompt_length=request.prompt_len,
+        )
+        if allocation is None:
+            return False
+        accepted = False
+        try:
+            allocation.cuda_stream = self._stream.cuda_stream
+            accepted = (
+                self.execution_completion_demand([*claims, (request, allocation, 0)])
+                <= capacity_blocks
+            )
+            return accepted
+        finally:
+            if not accepted:
+                self.free_resources(request)
+
     def get_num_free_blocks(self) -> int:
         # NOTE This method is used to get the number of blocks in the primary pool not the FREE blocks.
         # However, since we only use this function when the kv cache manager is empty, so it is safe to do so.

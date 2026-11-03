@@ -93,6 +93,111 @@ def test_isolated_v2_holds_full_blocks_without_promoting_residency(engine) -> No
     assert adapter._reserved_v2_blocks == 0
 
 
+@pytest.mark.parametrize("ready", [True, False])
+def test_isolated_partial_requires_native_immutable_ready_proof(engine, monkeypatch, ready):
+    monkeypatch.setenv("TRTLLM_RETIRE_ISOLATED_PARTIAL", "1")
+    cache = Mock(num_committed_tokens=7)
+    cache.isolated_prefix_ready.return_value = ready
+    engine.kv_cache_manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+    hold = adapter.reserve_isolated(replace(INPUT, min_reuse_tokens=7, max_reuse_tokens=7))
+    cache.isolated_prefix_ready.assert_called_once_with(allow_partial=True)
+    cache.resume.assert_not_called()
+    cache.try_pin_resident_prefix.assert_not_called()
+    assert engine.kv_cache_manager.impl.create_kv_cache.call_args.args[1] == list(range(7))
+    if ready:
+        assert hold is not None and hold.num_tokens == 7
+        assert adapter._reserved_v2_blocks == 2
+        hold.close()
+    else:
+        assert hold is None
+    cache.close.assert_called_once()
+    assert adapter._reserved_v2_blocks == 0
+
+
+def test_isolated_partial_cannot_weaken_the_strict_promise(engine, monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_ISOLATED_PARTIAL", "1")
+    cache = Mock(num_committed_tokens=4)
+    engine.kv_cache_manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine)
+    assert adapter.reserve_isolated(replace(INPUT, min_reuse_tokens=7)) is None
+    cache.close.assert_called_once()
+
+
+@pytest.mark.parametrize("flag", ["ISOLATED_PARTIAL", "ISOLATED_RESIDENCY"])
+@pytest.mark.parametrize("value", ["true", "", "2"])
+def test_isolated_flags_reject_ambiguous_values(engine, monkeypatch, flag, value):
+    monkeypatch.setenv("TRTLLM_RETIRE_" + flag, value)
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        KVAlignmentAdapter(engine)
+
+
+@pytest.mark.parametrize("partial", [True, False])
+def test_isolated_flags_require_new_native_api(engine, monkeypatch, partial):
+    monkeypatch.setenv(
+        "TRTLLM_RETIRE_ISOLATED_PARTIAL" if partial else "TRTLLM_RETIRE_ISOLATED_RESIDENCY", "1"
+    )
+    manager = engine.kv_cache_manager
+    manager._supports_dense_resume_capacity.return_value = True
+    cache = Mock(num_committed_tokens=7 if partial else 12)
+    cache.isolated_prefix_ready = None
+    cache.try_pin_resident_prefix = None
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+    with pytest.raises(RuntimeError, match="requires rebuilt native KV"):
+        adapter.reserve_isolated(INPUT)
+    cache.close.assert_called_once()
+
+
+@pytest.mark.parametrize("pinned", [True, False])
+def test_isolated_residency_uses_pin_only_api_and_existing_pressure_yield(
+    engine, monkeypatch, pinned
+):
+    monkeypatch.setenv("TRTLLM_RETIRE_ISOLATED_RESIDENCY", "1")
+    manager = engine.kv_cache_manager
+    manager._supports_dense_resume_capacity.return_value = True
+    cache = Mock(num_committed_tokens=12)
+    cache.try_pin_resident_prefix.return_value = pinned
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+    hold = adapter.reserve_isolated(INPUT)
+    assert hold is not None
+    cache.try_pin_resident_prefix.assert_called_once_with(manager._stream.cuda_stream)
+    cache.resume.assert_not_called()
+    cache.resize.assert_not_called()
+    assert hold.has_resident_prefix is pinned
+    assert adapter.yield_residency() is pinned
+    assert not hold.has_resident_prefix
+    if pinned:
+        cache.suspend.assert_called_once()
+    else:
+        cache.suspend.assert_not_called()
+    assert adapter._reserved_v2_blocks == 3
+    hold.close()
+    cache.close.assert_called_once()
+
+
+def test_isolated_residency_selects_only_prefixes_within_aggregate_quarter_pool_budget(
+    engine, monkeypatch
+):
+    monkeypatch.setenv("TRTLLM_RETIRE_ISOLATED_RESIDENCY", "1")
+    manager = engine.kv_cache_manager
+    manager._supports_dense_resume_capacity.return_value = True
+    first, second = (Mock(num_committed_tokens=12), Mock(num_committed_tokens=8))
+    first.try_pin_resident_prefix.return_value = True
+    manager.impl.create_kv_cache.side_effect = [first, second]
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+    holds = [adapter.reserve_isolated(INPUT), adapter.reserve_isolated(INPUT)]
+    assert holds[0].has_resident_prefix
+    assert not holds[1].has_resident_prefix
+    second.try_pin_resident_prefix.assert_not_called()
+    adapter.advance_residency()
+    assert adapter.yield_expired_residency()
+    assert not holds[0].has_resident_prefix
+    for hold in holds:
+        hold.close()
+
+
 @pytest.mark.parametrize("limit,expected", [(0, 0), (1, 0), (7, 4), (8, 8), (None, 16)])
 def test_isolated_v2_rounds_runtime_and_final_token_bounds(engine, limit, expected) -> None:
     manager = engine.kv_cache_manager

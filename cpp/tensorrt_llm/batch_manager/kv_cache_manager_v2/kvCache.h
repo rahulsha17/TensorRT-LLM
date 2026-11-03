@@ -250,6 +250,14 @@ public:
     bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt,
         std::optional<int> capacityHint = std::nullopt);
 
+    //! Nonblocking proof that a never-resumed dense prefix owns ready immutable canonical pages.
+    //! Partial sources remain suspended and are copied privately by the successor's normal resume.
+    bool isolatedPrefixReady(bool allowPartial = false) const;
+
+    //! Pin only ready full pages already on GPU. No restore, copy, or CUDA wait is submitted.
+    //! On success this cache owns read-only locks and can be yielded with suspend() or close().
+    bool tryPinResidentPrefix(CUstream stream);
+
     // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
     // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
     // with an unchanged watermark. Returns false on host OOM.
