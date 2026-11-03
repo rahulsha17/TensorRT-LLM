@@ -20,14 +20,10 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
-#if CUDA_VERSION < 12080
 #include <algorithm>
-#endif
 #include <array>
 #include <cstddef>
-#if CUDA_VERSION < 12080
 #include <cstdint>
-#endif
 #include <memory>
 #include <vector>
 
@@ -56,8 +52,9 @@ CudaAllocation allocateCuda(size_t numBytes)
     return CudaAllocation{ptr};
 }
 
-#if CUDA_VERSION < 12080
-TEST(KvCacheManagerV2ColdPageCopyTest, KernelFallbackCapturesMultipleIndexSegments)
+using CopyIndices = void (*)(CUdeviceptr, PageIndexPair const*, size_t, CUstream);
+
+void checkCapturedIndexSegments(CopyIndices copyIndices)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
 
@@ -73,7 +70,7 @@ TEST(KvCacheManagerV2ColdPageCopyTest, KernelFallbackCapturesMultipleIndexSegmen
 
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
-    detail::copyPageIndicesToDeviceWithKernel(
+    copyIndices(
         reinterpret_cast<CUdeviceptr>(device.get()), input.data(), input.size(), reinterpret_cast<CUstream>(stream));
     std::fill(input.begin(), input.end(), PageIndexPair{-1, -1});
 
@@ -88,6 +85,17 @@ TEST(KvCacheManagerV2ColdPageCopyTest, KernelFallbackCapturesMultipleIndexSegmen
         EXPECT_EQ(actual[index].src, expected[index].src);
     }
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2ColdPageCopyTest, DispatcherCapturesMultipleIndexSegments)
+{
+    checkCapturedIndexSegments(detail::copyPageIndicesToDevice);
+}
+
+#if CUDA_VERSION < 12080
+TEST(KvCacheManagerV2ColdPageCopyTest, KernelFallbackCapturesMultipleIndexSegments)
+{
+    checkCapturedIndexSegments(detail::copyPageIndicesToDeviceWithKernel);
 }
 #endif
 

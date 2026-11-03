@@ -5226,6 +5226,172 @@ class TestRecoveryAdmission:
         assert result.context_requests == [cold]
 
 
+class TestRecoveryFairShare:
+    @staticmethod
+    def setup(monkeypatch, **scheduler_kwargs):
+        monkeypatch.setenv("TRTLLM_RETIRE_PREFILL_FAIR_SHARE", "1")
+        manager = make_kv_cache_manager(enable_block_reuse=True)
+        manager.mapping.world_size = 1
+        manager._supports_dense_resume_capacity.return_value = True
+        scheduler = make_scheduler(
+            manager, max_num_tokens=256, ctx_chunk_config=(None, 64), **scheduler_kwargs
+        )
+        ordinary = make_ctx_request(1, 1024, is_last_context_chunk=False)
+        recovery = make_ctx_request(
+            2, 4096, prompt_len=8192, is_first_context_chunk=False, is_last_context_chunk=False
+        )
+        recovery.context_current_position = 4096
+        recovery.py_execution_recovery_prefill = True
+        ordinary.py_multimodal_data = recovery.py_multimodal_data = None
+        return manager, scheduler, ordinary, recovery
+
+    @staticmethod
+    def age(scheduler, ordinary):
+        scheduler._ordinary_prefill_wait[ordinary.py_request_id] = (
+            ordinary,
+            scheduler._RECOVERY_FAIR_SHARE_PASSES,
+        )
+
+    def test_age_requires_four_productive_recovery_batches(self, monkeypatch):
+        manager, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        for _ in range(4):
+            result = scheduler.schedule_request([ordinary, recovery], set())
+            assert result.context_requests == [recovery]
+            recovery.context_current_position += recovery.context_chunk_size
+            recovery.context_remaining_length -= recovery.context_chunk_size
+        manager.resize_context.reset_mock()
+
+        result = scheduler.schedule_request([ordinary, recovery], set())
+
+        assert result.context_requests == [recovery, ordinary]
+        assert (recovery.context_chunk_size, ordinary.context_chunk_size) == (128, 128)
+        # Protect all of recovery's originally planned capacity before trying
+        # the ordinary request; shortening compute does not shrink that capacity.
+        assert manager.resize_context.call_args_list == [call(recovery, 256), call(ordinary, 128)]
+        manager.suspend_request.assert_not_called()
+        manager.free_resources.assert_not_called()
+        manager._yield_execution_residency.assert_not_called()
+        assert ordinary.py_request_id not in scheduler._ordinary_prefill_wait
+
+    @pytest.mark.parametrize("failure", ["prepare", "resize"])
+    def test_failed_optional_admission_keeps_full_recovery_chunk(self, monkeypatch, failure):
+        manager, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        self.age(scheduler, ordinary)
+        if failure == "prepare":
+            manager.prepare_context.side_effect = lambda req, **kwargs: req is recovery
+        else:
+            manager.resize_context.side_effect = lambda req, tokens: req is recovery
+        scheduler._try_preempt_for_pages = Mock(side_effect=AssertionError("must not preempt"))
+
+        result = scheduler.schedule_request([ordinary, recovery], set())
+
+        assert result.context_requests == [recovery]
+        assert recovery.context_chunk_size == 256
+        manager.suspend_request.assert_not_called()
+        assert all(c.args[0] is not recovery for c in manager.free_resources.call_args_list)
+        assert scheduler._ordinary_prefill_wait[ordinary.py_request_id][1] == 4
+
+    @pytest.mark.parametrize("length,expected_recovery", [(1, 192), (64, 192), (65, 128)])
+    def test_unused_offer_returns_to_recovery(self, monkeypatch, length, expected_recovery):
+        manager, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        self.age(scheduler, ordinary)
+        ordinary.context_remaining_length = ordinary.prompt_len = length
+        ordinary.is_last_context_chunk = True
+
+        result = scheduler.schedule_request([ordinary, recovery], set())
+
+        assert result.context_requests == [recovery, ordinary]
+        assert recovery.context_chunk_size == expected_recovery
+        assert ordinary.context_chunk_size == length
+        assert recovery.context_chunk_size + length <= 256
+        assert manager.resize_context.call_args_list == [
+            call(recovery, 256),
+            call(ordinary, length),
+        ]
+
+    def test_decode_budget_and_two_prefills_stay_within_limit(self, monkeypatch):
+        _, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        self.age(scheduler, ordinary)
+        decode = make_gen_request(3)
+
+        result = scheduler.schedule_request([ordinary, recovery, decode], set())
+
+        assert result.generation_requests == [decode]
+        assert result.context_requests == [recovery, ordinary]
+        assert recovery.context_chunk_size >= 128
+        assert recovery.context_chunk_size + ordinary.context_chunk_size + 1 <= 256
+
+    @pytest.mark.parametrize(
+        "restriction", ["resident", "promise", "batch", "peft", "multimodal", "force", "off"]
+    )
+    def test_sharing_respects_existing_admission_guards(self, monkeypatch, restriction):
+        manager, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        self.age(scheduler, ordinary)
+        requests = [ordinary, recovery]
+        if restriction == "resident":
+            manager.has_execution_residency = True
+        elif restriction == "promise":
+            waiting = make_ctx_request(3, 128)
+            waiting.py_execution_recovery_tokens = 64
+            requests.append(waiting)
+        elif restriction == "batch":
+            scheduler.max_num_requests = 1
+        elif restriction == "peft":
+            scheduler.peft_cache_manager = make_peft_cache_manager(1)
+            ordinary.lora_task_id, recovery.lora_task_id = 1, 2
+        elif restriction == "multimodal":
+            ordinary.py_multimodal_data = {"mm_bidirectional_blocks": True}
+        elif restriction == "force":
+            # The feature gate is fixed at construction.
+            monkeypatch.setenv("TRTLLM_RETIRE_PREFILL_FAIR_SHARE", "1")
+            scheduler = make_scheduler(
+                manager,
+                max_num_tokens=256,
+                ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64),
+            )
+            self.age(scheduler, ordinary)
+        else:
+            scheduler._recovery_fair_share = False
+
+        result = scheduler.schedule_request(requests, set())
+
+        assert result.context_requests == [recovery]
+        assert recovery.context_chunk_size == 256
+        assert all(c.args[0] is not ordinary for c in manager.prepare_context.call_args_list)
+
+    def test_no_age_for_decode_only_or_empty_polls_and_no_id_inheritance(self, monkeypatch):
+        _, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        self.age(scheduler, ordinary)
+        scheduler._account_prefill_wait([ordinary, recovery], [ordinary], [])
+        assert scheduler._ordinary_prefill_wait[ordinary.py_request_id][1] == 4
+        replacement = make_ctx_request(ordinary.py_request_id, 1024)
+        scheduler._account_prefill_wait([replacement], [replacement], [])
+        assert not scheduler._ordinary_prefill_wait
+        scheduler._account_prefill_wait([replacement, recovery], [replacement], [])
+        assert not scheduler._ordinary_prefill_wait
+
+    def test_cancelled_waiters_are_removed_and_inflight_age_is_preserved(self, monkeypatch):
+        _, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        self.age(scheduler, ordinary)
+        result = scheduler.schedule_request([ordinary, recovery], {ordinary.request_id})
+        assert result.context_requests == [recovery]
+        assert scheduler._ordinary_prefill_wait[ordinary.py_request_id][1] == 4
+        scheduler.schedule_request([recovery], set())
+        assert not scheduler._ordinary_prefill_wait
+
+    def test_duplicate_prefix_is_not_recomputed_to_share(self, monkeypatch):
+        manager, scheduler, ordinary, recovery = self.setup(monkeypatch)
+        scheduler._prefix_skip_enabled = True
+        manager.probe_first_new_block_key.side_effect = lambda req: ("same",)
+        self.age(scheduler, ordinary)
+
+        result = scheduler.schedule_request([ordinary, recovery], set())
+
+        assert result.context_requests == [recovery]
+        assert recovery.context_chunk_size == 256
+        assert all(c.args[0] is not ordinary for c in manager.prepare_context.call_args_list)
+
+
 class TestSorting:
     def test_no_lora_stable_order(self):
         mgr = make_kv_cache_manager()
