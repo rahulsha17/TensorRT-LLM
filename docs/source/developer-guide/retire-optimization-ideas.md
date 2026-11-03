@@ -56,6 +56,45 @@ readiness. Observe eventual FENCE completion and failures before declaring the
 run complete. Measure revision-to-first-token and useful throughput as well as
 receipt timing, while retaining the existing workload and baseline controls.
 
+## Diagnostic evidence: receipt delivery delay
+
+The November 3 Qwen3-32B TP1 diagnostic on engine `77cd2969` passed output,
+prefix-ownership, and eventual-revocation checks in both handoff modes, with
+4096- and 8192-token chunks. Its alignment-mode runs did not observe either
+worker RESUME before cleanup or a pending GPU event after isolation. Missing
+overlap coverage remains a separate outcome from correct model outputs.
+
+In the two isolated full-block cases, prefix acquisition finished 2.75 and
+3.12 ms after ADVANCE, and old cleanup had completed by 3.18 and 3.55 ms.
+Client ALIGN arrived around 11.53 ms and worker RESUME around 12.0 ms. The
+source GPU event was already ready before isolation. ALIGN processing preceded
+terminal cleanup, so terminal ordering did not cause the delay in these cases.
+
+The 8–9 ms between native prefix readiness and client ALIGN is consistent with
+the mailbox's 10 ms polling interval for a lone pending operation. Test a
+completion notification or a bounded 1 ms pending-poll interval, retaining
+FENCE semantics, ownership checks, error handling, and shutdown behavior.
+Measure controller CPU cost and ordinary-request latency under many concurrent
+revisions as well as any reduction in successor latency. Faster polling cannot
+create GPU overlap after the old GPU work has already completed.
+
+These are instrumented single-run observations, not a speedup result. The
+diagnostic triggers at host forward entry, before the decoder's prelaunch
+revocation check; it does not establish that a substantial GPU tail was
+submitted. The partial-prefix fallback additionally spent about 16–35 ms
+between host-forward return and alignment processing. Time input-copy waits
+and the early-exit boundary before changing that path. An adapter's later
+`wait_reclaim()` timestamp is merely when it observed FENCE after successor
+completion, not the time old resources were physically reclaimed.
+
+The separately versioned client timing benchmark in harness `eef0c6d` uses
+a fixed 20 ms client revision delay, three independent process pairs per chunk,
+and five nested trials per prefix. It checks zero visible old output, exact
+cold/warm references and cross-mode tokens, and cleanup before accepting a
+comparison. Model loading, fixed warmups, prefix seeding, and references are
+outside the timed cycles. Its single-session cycle rate is not saturated
+serving throughput; it cannot independently prove GPU overlap.
+
 ## Proposed: GPU-conditional layer groups
 
 A conditional CUDA graph could check live authority on the GPU immediately
