@@ -5535,6 +5535,12 @@ class PyExecutor:
                 # modifies the host page table, so wait before scheduling.
                 # This wait is also needed for legacy scheduler, but it can
                 # be pushed later, e.g. before DecoderRunner._prepare_inputs().
+                guard = getattr(self, '_execution_guard', None)
+                if guard is not None:
+                    # Previous sampling uses are recorded before this loop
+                    # boundary. A revision arriving after the prior early pass
+                    # can acquire an isolated prefix before the input-copy wait.
+                    guard.process_isolated_alignment()
                 self._wait_for_model_engine_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 

@@ -2466,7 +2466,7 @@ def test_overlap_idle_iteration_drains_terminal_request(monkeypatch, v2, revoked
     """Cancellation must free memory without waiting for a new model batch."""
     executor, terminal, live = _idle_overlap_executor(monkeypatch, v2, early_emit)
     terminal.is_finished = revoked
-    executor._execution_guard = object() if revoked else None
+    executor._execution_guard = Mock(spec=ExecutionDeviceGuard) if revoked else None
 
     def cancel():
         terminal.is_finished = True
@@ -3084,7 +3084,7 @@ def test_overlap_accepts_missing_sample_only_for_fully_revoked_batch(monkeypatch
     executor._sample_async.assert_called_once_with(batch, None)
 
 
-def test_overlap_isolation_follows_latest_sampler_use_before_input_copy_wait(guard, monkeypatch):
+def test_overlap_isolation_precedes_input_wait_at_loop_entry_and_after_sampling(guard, monkeypatch):
     from unittest.mock import MagicMock
 
     class ReachedInputWait(Exception):
@@ -3101,7 +3101,11 @@ def test_overlap_isolation_follows_latest_sampler_use_before_input_copy_wait(gua
     original_isolate = guard.process_isolated_alignment
 
     def isolate():
-        assert order == ["sample_submitted"]
+        if not order:
+            order.append("loop_isolate")
+            original_isolate()
+            return
+        assert order == ["loop_isolate", "sample_submitted"]
         assert guard._uses[id(request)].event is not None
         guard._uses[id(request)].event.record.assert_called_once()
         order.append("isolate")
@@ -3114,9 +3118,10 @@ def test_overlap_isolation_follows_latest_sampler_use_before_input_copy_wait(gua
         return object()
 
     def input_wait():
-        if order:
-            assert order == ["sample_submitted", "isolate"]
-            raise ReachedInputWait
+        if order == ["loop_isolate"]:
+            return
+        assert order == ["loop_isolate", "sample_submitted", "isolate"]
+        raise ReachedInputWait
 
     guard.process_isolated_alignment = isolate
     executor = MagicMock()
@@ -3151,7 +3156,8 @@ def test_overlap_isolation_follows_latest_sampler_use_before_input_copy_wait(gua
     executor.perf_manager.create_timing_events.return_value = (None, None, None)
     with pytest.raises(ReachedInputWait):
         PyExecutor._executor_loop_overlap(executor)
-    guard.table.alignment_state.process.assert_called_once_with(isolated_only=True)
+    assert guard.table.alignment_state.process.call_count == 2
+    guard.table.alignment_state.process.assert_called_with(isolated_only=True)
     guard.device.wait_event.assert_not_called()
 
 
