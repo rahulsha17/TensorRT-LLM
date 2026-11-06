@@ -167,3 +167,32 @@ def test_one_layer_group_can_skip_the_whole_forward(monkeypatch):
         assert graph.native.status().tolist() == [0, 1]
     finally:
         graph.reset()
+
+
+@CUDA
+@pytest.mark.parametrize("width", [3, 16])
+def test_conditional_copy_lowering_preserves_bytes_and_dependent_nodes(width):
+    metadata = _metadata()
+    # Offset one forces the byte path; an aligned multiple of eight uses words.
+    offset = int(width == 3)
+    source_storage = torch.arange(width + offset, dtype=torch.uint8, device="cuda")
+    target_storage = torch.zeros(width + offset, dtype=torch.uint8, device="cuda")
+    source = source_storage[offset:]
+    target = target_storage[offset:]
+    output = torch.zeros_like(target)
+    with ConditionalCapture(metadata) as graph:
+        target.copy_(source)
+        target.add_(7)
+        output.copy_(target)
+    try:
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output, source + 7)
+        metadata.retire_current_versions[0] = 2
+        output.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert output.eq(0).all()
+        assert graph.native.status().tolist() == [0, 1]
+    finally:
+        graph.reset()

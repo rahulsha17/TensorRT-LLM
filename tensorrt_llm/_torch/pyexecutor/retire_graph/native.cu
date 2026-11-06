@@ -100,6 +100,86 @@ void validateTensor(at::Tensor const& tensor, at::ScalarType dtype, c10::Device 
         "RETIRE graph metadata requires contiguous one-dimensional CUDA tensors on one device");
 }
 
+// Some CUDA 13.4/driver combinations crash while instantiating a conditional
+// child containing a captured D2D memcpy. A kernel keeps the exact byte copy
+// and graph dependencies without involving the conditional memcpy engine.
+template <typename Word>
+__global__ void copyWords(Word const* source, Word* destination, size_t count)
+{
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
+         index += static_cast<size_t>(blockDim.x) * gridDim.x)
+    {
+        destination[index] = source[index];
+    }
+}
+
+std::vector<cudaGraphNode_t> adjacentNodes(cudaGraphNode_t node, bool successors)
+{
+    size_t count = 0;
+    auto query = [&](cudaGraphNode_t* nodes)
+    {
+#if CUDART_VERSION >= 13000
+        return successors ? cudaGraphNodeGetDependentNodes(node, nodes, nullptr, &count)
+                          : cudaGraphNodeGetDependencies(node, nodes, nullptr, &count);
+#else
+        return successors ? cudaGraphNodeGetDependentNodes(node, nodes, &count)
+                          : cudaGraphNodeGetDependencies(node, nodes, &count);
+#endif
+    };
+    checkCuda(query(nullptr));
+    std::vector<cudaGraphNode_t> nodes(count);
+    checkCuda(query(nodes.data()));
+    return nodes;
+}
+
+void replaceLinearCopy(cudaGraph_t graph, cudaGraphNode_t node)
+{
+    cudaMemcpy3DParms copy{};
+    checkCuda(cudaGraphMemcpyNodeGetParams(node, &copy));
+    TORCH_CHECK(!copy.srcArray && !copy.dstArray && copy.extent.height == 1 && copy.extent.depth == 1
+            && copy.extent.width > 0 && copy.srcPos.x == 0 && copy.srcPos.y == 0 && copy.srcPos.z == 0
+            && copy.dstPos.x == 0 && copy.dstPos.y == 0 && copy.dstPos.z == 0
+            && (copy.kind == cudaMemcpyDeviceToDevice || copy.kind == cudaMemcpyDefault),
+        "RETIRE conditional graphs support only linear D2D captured copies");
+    cudaPointerAttributes source{}, destination{};
+    checkCuda(cudaPointerGetAttributes(&source, copy.srcPtr.ptr));
+    checkCuda(cudaPointerGetAttributes(&destination, copy.dstPtr.ptr));
+    int device;
+    checkCuda(cudaGetDevice(&device));
+    TORCH_CHECK(source.type == cudaMemoryTypeDevice && destination.type == cudaMemoryTypeDevice
+            && source.device == device && destination.device == device,
+        "RETIRE conditional copies require device pointers on the current GPU");
+    auto const from = reinterpret_cast<uintptr_t>(copy.srcPtr.ptr);
+    auto const to = reinterpret_cast<uintptr_t>(copy.dstPtr.ptr);
+    size_t const bytes = copy.extent.width;
+    TORCH_CHECK(from == to || (from < to ? to - from >= bytes : from - to >= bytes),
+        "RETIRE conditional copy operands must not overlap");
+    auto dependencies = adjacentNodes(node, false);
+    auto successors = adjacentNodes(node, true);
+    bool const wide = (from % sizeof(uint64_t) == 0 && to % sizeof(uint64_t) == 0 && bytes % sizeof(uint64_t) == 0);
+    size_t words = wide ? bytes / sizeof(uint64_t) : bytes;
+    auto src = copy.srcPtr.ptr;
+    auto dst = copy.dstPtr.ptr;
+    void* arguments[] = {&src, &dst, &words};
+    cudaKernelNodeParams kernel{};
+    kernel.func = wide ? reinterpret_cast<void*>(copyWords<uint64_t>) : reinterpret_cast<void*>(copyWords<uint8_t>);
+    kernel.gridDim = dim3(static_cast<unsigned int>(std::min<size_t>((words + 255) / 256, 65535)));
+    kernel.blockDim = dim3(256);
+    kernel.kernelParams = arguments;
+    cudaGraphNode_t replacement;
+    checkCuda(cudaGraphAddKernelNode(&replacement, graph, dependencies.data(), dependencies.size(), &kernel));
+    if (!successors.empty())
+    {
+        std::vector<cudaGraphNode_t> sources(successors.size(), replacement);
+#if CUDART_VERSION >= 13000
+        checkCuda(cudaGraphAddDependencies(graph, sources.data(), successors.data(), nullptr, successors.size()));
+#else
+        checkCuda(cudaGraphAddDependencies(graph, sources.data(), successors.data(), successors.size()));
+#endif
+    }
+    checkCuda(cudaGraphDestroyNode(node));
+}
+
 void validateSegment(cudaGraph_t graph, unsigned int depth = 0)
 {
     TORCH_CHECK(depth < 64, "RETIRE captured child graph nesting is too deep");
@@ -117,8 +197,8 @@ void validateSegment(cudaGraph_t graph, unsigned int depth = 0)
         }
         switch (type)
         {
-        case cudaGraphNodeTypeKernel:
-        case cudaGraphNodeTypeMemcpy:
+        case cudaGraphNodeTypeKernel: break;
+        case cudaGraphNodeTypeMemcpy: replaceLinearCopy(graph, node); break;
         case cudaGraphNodeTypeMemset:
         case cudaGraphNodeTypeEmpty: break;
         case cudaGraphNodeTypeGraph:

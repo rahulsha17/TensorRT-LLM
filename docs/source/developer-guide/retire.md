@@ -1595,6 +1595,16 @@ breakable-graph path. The extension compiles before capture and caches by source
 hash; deploying its source requires nvcc in the runtime environment. Every
 segment retains its PyTorch allocator pool until composed-graph uses finish.
 Completion and output-authority checks remain independent of skipped groups.
+An unconditional tail sanitizes obsolete and padding logits before sampling;
+live rows are left bitwise unchanged. The token-commit authority check still
+rejects obsolete output afterward.
+
+Captured linear, same-device D2D copies are lowered to byte-preserving copy
+kernels before nesting the captured groups. This works around an observed
+CUDA 13.4/driver 580 conditional-graph instantiation crash; CUDA's API permits
+these copies. Incoming and outgoing graph dependencies are retained. Arrays,
+host copies, overlapping ranges and non-linear copy forms are rejected by this
+experimental path.
 
 MLP compaction retains the original GEMM shape for near-full batches. It adds
 authority checks and gather/scatter work and can lose performance on small,

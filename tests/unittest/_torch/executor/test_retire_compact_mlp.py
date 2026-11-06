@@ -25,7 +25,8 @@ def test_compact_mlp_requires_conditional_graphs(monkeypatch):
 
 
 @CUDA
-def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatch, dtype):
     monkeypatch.setenv("TRTLLM_RETIRE_CONDITIONAL_GRAPHS", "1")
     monkeypatch.setenv("TRTLLM_RETIRE_COMPACT_MLP", "1")
     rows, width = 8, 16
@@ -37,8 +38,8 @@ def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatc
         retire_expected_versions=torch.ones(rows, dtype=torch.int64, device="cuda"),
         retire_real_rows=torch.ones(rows, dtype=torch.bool, device="cuda"),
     )
-    hidden = torch.arange(rows * width, dtype=torch.float32, device="cuda").reshape(rows, width)
-    weight = torch.eye(width, dtype=torch.float32, device="cuda") * 2
+    hidden = torch.arange(rows * width, dtype=dtype, device="cuda").reshape(rows, width)
+    weight = torch.eye(width, dtype=dtype, device="cuda") * 2
 
     def function(value):
         return value @ weight
@@ -48,7 +49,7 @@ def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatc
     with ConditionalCapture(metadata) as graph:
         result = run_compact_mlp(function, hidden, metadata)
         # The last unconditional completion marker remains outside all bodies.
-        published = result.clone()
+        published = result.float().clone()
         graph.bind_logits(published)
     try:
         for survivors, bucket in [
@@ -62,7 +63,9 @@ def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatc
             metadata.retire_current_versions[survivors] = 1
             graph.replay()
             torch.cuda.synchronize()
-            torch.testing.assert_close(published[survivors], hidden[survivors] * 2, rtol=0, atol=0)
+            torch.testing.assert_close(
+                published[survivors], (hidden[survivors] * 2).float(), rtol=0, atol=0
+            )
             status = graph.native.status().tolist()
             selected = [
                 upper
