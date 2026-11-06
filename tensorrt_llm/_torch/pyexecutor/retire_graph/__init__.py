@@ -81,6 +81,7 @@ class ConditionalCapture:
         self.compact_mlp = compact_mlp_enabled()
         self.segments = []
         self.predicates = []
+        self.logits = []
         self._predicate = (None, -1, -1)
         self.native = None
         self._segment_context = None
@@ -106,10 +107,6 @@ class ConditionalCapture:
                 self._segment_context.__exit__(error_type, error, traceback)
                 self._segment_context = None
             if error_type is None and not self.warmup:
-                if len(self.segments) < 2:
-                    raise RuntimeError(
-                        "RETIRE conditional graph has no supported model layer boundaries"
-                    )
                 metadata = self.metadata
                 self.native = self._native_module.ConditionalGraph(
                     [segment.raw_cuda_graph() for segment in self.segments],
@@ -123,10 +120,25 @@ class ConditionalCapture:
                     ],
                     [p[1] for p in self.predicates],
                     [p[2] for p in self.predicates],
+                    self.logits,
                 )
         finally:
             _capture.reset(self._token)
         return False
+
+    def bind_logits(self, logits):
+        """Make skipped rows safe for sampling before token authority is checked."""
+        if (
+            self.metadata.num_contexts
+            or logits.ndim != 2
+            or logits.shape[0] != len(self.metadata.request_ids)
+            or logits.dtype != torch.float32
+            or not logits.is_contiguous()
+        ):
+            raise ValueError(
+                "RETIRE conditional graphs require contiguous FP32 decode logits in request-row order"
+            )
+        self.logits = [logits]
 
     def _begin(self):
         segment = torch.cuda.CUDAGraph(keep_graph=True)
@@ -161,6 +173,7 @@ class ConditionalCapture:
             segment.reset()
         self.segments.clear()
         self.predicates.clear()
+        self.logits.clear()
 
     def __del__(self):
         # Native close waits for the last replay before segment allocator pools

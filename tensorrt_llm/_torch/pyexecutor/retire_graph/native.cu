@@ -11,6 +11,9 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 #if CUDART_VERSION < 12030
@@ -62,6 +65,34 @@ __global__ void checkAuthority(cudaGraphConditionalHandle handle, int64_t* table
     }
 }
 
+// Samplers run before the token-commit guard. Skipped or obsolete rows must
+// never expose uninitialized/NaN graph storage to their probability kernels.
+__global__ void sanitizeLogits(int64_t* table, int const* slots, int64_t const* expected, bool const* realRows,
+    int capacity, float* logits, int width)
+{
+    __shared__ bool allowed;
+    int const row = blockIdx.x;
+    if (threadIdx.x == 0)
+    {
+        int const slot = slots[row];
+        allowed = realRows[row];
+        if (allowed && slot >= 0 && slot < capacity)
+        {
+            cuda::atomic_ref<int64_t, cuda::thread_scope_device> current(table[slot]);
+            allowed = current.load(cuda::memory_order_acquire) == expected[row];
+        }
+    }
+    __syncthreads();
+    if (allowed)
+    {
+        return; // Preserve every bit of live and real untagged logits.
+    }
+    for (int column = threadIdx.x; column < width; column += blockDim.x)
+    {
+        logits[static_cast<int64_t>(row) * width + column] = 0.0f;
+    }
+}
+
 void validateTensor(at::Tensor const& tensor, at::ScalarType dtype, c10::Device device)
 {
     TORCH_CHECK(
@@ -69,17 +100,53 @@ void validateTensor(at::Tensor const& tensor, at::ScalarType dtype, c10::Device 
         "RETIRE graph metadata requires contiguous one-dimensional CUDA tensors on one device");
 }
 
+void validateSegment(cudaGraph_t graph, unsigned int depth = 0)
+{
+    TORCH_CHECK(depth < 64, "RETIRE captured child graph nesting is too deep");
+    size_t count = 0;
+    checkCuda(cudaGraphGetNodes(graph, nullptr, &count));
+    std::vector<cudaGraphNode_t> nodes(count);
+    checkCuda(cudaGraphGetNodes(graph, nodes.data(), &count));
+    for (auto node : nodes)
+    {
+        cudaGraphNodeType type;
+        checkCuda(cudaGraphNodeGetType(node, &type));
+        if (std::getenv("TRTLLM_RETIRE_GRAPH_DEBUG_DOT"))
+        {
+            std::fprintf(stderr, "RETIRE captured node depth=%u type=%d\n", depth, static_cast<int>(type));
+        }
+        switch (type)
+        {
+        case cudaGraphNodeTypeKernel:
+        case cudaGraphNodeTypeMemcpy:
+        case cudaGraphNodeTypeMemset:
+        case cudaGraphNodeTypeEmpty: break;
+        case cudaGraphNodeTypeGraph:
+        {
+            cudaGraph_t child;
+            checkCuda(cudaGraphChildGraphNodeGetGraph(node, &child));
+            validateSegment(child, depth + 1);
+            break;
+        }
+        default:
+            TORCH_CHECK(false, "RETIRE conditional capture contains unsupported node type ", static_cast<int>(type),
+                "; host callbacks, events, allocations and imported conditional handles cannot be nested");
+        }
+    }
+}
+
 class ConditionalGraph
 {
 public:
     ConditionalGraph(std::vector<int64_t> const& segments, at::Tensor table, at::Tensor slots, at::Tensor expected,
         at::Tensor realRows, std::vector<at::Tensor> counts, std::vector<int64_t> const& lowerBounds,
-        std::vector<int64_t> const& upperBounds)
+        std::vector<int64_t> const& upperBounds, std::vector<at::Tensor> logits)
         : mTable(std::move(table))
         , mSlots(std::move(slots))
         , mExpected(std::move(expected))
         , mRealRows(std::move(realRows))
         , mCounts(std::move(counts))
+        , mLogits(std::move(logits))
     {
         TORCH_CHECK(mTable.is_cuda(), "RETIRE graph authority must reside on CUDA");
         c10::cuda::CUDAGuard guard(mTable.device());
@@ -107,6 +174,7 @@ public:
             cudaGraphNode_t previous = nullptr;
             for (size_t index = 0; index < segments.size(); ++index)
             {
+                validateSegment(reinterpret_cast<cudaGraph_t>(segments[index]));
                 cudaGraphConditionalHandle handle;
                 checkCuda(cudaGraphConditionalHandleCreate(&handle, mGraph, 0, 0));
                 int64_t* tablePtr = mTable.data_ptr<int64_t>();
@@ -144,6 +212,29 @@ public:
                 checkCuda(cudaGraphAddChildGraphNode(&child, condition.conditional.phGraph_out[0], nullptr, 0,
                     reinterpret_cast<cudaGraph_t>(segments[index])));
             }
+            for (auto const& logits : mLogits)
+            {
+                TORCH_CHECK(logits.device() == mTable.device() && logits.scalar_type() == at::kFloat
+                        && logits.dim() == 2 && logits.is_contiguous() && logits.size(0) > 0
+                        && logits.size(0) <= mSlots.numel() && logits.size(1) > 0 && logits.size(1) <= INT_MAX,
+                    "RETIRE sanitizer requires contiguous FP32 decode logits on the authority device");
+                int64_t* tablePtr = mTable.data_ptr<int64_t>();
+                int const* slotsPtr = mSlots.data_ptr<int>();
+                int64_t const* expectedPtr = mExpected.data_ptr<int64_t>();
+                bool const* realRowsPtr = mRealRows.data_ptr<bool>();
+                int capacity = static_cast<int>(mTable.numel());
+                float* logitsPtr = logits.data_ptr<float>();
+                int width = static_cast<int>(logits.size(1));
+                void* args[] = {&tablePtr, &slotsPtr, &expectedPtr, &realRowsPtr, &capacity, &logitsPtr, &width};
+                cudaKernelNodeParams kernel{};
+                kernel.func = reinterpret_cast<void*>(sanitizeLogits);
+                kernel.gridDim = dim3(static_cast<unsigned int>(logits.size(0)));
+                kernel.blockDim = dim3(256);
+                kernel.kernelParams = args;
+                cudaGraphNode_t sanitized;
+                checkCuda(cudaGraphAddKernelNode(&sanitized, mGraph, &previous, 1, &kernel));
+                previous = sanitized;
+            }
             // This node always runs, even when every model segment is skipped.
             cudaMemsetParams completed{};
             completed.dst = mStatus.data_ptr<int>() + segments.size();
@@ -153,6 +244,12 @@ public:
             completed.height = 1;
             cudaGraphNode_t terminal;
             checkCuda(cudaGraphAddMemsetNode(&terminal, mGraph, &previous, 1, &completed));
+            if (auto directory = std::getenv("TRTLLM_RETIRE_GRAPH_DEBUG_DOT"))
+            {
+                auto path = std::string(directory) + "/conditional-" + std::to_string(reinterpret_cast<uintptr_t>(this))
+                    + ".dot";
+                checkCuda(cudaGraphDebugDotPrint(mGraph, path.c_str(), cudaGraphDebugDotFlagsVerbose));
+            }
             checkCuda(cudaGraphInstantiate(&mExec, mGraph, 0));
             checkCuda(cudaEventCreateWithFlags(&mDone, cudaEventDisableTiming));
         }
@@ -224,7 +321,7 @@ private:
     }
 
     at::Tensor mTable, mSlots, mExpected, mRealRows, mStatus;
-    std::vector<at::Tensor> mCounts;
+    std::vector<at::Tensor> mCounts, mLogits;
     cudaGraph_t mGraph{};
     cudaGraphExec_t mExec{};
     cudaEvent_t mDone{};
@@ -237,7 +334,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     pybind11::class_<ConditionalGraph>(m, "ConditionalGraph")
         .def(pybind11::init<std::vector<int64_t> const&, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-            std::vector<at::Tensor>, std::vector<int64_t> const&, std::vector<int64_t> const&>())
+            std::vector<at::Tensor>, std::vector<int64_t> const&, std::vector<int64_t> const&,
+            std::vector<at::Tensor>>())
         .def("replay", &ConditionalGraph::replay)
         .def("close", &ConditionalGraph::close)
         .def("status", &ConditionalGraph::status);

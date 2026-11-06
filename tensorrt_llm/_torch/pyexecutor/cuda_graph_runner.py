@@ -773,6 +773,8 @@ class CUDAGraphRunner:
                 graph, pool=self.memory_pool))
             with capture_scope:
                 output = forward_fn(capture_inputs)
+                if conditional:
+                    graph.bind_logits(output['logits'])
             # Snapshot before postprocessing so the check compares against
             # the addresses the graph actually baked in.
             self._record_strict_buffer_snapshot(key)

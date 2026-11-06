@@ -31,6 +31,7 @@ def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatc
     rows, width = 8, 16
     metadata = SimpleNamespace(
         num_contexts=0,
+        request_ids=list(range(rows)),
         retire_current_versions=torch.ones(rows, dtype=torch.int64, device="cuda"),
         retire_sequence_slots=torch.arange(rows, dtype=torch.int32, device="cuda"),
         retire_expected_versions=torch.ones(rows, dtype=torch.int64, device="cuda"),
@@ -48,6 +49,7 @@ def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatc
         result = run_compact_mlp(function, hidden, metadata)
         # The last unconditional completion marker remains outside all bodies.
         published = result.clone()
+        graph.bind_logits(published)
     try:
         for survivors, bucket in [
             ([0, 1, 2, 3, 4, 5, 6, 7], 8),
@@ -74,6 +76,7 @@ def test_live_rows_choose_one_bucket_and_return_to_original_positions(monkeypatc
         torch.cuda.synchronize()
         # A stale snapshot from the previous replay cannot keep branches alive.
         assert graph.native.status().tolist() == [0] * len(graph.segments) + [1]
+        assert published.eq(0).all()
     finally:
         graph.reset()
 
@@ -84,6 +87,7 @@ def test_untagged_live_row_and_padding_have_different_compaction_semantics(monke
     monkeypatch.setenv("TRTLLM_RETIRE_COMPACT_MLP", "1")
     metadata = SimpleNamespace(
         num_contexts=0,
+        request_ids=list(range(4)),
         retire_current_versions=torch.tensor([2], dtype=torch.int64, device="cuda"),
         retire_sequence_slots=torch.tensor([0, -1, -1, -1], dtype=torch.int32, device="cuda"),
         retire_expected_versions=torch.ones(4, dtype=torch.int64, device="cuda"),
@@ -99,6 +103,7 @@ def test_untagged_live_row_and_padding_have_different_compaction_semantics(monke
     with ConditionalCapture(metadata) as graph:
         result = run_compact_mlp(function, hidden, metadata)
         output = result.clone()
+        graph.bind_logits(output)
     try:
         graph.replay()
         torch.cuda.synchronize()

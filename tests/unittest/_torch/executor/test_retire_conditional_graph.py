@@ -105,3 +105,65 @@ def test_conditional_graph_rejects_submission_stream_changes():
                 graph.replay()
     finally:
         graph.reset()
+
+
+@CUDA
+@pytest.mark.parametrize("cancellation", ["before", "between_groups", "mixed", "mixed_tagged"])
+def test_unconditional_logits_sanitizer_protects_sampler_and_preserves_live_bits(cancellation):
+    mixed = cancellation.startswith("mixed")
+    metadata = _metadata(
+        slots=(0, 1 if cancellation == "mixed_tagged" else -1, -1) if mixed else (0, -1),
+        real=(True, True, False) if mixed else (True, False),
+    )
+    rows = metadata.retire_sequence_slots.numel()
+    metadata.num_contexts = 0
+    metadata.request_ids = list(range(rows))
+    logits = torch.full((rows, 4), float("nan"), device="cuda")
+    payload = logits.clone()
+    if mixed:
+        payload[1] = torch.tensor([-0.0, 1.0, -2.0, 3.0], device="cuda")
+    scratch = torch.zeros(1, device="cuda")
+    if cancellation == "before":
+        metadata.retire_current_versions[0] = 2
+    with ConditionalCapture(metadata) as graph:
+        scratch.add_(1)
+        if cancellation != "before":
+            metadata.retire_current_versions[:1].fill_(2)
+        graph.boundary()
+        logits.copy_(payload)
+        graph.bind_logits(logits)
+    try:
+        graph.replay()
+        # Random sampling must be safe even though the executor rejects the
+        # obsolete tokens later at its ordinary asynchronous commit boundary.
+        sampled = torch.multinomial(torch.softmax(logits, dim=-1), 1)
+        torch.cuda.synchronize()
+        assert torch.isfinite(logits).all()
+        assert sampled.shape == (rows, 1)
+        assert logits[0].eq(0).all() and logits[-1].eq(0).all()
+        if mixed:
+            assert torch.equal(logits[1].view(torch.int32), payload[1].view(torch.int32))
+        assert graph.native.status()[-1].item() == 1
+    finally:
+        graph.reset()
+
+
+@CUDA
+def test_one_layer_group_can_skip_the_whole_forward(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_GRAPH_LAYER_GROUP", "128")
+    metadata = _metadata()
+    value = torch.zeros(1, device="cuda")
+    with ConditionalCapture(metadata) as graph:
+        value.add_(7)
+    try:
+        graph.replay()
+        torch.cuda.synchronize()
+        assert value.item() == 7
+        metadata.retire_current_versions[0] = 2
+        value.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert value.item() == 0
+        assert graph.native.status().tolist() == [0, 1]
+    finally:
+        graph.reset()
