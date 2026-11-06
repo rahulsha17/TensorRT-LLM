@@ -61,12 +61,15 @@ class KVAlignmentAdapter:
 
         self._isolated_partial = enabled("TRTLLM_RETIRE_ISOLATED_PARTIAL")
         self._isolated_residency = enabled("TRTLLM_RETIRE_ISOLATED_RESIDENCY")
+        self._incremental_residency = enabled("TRTLLM_RETIRE_INCREMENTAL_RESIDENCY")
         if self._keep_resident:
             self._manager._execution_residency_reclaimer = self.yield_residency
             self._manager._execution_residency_pending = self.has_residency
             self._manager._execution_context_residency_reclaimer = self.yield_expired_residency
             self._manager._execution_residency_advance = self.advance_residency
             self._manager._execution_residency_repoll = self.defer_idle_recovery
+            if self._incremental_residency:
+                self._manager._execution_residency_retry = self.retry_residency
 
     def has_residency(self) -> bool:
         """Whether optional GPU locks remain, without inspecting native pages."""
@@ -97,7 +100,22 @@ class KVAlignmentAdapter:
         """Let context pressure reclaim holds after one productive pass."""
         return self.yield_residency(expired_only=True)
 
-    def yield_residency(self, *, expired_only: bool = False) -> bool:
+    def retry_residency(self, admit: Callable[[], bool], *, expired_only: bool = False) -> bool:
+        """Retry admission after each oldest optional hold, preserving others.
+
+        A failed admission can need several holds, including holds sharing
+        physical pages. Bound retries by the original population; each step
+        must surrender ownership of one GPU lock without dropping its promise.
+        Context admission retains the ordinary one-pass residency grace.
+        """
+        for _ in range(len(self._resident_v2)):
+            if not self.yield_residency(expired_only=expired_only, single=True):
+                break
+            if admit():
+                return True
+        return False
+
+    def yield_residency(self, *, expired_only: bool = False, single: bool = False) -> bool:
         """Yield GPU locks before admission evicts an executing request.
 
         The native cache remains suspended and keeps its PageHolders, so the
@@ -112,6 +130,8 @@ class KVAlignmentAdapter:
             del self._resident_v2[key]
             self._fresh_resident_v2.discard(key)
             yielded = True
+            if single:
+                break
         return yielded
 
     def reserve(self, revised: AlignmentInput) -> PrefixReservation:

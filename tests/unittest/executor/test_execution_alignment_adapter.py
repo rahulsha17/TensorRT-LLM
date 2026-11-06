@@ -124,7 +124,9 @@ def test_isolated_partial_cannot_weaken_the_strict_promise(engine, monkeypatch):
     cache.close.assert_called_once()
 
 
-@pytest.mark.parametrize("flag", ["ISOLATED_PARTIAL", "ISOLATED_RESIDENCY"])
+@pytest.mark.parametrize(
+    "flag", ["ISOLATED_PARTIAL", "ISOLATED_RESIDENCY", "INCREMENTAL_RESIDENCY"]
+)
 @pytest.mark.parametrize("value", ["true", "", "2"])
 def test_isolated_flags_reject_ambiguous_values(engine, monkeypatch, flag, value):
     monkeypatch.setenv("TRTLLM_RETIRE_" + flag, value)
@@ -196,6 +198,75 @@ def test_isolated_residency_selects_only_prefixes_within_aggregate_quarter_pool_
     assert not holds[0].has_resident_prefix
     for hold in holds:
         hold.close()
+
+
+@pytest.mark.parametrize("needed", [1, 2, 4])
+def test_incremental_residency_keeps_unneeded_prefixes_hot(engine, monkeypatch, needed):
+    monkeypatch.setenv("TRTLLM_RETIRE_INCREMENTAL_RESIDENCY", "1")
+    manager = engine.kv_cache_manager
+    manager._supports_dense_resume_capacity.return_value = True
+    caches = [Mock(num_committed_tokens=4, cached_tokens_by_level=[4, 0]) for _ in range(3)]
+    manager.impl.create_kv_cache.side_effect = caches
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+    holds = [adapter.reserve(INPUT) for _ in caches]
+    admit = Mock(side_effect=lambda: sum(cache.suspend.call_count for cache in caches) >= needed)
+
+    result = manager._execution_residency_retry(admit)
+
+    assert result is (needed <= len(caches))
+    released = min(needed, len(caches))
+    assert admit.call_count == released
+    assert [hold.has_resident_prefix for hold in holds] == [False] * released + [True] * (
+        3 - released
+    )
+    assert adapter._reserved_v2_blocks == 3
+    for cache, hold in zip(caches, holds):
+        cache.close.assert_not_called()
+        cache.commit.assert_not_called()
+        assert hold.num_tokens == 4
+        hold.close()
+        cache.close.assert_called_once()
+    assert adapter._reserved_v2_blocks == 0
+
+
+def test_incremental_context_reclamation_preserves_fresh_hold_grace(engine, monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_INCREMENTAL_RESIDENCY", "1")
+    manager = engine.kv_cache_manager
+    manager._supports_dense_resume_capacity.return_value = True
+    old, fresh = [Mock(num_committed_tokens=4, cached_tokens_by_level=[4, 0]) for _ in range(2)]
+    manager.impl.create_kv_cache.side_effect = [old, fresh]
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+    first = adapter.reserve(INPUT)
+    adapter.advance_residency()
+    second = adapter.reserve(INPUT)
+    admit = Mock(return_value=False)
+
+    assert not manager._execution_residency_retry(admit, expired_only=True)
+
+    admit.assert_called_once()
+    old.suspend.assert_called_once()
+    fresh.suspend.assert_not_called()
+    assert not first.has_resident_prefix and second.has_resident_prefix
+    first.close()
+    second.close()
+
+
+def test_incremental_residency_failure_retains_unknown_ownership(engine, monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_INCREMENTAL_RESIDENCY", "1")
+    manager = engine.kv_cache_manager
+    manager._supports_dense_resume_capacity.return_value = True
+    cache = Mock(num_committed_tokens=4, cached_tokens_by_level=[4, 0])
+    cache.suspend.side_effect = RuntimeError("native suspension failed")
+    manager.impl.create_kv_cache.return_value = cache
+    adapter = KVAlignmentAdapter(engine, keep_resident=True)
+    hold = adapter.reserve(INPUT)
+    admit = Mock()
+    with pytest.raises(RuntimeError, match="native suspension failed"):
+        manager._execution_residency_retry(admit)
+    admit.assert_not_called()
+    cache.close.assert_not_called()
+    assert hold.has_resident_prefix and adapter._reserved_v2_blocks == 1
+    hold.close()
 
 
 @pytest.mark.parametrize("limit,expected", [(0, 0), (1, 0), (7, 4), (8, 8), (None, 16)])

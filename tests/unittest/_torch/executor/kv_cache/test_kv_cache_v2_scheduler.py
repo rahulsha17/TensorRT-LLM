@@ -4634,6 +4634,59 @@ class TestRecoveryAdmission:
             manager._restore_page_index_bufs.assert_not_called()
             manager._fill_fresh_kv_pages.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "context_resume",
+            "direct_resume",
+            "generation_resume",
+            "context_resize",
+            "generation_resize",
+        ],
+    )
+    @pytest.mark.parametrize("needed", [1, 2, 4])
+    def test_incremental_residency_retries_real_admission_between_holds(self, operation, needed):
+        from tensorrt_llm._torch.pyexecutor.execution_alignment import KVAlignmentAdapter
+
+        manager, request, cache = self.recovery_capacity_manager()
+        manager._stream = Mock(cuda_stream=17)
+        manager._restore_page_index_bufs = Mock()
+        manager._ensure_generation_beam_width = Mock(return_value=True)
+        manager._generation_draft_slots = Mock(return_value=0)
+        manager._allocated_draft_lens = {}
+        adapter = object.__new__(KVAlignmentAdapter)
+        holds = [Mock() for _ in range(3)]
+        adapter._resident_v2 = {id(hold): hold for hold in holds}
+        adapter._fresh_resident_v2 = set()
+        manager._execution_residency_retry = adapter.retry_residency
+        cache.is_active = "resize" in operation
+        cache.enter_decode.return_value = True
+        failing = cache.resume if "resume" in operation else cache.resize
+        failing.side_effect = lambda *args, **kwargs: (
+            sum(hold.suspend.call_count for hold in holds) >= needed
+        )
+
+        if operation == "context_resume":
+            result = manager._resume_context_and_restore(
+                request.py_request_id, cache, capacity_hint=192
+            )
+        elif operation == "direct_resume":
+            result = manager._resume_and_restore(request.py_request_id, cache, capacity_hint=192)
+        elif operation == "context_resize":
+            request.is_first_context_chunk = False
+            result = manager.resize_context(request, 64)
+        else:
+            result = manager.try_allocate_generation(request)
+
+        assert result is (needed <= len(holds))
+        assert failing.call_count == 1 + min(needed, len(holds))
+        assert [hold.suspend.call_count for hold in holds] == [1] * min(needed, 3) + [0] * max(
+            0, 3 - needed
+        )
+        for hold in holds:
+            hold.close.assert_not_called()
+        cache.commit.assert_not_called()
+
     @pytest.mark.parametrize("operation", ["resume", "resize"])
     def test_first_admission_preserves_handoff_residency_for_the_context_scan(self, operation):
         manager, request, cache = self.recovery_capacity_manager()

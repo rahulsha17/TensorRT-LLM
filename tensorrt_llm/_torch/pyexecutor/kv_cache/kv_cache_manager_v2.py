@@ -1794,6 +1794,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._execution_residency_reclaimer: Callable[[], bool] | None = None
+        self._execution_residency_retry: Callable[..., bool] | None = None
         self._execution_resident_recovery: Callable[[LlmRequest], bool] | None = None
         self._execution_residency_repoll: Callable[[], bool] | None = None
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
@@ -3612,9 +3613,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 if capacity_hint is not None
                 else kv_cache.resume(self._stream.cuda_stream, is_decoding=True)
             )
-            if not resumed and self._yield_execution_residency():
-                resumed = kv_cache.resume(
-                    self._stream.cuda_stream, is_decoding=True, capacity_hint=capacity_hint
+            if not resumed:
+                resumed = self._retry_execution_residency(
+                    lambda: kv_cache.resume(
+                        self._stream.cuda_stream, is_decoding=True, capacity_hint=capacity_hint
+                    )
                 )
             if not resumed:
                 return False
@@ -3634,8 +3637,8 @@ class KVCacheManagerV2(BaseResourceManager):
         pre_capacity = kv_cache.capacity
         new_capacity = pre_capacity + 1 + draft_slots
         resized = kv_cache.resize(new_capacity)
-        if not resized and self._yield_execution_residency():
-            resized = kv_cache.resize(new_capacity)
+        if not resized:
+            resized = self._retry_execution_residency(lambda: kv_cache.resize(new_capacity))
         if not resized:
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
@@ -3785,6 +3788,20 @@ class KVCacheManagerV2(BaseResourceManager):
         reclaimer = getattr(self, "_execution_context_residency_reclaimer", None)
         return reclaimer is not None and reclaimer()
 
+    def _retry_execution_residency(
+        self, admit: Callable[[], bool], *, expired_only: bool = False
+    ) -> bool:
+        """Reclaim optional locks only until this failed allocation succeeds."""
+        retry = getattr(self, "_execution_residency_retry", None)
+        if retry is not None:
+            return retry(admit, expired_only=expired_only)
+        yielded = (
+            self._yield_context_execution_residency()
+            if expired_only
+            else self._yield_execution_residency()
+        )
+        return yielded and admit()
+
     def advance_execution_residency(self) -> None:
         """Account for a scheduled forward, never an empty polling iteration."""
         advance = getattr(self, "_execution_residency_advance", None)
@@ -3803,9 +3820,12 @@ class KVCacheManagerV2(BaseResourceManager):
         resumed = self._resume_and_restore(
             req_id, kv_cache, capacity_hint=capacity_hint, yield_residency=False
         )
-        if not resumed and self._yield_context_execution_residency():
-            resumed = self._resume_and_restore(
-                req_id, kv_cache, capacity_hint=capacity_hint, yield_residency=False
+        if not resumed:
+            resumed = self._retry_execution_residency(
+                lambda: self._resume_and_restore(
+                    req_id, kv_cache, capacity_hint=capacity_hint, yield_residency=False
+                ),
+                expired_only=True,
             )
         return resumed
 
@@ -3828,11 +3848,13 @@ class KVCacheManagerV2(BaseResourceManager):
             if capacity_hint is None
             else kv_cache.resume(self._stream.cuda_stream, capacity_hint=capacity_hint)
         )
-        if not resumed and yield_residency and self._yield_execution_residency():
-            resumed = (
-                kv_cache.resume(self._stream.cuda_stream)
-                if capacity_hint is None
-                else kv_cache.resume(self._stream.cuda_stream, capacity_hint=capacity_hint)
+        if not resumed and yield_residency:
+            resumed = self._retry_execution_residency(
+                lambda: (
+                    kv_cache.resume(self._stream.cuda_stream)
+                    if capacity_hint is None
+                    else kv_cache.resume(self._stream.cuda_stream, capacity_hint=capacity_hint)
+                )
             )
         if not resumed:
             return False
@@ -4149,11 +4171,14 @@ class KVCacheManagerV2(BaseResourceManager):
         success = (
             kv_cache.resize(capacity, history) if history is not None else kv_cache.resize(capacity)
         )
-        if not success and self._yield_context_execution_residency():
-            success = (
-                kv_cache.resize(capacity, history)
-                if history is not None
-                else kv_cache.resize(capacity)
+        if not success:
+            success = self._retry_execution_residency(
+                lambda: (
+                    kv_cache.resize(capacity, history)
+                    if history is not None
+                    else kv_cache.resize(capacity)
+                ),
+                expired_only=True,
             )
         if not success:
             logger.debug(
