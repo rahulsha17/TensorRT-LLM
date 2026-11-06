@@ -228,3 +228,81 @@ def test_missing_attention_request_is_rejected_before_staging():
     with pytest.raises(ValueError, match="no execution request"):
         binding.prepare(metadata, SimpleNamespace(all_requests=lambda: iter([])))
     assert not binding._rows
+
+
+def test_conditional_real_rows_preserve_padding_and_cached_storage(monkeypatch):
+    from tensorrt_llm._torch.attention.backends import trtllm as backend
+    from tensorrt_llm._torch.pyexecutor import execution_attention as binding_module
+
+    class Metadata:
+        pass
+
+    monkeypatch.setattr(backend, "TrtllmAttentionMetadata", Metadata)
+    monkeypatch.setenv("TRTLLM_RETIRE_CONDITIONAL_GRAPHS", "1")
+    monkeypatch.setattr(binding_module, "prefer_pinned", lambda: False)
+    uploads = Mock(side_effect=lambda values, **kwargs: tuple(values))
+    storage = Mock()
+    allocate = Mock(return_value=storage)
+    event = Mock()
+    event.query.return_value = False
+    monkeypatch.setattr(torch, "tensor", uploads)
+    monkeypatch.setattr(torch, "empty_like", allocate)
+    monkeypatch.setattr(torch.cuda, "Event", Mock(return_value=event))
+    authority = Mock()
+    authority.create_attention_rows.return_value = SimpleNamespace(
+        slots=SimpleNamespace(numel=lambda: 6), expected=object(), counters=object()
+    )
+    binding = ExecutionAttentionBinding(authority)
+    metadata = Metadata()
+    metadata.is_cross = False
+    metadata.kv_cache_manager = object()
+    metadata.kv_lens_cuda_runtime = SimpleNamespace(numel=lambda: 4)
+    metadata.max_num_requests = 6
+    metadata.request_ids = [21, -3, 17, -3]
+    version = ExecutionVersion("tenant", "scope", 9)
+    live, untagged, padding = request(17, version), request(21), request(-3, dummy=True)
+    batch = SimpleNamespace(all_requests=lambda: iter([live, padding, untagged, padding]))
+
+    binding.prepare(metadata, batch)
+    assert metadata.retire_real_rows is storage
+    storage.copy_.assert_called_once_with(
+        (True, False, True, False, False, False), non_blocking=True
+    )
+    assert len(binding._real_row_uploads) == 1
+    binding.prepare(metadata, batch)
+    assert uploads.call_count == allocate.call_count == storage.copy_.call_count == 1
+
+    metadata.request_ids = [-3, 17, -3, 21]
+    binding.prepare(metadata, batch)
+    assert metadata.retire_real_rows is storage
+    assert allocate.call_count == 1
+    storage.copy_.assert_called_with((False, True, False, True, False, False), non_blocking=True)
+    # Both pinned host sources remain owned while their asynchronous copies run.
+    assert len(binding._real_row_uploads) == 2
+
+
+@pytest.mark.parametrize("dummy_first", [False, True])
+def test_real_and_padding_id_alias_is_rejected_before_mask_upload(monkeypatch, dummy_first):
+    from tensorrt_llm._torch.attention.backends import trtllm as backend
+
+    class Metadata:
+        pass
+
+    monkeypatch.setattr(backend, "TrtllmAttentionMetadata", Metadata)
+    monkeypatch.setenv("TRTLLM_RETIRE_CONDITIONAL_GRAPHS", "1")
+    uploads = Mock()
+    monkeypatch.setattr(torch, "tensor", uploads)
+    authority = Mock()
+    binding = ExecutionAttentionBinding(authority)
+    metadata = Metadata()
+    metadata.is_cross = False
+    metadata.kv_cache_manager = object()
+    metadata.kv_lens_cuda_runtime = SimpleNamespace(numel=lambda: 1)
+    metadata.request_ids = [17]
+    requests = [request(17), request(17, dummy=True)]
+    if dummy_first:
+        requests.reverse()
+    with pytest.raises(ValueError, match="duplicate real request"):
+        binding.prepare(metadata, SimpleNamespace(all_requests=lambda: iter(requests)))
+    uploads.assert_not_called()
+    authority.create_attention_rows.assert_not_called()

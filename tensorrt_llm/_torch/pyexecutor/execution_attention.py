@@ -78,6 +78,8 @@ class ExecutionAttentionBinding:
                 or config.is_spec_decode
                 or config.torch_compile_enabled
                 or config.cuda_graph_specialize_lora
+                or runner.model.model_config.lora_config is not None
+                or runner.model.model_config.quant_config.quant_algo is not None
             ):
                 raise NotImplementedError(
                     "RETIRE conditional graphs require uncompiled TP1 dense Qwen3 without LoRA or speculation"
