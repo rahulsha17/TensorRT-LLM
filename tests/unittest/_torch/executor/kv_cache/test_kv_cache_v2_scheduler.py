@@ -720,7 +720,12 @@ def test_revision_cohort_retains_finished_and_inflight_owners(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "flag", ["TRTLLM_RETIRE_ADAPTIVE_PREFILL", "TRTLLM_RETIRE_REVISION_COHORT"]
+    "flag",
+    [
+        "TRTLLM_RETIRE_ADAPTIVE_PREFILL",
+        "TRTLLM_RETIRE_REVISION_COHORT",
+        "TRTLLM_RETIRE_PROGRESSIVE_PREFILL",
+    ],
 )
 def test_revision_flags_reject_ambiguous_values(monkeypatch, flag):
     monkeypatch.setenv(flag, "yes")
@@ -826,6 +831,87 @@ def test_revision_ablation_flags_are_independent(monkeypatch, adaptive, cohort):
     assert result.generation_requests == ([] if cohort else [live])
     assert young.context_chunk_size == (128 if adaptive or cohort else 960)
     assert (scheduler._revision_policy is not None) == (adaptive or cohort)
+
+
+class TestProgressiveRevisionScheduling:
+    @staticmethod
+    def scheduler(monkeypatch, **kwargs):
+        monkeypatch.setenv("TRTLLM_RETIRE_PROGRESSIVE_PREFILL", "1")
+        manager, scheduler = _revision_scheduler(monkeypatch, **kwargs)
+        scheduler._revision_policy.stable_tokens = 1024
+        return manager, scheduler
+
+    def test_completed_chunks_grow_cap_without_weakening_total_budget(self, monkeypatch):
+        _, scheduler = self.scheduler(monkeypatch)
+        request = _revision_request(1)
+        stable = make_ctx_request(2, 4096, is_last_context_chunk=False)
+        for expected in (128, 256, 512, 512, 1024):
+            result = scheduler.schedule_request([request, stable], set())
+            assert request in result.context_requests
+            assert request.context_chunk_size == expected
+            assert sum(req.context_chunk_size for req in result.context_requests) <= 1024
+            _advance_revision_context(request)
+        assert scheduler.execution_scheduling_snapshot()["progressive_prefill"]
+
+    def test_schedule_without_completion_does_not_grow_cap(self, monkeypatch):
+        _, scheduler = self.scheduler(monkeypatch)
+        request = _revision_request(1)
+        request.context_current_position = 8192
+        for _ in range(4):
+            scheduler.schedule_request([request], set())
+            assert request.context_chunk_size == 128
+
+    @pytest.mark.parametrize("change", ["epoch", "request", "rewind"])
+    def test_new_version_or_rewind_loses_growth(self, monkeypatch, change):
+        from tensorrt_llm.execution_version import ExecutionVersion
+
+        _, scheduler = self.scheduler(monkeypatch)
+        request = _revision_request(1)
+        for _ in range(2):
+            scheduler.schedule_request([request], set())
+            _advance_revision_context(request)
+        if change == "epoch":
+            request.py_execution_version = ExecutionVersion("tenant", "1", 1)
+        elif change == "request":
+            request = _revision_request(1)
+        else:
+            request.context_current_position = 0
+        scheduler.schedule_request([request], set())
+        assert request.context_chunk_size == 128
+
+    def test_cohort_growth_keeps_decode_turn_and_youngest_member_cap(self, monkeypatch):
+        _, scheduler = self.scheduler(monkeypatch, cohort=True)
+        request = _revision_request(1, scope="same")
+        decode = make_gen_request(2)
+        for expected in (128, 256):
+            result = scheduler.schedule_request([request, decode], set())
+            assert result.context_requests == [request]
+            assert result.generation_requests == []
+            assert request.context_chunk_size == expected
+            _advance_revision_context(request)
+            result = scheduler.schedule_request([request, decode], set())
+            assert result.generation_requests == [decode]
+        newcomer = _revision_request(3, scope="same")
+        result = scheduler.schedule_request([request, newcomer, decode], set())
+        assert result.generation_requests == []
+        assert sum(req.context_chunk_size for req in result.context_requests) == 128
+
+    @pytest.mark.parametrize("adaptive,cohort", [(True, False), (False, True)])
+    def test_progressive_policy_supports_each_existing_ablation(
+        self, monkeypatch, adaptive, cohort
+    ):
+        _, scheduler = self.scheduler(monkeypatch, adaptive=adaptive, cohort=cohort)
+        request = _revision_request(1)
+        for expected in (128, 256):
+            result = scheduler.schedule_request([request], set())
+            assert result.context_requests == [request]
+            assert request.context_chunk_size == expected
+            _advance_revision_context(request)
+
+    def test_progressive_flag_requires_a_revision_policy(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_RETIRE_PROGRESSIVE_PREFILL", "1")
+        with pytest.raises(ValueError, match="requires adaptive prefill or revision cohorts"):
+            _revision_scheduler(monkeypatch, adaptive=False, cohort=False)
 
 
 def _completion_scheduler(monkeypatch, blocks: int = 8, *, bind_guard: bool = True):

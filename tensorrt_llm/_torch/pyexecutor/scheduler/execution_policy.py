@@ -27,13 +27,14 @@ class RevisionSchedulingPolicy:
     All state is bounded by the executor's current request population.
     """
 
-    def __init__(self, chunk_tokens: int, stable_tokens: int) -> None:
+    def __init__(self, chunk_tokens: int, stable_tokens: int, *, progressive: bool = False) -> None:
         if chunk_tokens <= 0 or stable_tokens < chunk_tokens:
             raise ValueError(
                 "revision chunk tokens must be positive and no larger than stability tokens"
             )
         self.chunk_tokens = chunk_tokens
         self.stable_tokens = stable_tokens
+        self.progressive = progressive
         self._progress: dict[int, _Progress] = {}
         self._stable_next = False
         self._last_group: tuple[str, str, int] | None = None
@@ -62,6 +63,27 @@ class RevisionSchedulingPolicy:
             progress.computed += progress.end - progress.start
             progress.start = progress.end = position
         return progress.computed < self.stable_tokens
+
+    def chunk_limit(self, request: "LlmRequest") -> int | None:
+        """Grow a sensitive version's cap using completed computation only.
+
+        The initial cap doubles after each cap-sized amount of demonstrated
+        progress. Growth stops at four initial chunks and remains chunk-unit
+        aligned. A stable version returns to the scheduler's ordinary budget.
+        """
+        if not self.sensitive(request):
+            return None
+        if not self.progressive:
+            return self.chunk_tokens
+        progress = self._progress.get(id(request))
+        computed = (
+            0
+            if progress is None or progress.version != request.py_execution_version
+            else progress.computed
+        )
+        completed_chunks = computed // self.chunk_tokens
+        multiplier = 1 << min(2, (completed_chunks + 1).bit_length() - 1)
+        return self.chunk_tokens * multiplier
 
     def scheduled(self, request: "LlmRequest") -> None:
         version = request.py_execution_version
@@ -104,4 +126,8 @@ class RevisionSchedulingPolicy:
         index = (keys.index(self._last_group) + 1) % len(keys) if self._last_group in groups else 0
         self._last_group = keys[index]
         self._stable_next = bool(stable)
-        return {id(req) for req in groups[keys[index]]}, self.chunk_tokens
+        selected = groups[keys[index]]
+        # A young member must not inherit a larger cancellation window merely
+        # because another request in its authority cohort has made progress.
+        cap = min(self.chunk_limit(req) or self.chunk_tokens for req in selected)
+        return {id(req) for req in selected}, cap
