@@ -25,7 +25,8 @@ void checkCuda(cudaError_t result)
 }
 
 __global__ void checkAuthority(cudaGraphConditionalHandle handle, int64_t* table, int const* slots,
-    int64_t const* expected, bool const* realRows, int rows, int capacity, int* status, int index)
+    int64_t const* expected, bool const* realRows, int rows, int capacity, int* status, int index, int const* count,
+    int lower, int upper)
 {
     __shared__ int live;
     if (threadIdx.x == 0)
@@ -55,8 +56,9 @@ __global__ void checkAuthority(cudaGraphConditionalHandle handle, int64_t* table
     __syncthreads();
     if (threadIdx.x == 0)
     {
-        status[index] = live;
-        cudaGraphSetConditional(handle, live);
+        int const selected = live && (lower < 0 || (*count > lower && *count <= upper));
+        status[index] = selected;
+        cudaGraphSetConditional(handle, selected);
     }
 }
 
@@ -71,11 +73,13 @@ class ConditionalGraph
 {
 public:
     ConditionalGraph(std::vector<int64_t> const& segments, at::Tensor table, at::Tensor slots, at::Tensor expected,
-        at::Tensor realRows)
+        at::Tensor realRows, std::vector<at::Tensor> counts, std::vector<int64_t> const& lowerBounds,
+        std::vector<int64_t> const& upperBounds)
         : mTable(std::move(table))
         , mSlots(std::move(slots))
         , mExpected(std::move(expected))
         , mRealRows(std::move(realRows))
+        , mCounts(std::move(counts))
     {
         TORCH_CHECK(mTable.is_cuda(), "RETIRE graph authority must reside on CUDA");
         c10::cuda::CUDAGuard guard(mTable.device());
@@ -86,6 +90,16 @@ public:
         TORCH_CHECK(!segments.empty() && mSlots.numel() == mExpected.numel() && mSlots.numel() == mRealRows.numel()
                 && mSlots.numel() <= INT_MAX && mTable.numel() > 0 && mTable.numel() <= INT_MAX,
             "Invalid RETIRE graph row layout");
+        TORCH_CHECK(mCounts.size() == segments.size() && lowerBounds.size() == segments.size()
+                && upperBounds.size() == segments.size(),
+            "RETIRE graph predicates must describe every segment");
+        for (size_t index = 0; index < mCounts.size(); ++index)
+        {
+            validateTensor(mCounts[index], at::kInt, mTable.device());
+            TORCH_CHECK(mCounts[index].numel() >= 1 && lowerBounds[index] >= -1 && upperBounds[index] <= INT_MAX
+                    && (lowerBounds[index] == -1 || upperBounds[index] > lowerBounds[index]),
+                "Invalid RETIRE graph bucket bounds");
+        }
         mStatus = at::zeros({static_cast<int64_t>(segments.size()) + 1}, mSlots.options());
         try
         {
@@ -103,8 +117,11 @@ public:
                 int capacity = static_cast<int>(mTable.numel());
                 int* statusPtr = mStatus.data_ptr<int>();
                 int segmentIndex = static_cast<int>(index);
+                int const* countPtr = mCounts[index].data_ptr<int>();
+                int lower = static_cast<int>(lowerBounds[index]);
+                int upper = static_cast<int>(upperBounds[index]);
                 void* args[] = {&handle, &tablePtr, &slotsPtr, &expectedPtr, &realRowsPtr, &rows, &capacity, &statusPtr,
-                    &segmentIndex};
+                    &segmentIndex, &countPtr, &lower, &upper};
                 cudaKernelNodeParams kernel{};
                 kernel.func = reinterpret_cast<void*>(checkAuthority);
                 kernel.gridDim = dim3(1);
@@ -207,6 +224,7 @@ private:
     }
 
     at::Tensor mTable, mSlots, mExpected, mRealRows, mStatus;
+    std::vector<at::Tensor> mCounts;
     cudaGraph_t mGraph{};
     cudaGraphExec_t mExec{};
     cudaEvent_t mDone{};
@@ -218,7 +236,8 @@ private:
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     pybind11::class_<ConditionalGraph>(m, "ConditionalGraph")
-        .def(pybind11::init<std::vector<int64_t> const&, at::Tensor, at::Tensor, at::Tensor, at::Tensor>())
+        .def(pybind11::init<std::vector<int64_t> const&, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+            std::vector<at::Tensor>, std::vector<int64_t> const&, std::vector<int64_t> const&>())
         .def("replay", &ConditionalGraph::replay)
         .def("close", &ConditionalGraph::close)
         .def("status", &ConditionalGraph::status);

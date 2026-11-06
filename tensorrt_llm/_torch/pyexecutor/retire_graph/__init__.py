@@ -28,6 +28,15 @@ def layer_group_size() -> int:
     return value
 
 
+def compact_mlp_enabled() -> bool:
+    setting = os.getenv("TRTLLM_RETIRE_COMPACT_MLP", "0")
+    if setting not in ("0", "1"):
+        raise ValueError("TRTLLM_RETIRE_COMPACT_MLP must be 0 or 1")
+    if setting == "1" and not conditional_graph_enabled():
+        raise ValueError("RETIRE compact MLP requires conditional CUDA graphs")
+    return setting == "1"
+
+
 @lru_cache(maxsize=1)
 def load_native():
     """Compile before capture; source identity prevents cross-revision cache reuse."""
@@ -69,7 +78,10 @@ class ConditionalCapture:
         self.group_size = layer_group_size()
         self._pool = pool
         self.warmup = warmup
+        self.compact_mlp = compact_mlp_enabled()
         self.segments = []
+        self.predicates = []
+        self._predicate = (None, -1, -1)
         self.native = None
         self._segment_context = None
         self._token = None
@@ -105,6 +117,12 @@ class ConditionalCapture:
                     metadata.retire_sequence_slots,
                     metadata.retire_expected_versions,
                     metadata.retire_real_rows,
+                    [
+                        p[0] if p[0] is not None else metadata.retire_sequence_slots
+                        for p in self.predicates
+                    ],
+                    [p[1] for p in self.predicates],
+                    [p[2] for p in self.predicates],
                 )
         finally:
             _capture.reset(self._token)
@@ -115,14 +133,16 @@ class ConditionalCapture:
         self._segment_context = torch.cuda.graph(segment, pool=self._pool)
         self._segment_context.__enter__()
         self.segments.append(segment)
+        self.predicates.append(self._predicate)
 
-    def boundary(self):
+    def boundary(self, count=None, lower: int = -1, upper: int = -1):
         if self.warmup:
             return
         self._segment_context.__exit__(None, None, None)
         self._segment_context = None
         if self._pool is None:
             self._pool = self.segments[0].pool()
+        self._predicate = (count, lower, upper)
         self._begin()
 
     def replay(self):
@@ -140,6 +160,7 @@ class ConditionalCapture:
         for segment in self.segments:
             segment.reset()
         self.segments.clear()
+        self.predicates.clear()
 
     def __del__(self):
         # Native close waits for the last replay before segment allocator pools
@@ -153,3 +174,12 @@ class ConditionalCapture:
 def conditional_warmup(metadata):
     with ConditionalCapture(metadata, warmup=True):
         yield
+
+
+def run_compact_mlp(function, hidden_states, metadata):
+    capture = _capture.get()
+    if capture is None or not capture.compact_mlp or metadata.num_contexts:
+        return function(hidden_states)
+    from .compaction import compact_mlp
+
+    return compact_mlp(capture, function, hidden_states, metadata)

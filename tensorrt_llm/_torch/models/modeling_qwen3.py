@@ -103,6 +103,9 @@ class Qwen3DecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         self.mapping_with_cp = mapping_with_cp
         self.enable_attention_dp = self.mapping.enable_attention_dp
+        from ..pyexecutor.retire_graph import compact_mlp_enabled
+
+        self._retire_compact_mlp = compact_mlp_enabled()
 
         # When enable_attention_dp is True, TP reduction is skipped since each DP rank
         # works on different batch elements. However, with CP > 1, attention is split
@@ -183,14 +186,30 @@ class Qwen3DecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(
-            hidden_states,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_mlp_allreduce),
-            cutlass_min_latency_mode=False,
-            **kwargs,
-        )
+        if self._retire_compact_mlp and not torch.compiler.is_compiling():
+
+            def mlp(inputs):
+                return self.mlp(
+                    inputs,
+                    all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                    final_all_reduce_params=AllReduceParams(
+                        enable_allreduce=not self.disable_mlp_allreduce),
+                    cutlass_min_latency_mode=False,
+                    **kwargs,
+                )
+
+            from ..pyexecutor.retire_graph import run_compact_mlp
+
+            hidden_states = run_compact_mlp(mlp, hidden_states, attn_metadata)
+        else:
+            hidden_states = self.mlp(
+                hidden_states,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                final_all_reduce_params=AllReduceParams(
+                    enable_allreduce=not self.disable_mlp_allreduce),
+                cutlass_min_latency_mode=False,
+                **kwargs,
+            )
         if deepstack_embeds is not None and self.layer_idx in range(
                 len(deepstack_embeds)):
             residual = residual + deepstack_embeds[self.layer_idx]
