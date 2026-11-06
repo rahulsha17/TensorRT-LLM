@@ -1562,14 +1562,18 @@ Set them before constructing the controller and worker.
 | `NONBLOCKING_ALIGN` | Eligible single-rank fallback preparation first queries recorded completion. An unready source is retried at later engine safe points, without waiting under the shared alignment lock. Owner release still captures an armed promise before dropping its allocation. |
 | `READY_NOTIFY` | Local worker lifecycle changes wake the controller. Receipts still require independent polling and validation; remote control retains bounded polling. |
 | `FAST_LIFECYCLE` | Poll ALIGN before historical cleanup and limit idle pending-receipt sleeps to 1 ms, including IPC transports without readiness notifications. Both lifecycle queues retain round-robin progress and publications are checked every poll pair. This trades controller CPU and IPC traffic for lower receipt latency; it does not shorten required device or ownership waits. |
-| `EARLY_ALIGNMENT` | Try isolated handoff after the sampler's final use event is recorded and before the input-copy wait. This pass cannot prepare fallback KV or reclaim prior holds. |
+| `EARLY_ALIGNMENT` | Try isolated handoff after the sampler's final use event is recorded and again at the next overlap-loop entry before input-copy waits. The second pass catches revisions arriving between these safe points. These passes cannot prepare fallback KV or reclaim prior holds. |
 | `ADAPTIVE_PREFILL` | Newly active tagged versions use smaller chunks. Only subsequently observed progress from scheduled chunks earns the return to normal chunk sizes; reused prefixes do not. |
+| `PROGRESSIVE_PREFILL` | With adaptive prefill or revision cohorts enabled, grow the revision chunk cap from 1x to 2x to 4x as scheduled work makes observed progress, then return to the ordinary cap at the stable threshold. Cohorts use the smallest member cap. Prefix reuse does not earn growth. |
 | `REVISION_COHORT` | Alternate one bounded prefill cohort sharing an authority version with normal work. The sensitive pass cannot evict unrelated owners; failed admission retries ordinary scheduling. This bounds scheduling opportunities, not memory admission or wall time. |
 | `SHARED_COMPLETION_BUDGET` | Requires `COMPLETION_BUDGET=1` and the rebuilt native API. Charge actual retained allocation capacity and future growth; count identical immutable pages once. Private destinations and partial-copy sources remain charged. Candidate credit retains the exact matched cache through admission. |
 | `ISOLATED_RESIDENCY` | Briefly protect already-ready, full GPU prefix pages for an isolated successor. Optional protection is capped at one quarter of logical GPU capacity and uses the existing bounded yield policy. It does not restore cold pages or wait for old GPU work. |
+| `INCREMENTAL_RESIDENCY` | On a capacity failure, release one oldest optional GPU-residency hold and retry before releasing another. Strict prefix promises and native ownership remain held. This preserves other hot prefixes when one released hold suffices. |
 | `ISOLATED_PARTIAL` | Permit an exact partial prefix when native committed-page coverage and completion prove it safe. Resume creates a private writable tail. Insufficient published coverage falls back to drained preparation; a strict promise is never rounded down. |
 | `SCRATCH_POOL` | Reuse only internal device scratch and pinned upload buffers after recorded device completion. Bound retention to 64 allocations and 4 MiB; exhaustion allocates normally without waiting. Returned token buffers, host verdicts, cached metadata, graph inputs, and events remain independently owned. |
 | `COALESCE_ADVANCE` | Coalesce eligible queued local non-admitting advances. Never cross a pending same-scope admission, RESUME or transfer barrier. Historical publication/FENCE futures and superseded ALIGN outcomes remain explicit. |
+| `CONDITIONAL_GRAPHS` | Experimental TP1 dense BF16 Qwen3 decode graphs check current device authority before each layer group. A wholly obsolete real batch skips future groups, including groups already submitted in that graph. Running kernels are not interrupted. Requires native guards, CUDA 12.3 or newer, nvcc and PyTorch raw-graph access. |
+| `COMPACT_MLP` | Requires conditional graphs. For decode, snapshot the live rows and run one smaller MLP bucket when at most half the rows remain live, then scatter results to their original rows. Attention, KV mapping and residual layout retain their original shape. This is not full decoder-row compaction. |
 
 Adaptive prefill and cohort scheduling initially require dense, single-rank,
 prefix-aware chunked execution without forced chunks, PEFT, draft/cross caches,
@@ -1578,6 +1582,24 @@ switch enabled, `TRTLLM_RETIRE_REVISION_CHUNK_TOKENS` defaults to `1024`, and
 `TRTLLM_RETIRE_REVISION_STABLE_TOKENS` defaults to `4096`. The chunk cap must
 align to the scheduler's chunk unit. `execution_scheduling_snapshot()` reports
 host scheduling counters; these are not evidence of completed GPU work.
+
+Adaptive recovery admission budgets the next capped chunk, rather than reserving
+the unused larger batch budget. Disabled, untagged and unsupported request paths
+retain their existing admission behavior.
+
+Conditional graph groups use `TRTLLM_RETIRE_GRAPH_LAYER_GROUP=4` by default
+(allowed range 1 through 128). The first implementation is limited to full
+decode graphs on dense, unquantized Qwen3 with TP1, no LoRA, speculation, beams,
+in-graph sampling or torch compilation. Prefill retains the existing eager or
+breakable-graph path. The extension compiles before capture and caches by source
+hash; deploying its source requires nvcc in the runtime environment. Every
+segment retains its PyTorch allocator pool until composed-graph uses finish.
+Completion and output-authority checks remain independent of skipped groups.
+
+MLP compaction retains the original GEMM shape for near-full batches. It adds
+authority checks and gather/scatter work and can lose performance on small,
+bandwidth-bound decode batches. Both graph switches default off; qualify the
+model and measure an ablation before enabling them in a performance campaign.
 
 The new native methods require rebuilding the library, Python bindings and
 native test consumers together. Tests extend the existing CPU protocol/guard

@@ -20,7 +20,15 @@ strict partial-prefix isolation, internal scratch pooling and queued ADVANCE
 coalescing. See [Experimental performance switches](retire.md#experimental-performance-switches)
 for their contracts. The table below retains the motivation and tradeoffs;
 these switches still require GPU qualification and measured comparisons.
-GPU-conditional layer groups remain a separate proposal.
+The November 6 follow-up starts from the measured campaign's `a41de7ec46`
+revision. Separate commits add faster lifecycle receipt polling, an additional
+isolated safe point before overlap input-copy waits, progressive prefill caps,
+matching recovery-capacity hints, incremental optional-residency release,
+device-conditional decode layer groups and decode MLP row compaction. Graph
+features remain experimental and default off. The companion client separately
+adds callback-based receipt waits and a concurrent alignment-before-FENCE replay.
+The historical campaign's inputs remain frozen; these changes are a new version,
+not a modification of its Native-versus-RETIRE comparison.
 
 ## Existing mechanisms and benchmark context
 
@@ -56,10 +64,12 @@ even when the runtime can provide a safe ALIGN earlier. It cannot measure the
 latency benefit of handoff before cleanup. Preserve those historical inputs;
 use a separately versioned harness for a new experiment.
 
-The new harness should wait for publication, ALIGN, and acknowledged RESUME,
+The separately versioned concurrent async harness waits for publication, ALIGN,
+and acknowledged RESUME,
 then submit the exact aligned successor. Retain the independent FENCE future
 and record its physical-cleanup completion timestamp separately, without putting
-that wait back on the successor submission path. Keep all times relative to the
+that wait back on the successor submission path. It bounds outstanding cleanup
+before admitting a revision and joins cleanup, including on failures. Keep all times relative to the
 same revision event; `fence_s` must continue to mean full drain, not ALIGN
 readiness. Observe eventual FENCE completion and failures before declaring the
 run complete. Measure revision-to-first-token and useful throughput as well as
@@ -104,7 +114,14 @@ comparison. Model loading, fixed warmups, prefix seeding, and references are
 outside the timed cycles. Its single-session cycle rate is not saturated
 serving throughput; it cannot independently prove GPU overlap.
 
-## Proposed: GPU-conditional layer groups
+## Experimental implementation: GPU-conditional layer groups
+
+The first implementation covers full decode graphs for TP1 dense BF16 Qwen3.
+It composes captured layer groups under device-controlled conditional nodes.
+An optional second switch compacts only the MLP work of mixed decode batches;
+attention retains its existing row and KV layout. These are bounded prototypes,
+not conditional prefill graphs or full decoder compaction. See the switch
+contracts in [RETIRE](retire.md#experimental-performance-switches).
 
 A conditional CUDA graph could check live authority on the GPU immediately
 before each group of decoder layers. If every real row is obsolete, its
@@ -116,7 +133,7 @@ graph bodies controlled by device code; integration must be checked against the
 actual CUDA, driver, PyTorch capture, and allocator versions. See NVIDIA's
 [CUDA Graphs documentation](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html).
 
-The first prototype should target TP1 and a wholly obsolete batch. Keep the
+The first prototype targets TP1 and a wholly obsolete batch. Keep the
 authority table and graph row identities at stable addresses, refresh identities
 before replay, and read the current epoch at execution time. Do not capture a
 Python authority decision as a permanent graph constant. A positive check admits
@@ -153,6 +170,14 @@ useful only when they avoid enough work to pay their cost.
 | Revision bursts | Exact retries reuse their protocol records, and superseded work loses authority. | Avoid restoring or executing intermediate successors already superseded. Revoke promptly; preserve accepted revision records, explicit prefix promises, and ownership cleanup. Coalescing work is not silently deleting protocol obligations. |
 | Recovery fairness | Recovery admission is bounded and existing work can drain. A later experimental policy shares recovery compute with waiting ordinary prefill. | Evaluate that policy independently from handoff changes, using ordinary and recovery latency distributions. A compute share cannot solve absent memory capacity and must not release promised reservations. |
 | Mixed-batch stale work | Live rows prevent whole-batch exit; native predicates cover selected attention work/stores. | Compact stale rows at safe chunk boundaries or investigate revision-aware batching. Include packing, graph-shape, utilization, and live-neighbor costs. |
+
+Remaining extensions include conditional prefill, full attention/residual row
+compaction, automatic graph-bucket selection from measurements, and broader
+model/parallelism support. Refilling an existing graph bucket with compatible
+ready requests belongs at the next forward boundary, after request admission
+and metadata refresh. A new request cannot enter a partly executed decoder at
+an arbitrary later layer. GPU slots or pages still referenced by old submitted
+work must remain owned until their completion events allow reuse.
 
 Implementation entry points are `execution_device.py` and `execution_guard.py`
 under `tensorrt_llm/_torch/pyexecutor/`, the V2 scheduler and KV manager in that
