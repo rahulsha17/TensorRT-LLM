@@ -2937,6 +2937,7 @@ def test_layer_hook_skips_only_unsubmitted_eager_layers(
         mapping_with_cp=None,
         num_hidden_layers=12,
         skip_norm=False,
+        _retire_conditional_graph=False,
     )
     forward = {
         "qwen3": modeling_qwen3.Qwen3Model.forward,

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import os
@@ -162,6 +165,18 @@ class CUDAGraphRunner:
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
+        from .retire_graph import conditional_graph_enabled
+
+        self._retire_conditional = conditional_graph_enabled()
+        if self._retire_conditional and (not config.use_cuda_graph
+                                         or config.mapping.world_size != 1
+                                         or config.spec_config is not None
+                                         or config.max_beam_width != 1
+                                         or config.enable_in_graph_sampling
+                                         or config.is_encoder_decoder):
+            raise NotImplementedError(
+                "RETIRE conditional graphs require TP1 decoder graphs without beams, speculation or in-graph sampling"
+            )
 
         # High-level configuration from the config object
         self.enabled = config.use_cuda_graph
@@ -724,14 +739,23 @@ class CUDAGraphRunner:
         }
 
         output = None
-        with with_multi_stream(True), piecewise_cuda_graph(False):
+        from .retire_graph import ConditionalCapture, conditional_warmup
+
+        conditional = getattr(self, '_retire_conditional', False)
+        if conditional and not hasattr(attn_metadata, 'retire_real_rows'):
+            raise RuntimeError(
+                "RETIRE conditional graphs require native authority binding")
+        with with_multi_stream(not conditional), piecewise_cuda_graph(False):
             # We have to do a warmup run to initialize PyTorch's internal
             # states according to the docs:
             # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
             # This also lets us initialize states in the attn_metadata and
             # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                output = forward_fn(capture_inputs)
+                warmup_scope = (conditional_warmup(attn_metadata)
+                                if conditional else contextlib.nullcontext())
+                with warmup_scope:
+                    output = forward_fn(capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
                 _restore_spec_decode_capture_state(attn_metadata,
@@ -740,11 +764,14 @@ class CUDAGraphRunner:
             if self.is_warmup_only:
                 return output
 
-            graph = torch.cuda.CUDAGraph()
+            graph = (ConditionalCapture(attn_metadata, pool=self.memory_pool)
+                     if conditional else torch.cuda.CUDAGraph())
             # Do not keep the eager result live from this runner across graph
             # setup/capture; release its reference before entering.
             output = None
-            with torch.cuda.graph(graph, pool=self.memory_pool):
+            capture_scope = (graph if conditional else torch.cuda.graph(
+                graph, pool=self.memory_pool))
+            with capture_scope:
                 output = forward_fn(capture_inputs)
             # Snapshot before postprocessing so the check compares against
             # the addresses the graph actually baked in.

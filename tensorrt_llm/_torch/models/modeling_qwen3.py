@@ -231,6 +231,9 @@ class Qwen3Model(DecoderModel):
             eps=config.pretrained_config.rms_norm_eps,
             dtype=config.pretrained_config.torch_dtype,
         )
+        from ..pyexecutor.retire_graph import conditional_graph_enabled
+
+        self._retire_conditional_graph = conditional_graph_enabled()
 
     def forward(
         self,
@@ -265,6 +268,11 @@ class Qwen3Model(DecoderModel):
             ):
                 early_exit = None
         for layer_index, decoder_layer in enumerate(self.layers):
+            if self._retire_conditional_graph and not torch.compiler.is_compiling(
+            ):
+                from ..pyexecutor.retire_graph import layer_boundary
+
+                layer_boundary(layer_index)
             if early_exit is not None and layer_index % 4 == 0:
                 early_exit("eager_layer", layer_index, len(self.layers))
             hidden_states, residual = decoder_layer(

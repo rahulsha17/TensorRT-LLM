@@ -199,6 +199,7 @@ else:
     ]
 
 package_data += [
+    '_torch/pyexecutor/retire_graph/*.cu',
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',

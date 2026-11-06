@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..._utils import prefer_pinned
 from ...execution_version import ExecutionVersion
 from .execution_device import DeviceAttentionRows, DeviceExecutionAuthority
 from .execution_speculation import is_private_ngram
@@ -55,6 +56,8 @@ class ExecutionAttentionBinding:
     def __init__(self, authority: DeviceExecutionAuthority) -> None:
         self.authority = authority
         self._rows: dict[int, tuple[weakref.ReferenceType, DeviceAttentionRows]] = {}
+        self._real_rows: dict[int, tuple[torch.Tensor, tuple[bool, ...]]] = {}
+        self._real_row_uploads: list[tuple[torch.Tensor, torch.cuda.Event]] = []
 
     @classmethod
     def from_runner(cls, runner: "DecoderRunner") -> "ExecutionAttentionBinding | None":
@@ -66,6 +69,20 @@ class ExecutionAttentionBinding:
         from ..attention.backends.trtllm import TrtllmAttentionMetadata
 
         config = runner._config
+        from .retire_graph import conditional_graph_enabled, load_native
+
+        if conditional_graph_enabled():
+            if (
+                runner.mapping.world_size != 1
+                or type(runner.model).__name__ != "Qwen3ForCausalLM"
+                or config.is_spec_decode
+                or config.torch_compile_enabled
+                or config.cuda_graph_specialize_lora
+            ):
+                raise NotImplementedError(
+                    "RETIRE conditional graphs require uncompiled TP1 dense Qwen3 without LoRA or speculation"
+                )
+            load_native()
         if (
             torch.cuda.get_device_capability() != (9, 0)
             or config.dtype != torch.bfloat16
@@ -103,7 +120,12 @@ class ExecutionAttentionBinding:
         entry = self._rows.get(key)
         if entry is None:
             rows = self.authority.create_attention_rows(metadata.max_num_requests)
-            self._rows[key] = (weakref.ref(metadata, lambda _: self._rows.pop(key, None)), rows)
+
+            def released(_):
+                self._rows.pop(key, None)
+                self._real_rows.pop(key, None)
+
+            self._rows[key] = (weakref.ref(metadata, released), rows)
         else:
             owner, rows = entry
             if owner() is not metadata:
@@ -115,3 +137,25 @@ class ExecutionAttentionBinding:
         metadata.retire_sequence_slots = rows.slots
         metadata.retire_expected_versions = rows.expected
         metadata.retire_counters = rows.counters
+        from .retire_graph import conditional_graph_enabled
+
+        if conditional_graph_enabled():
+            by_id = {r.py_request_id: r for r in batch.all_requests()}
+            mask = tuple(not by_id[rid].is_cuda_graph_dummy for rid in metadata.request_ids)
+            mask += (False,) * (rows.slots.numel() - len(mask))
+            cached = self._real_rows.get(key)
+            if cached is None:
+                real_rows = torch.empty_like(rows.slots, dtype=torch.bool)
+            else:
+                real_rows = cached[0]
+            if cached is None or cached[1] != mask:
+                host = torch.tensor(mask, dtype=torch.bool, pin_memory=prefer_pinned())
+                real_rows.copy_(host, non_blocking=True)
+                ready = torch.cuda.Event()
+                ready.record()
+                self._real_row_uploads = [
+                    item for item in self._real_row_uploads if not item[1].query()
+                ]
+                self._real_row_uploads.append((host, ready))
+                self._real_rows[key] = (real_rows, mask)
+            metadata.retire_real_rows = real_rows
