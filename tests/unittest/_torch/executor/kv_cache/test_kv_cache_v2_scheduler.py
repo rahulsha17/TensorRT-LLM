@@ -4446,6 +4446,77 @@ class TestStateFiltering:
 
 
 class TestRecoveryAdmission:
+    @pytest.mark.parametrize("progressive", [False, True])
+    def test_revision_capacity_hint_admits_only_the_next_capped_chunk(
+        self, monkeypatch, progressive
+    ):
+        monkeypatch.setenv("TRTLLM_RETIRE_ADAPTIVE_PREFILL", "1")
+        monkeypatch.setenv("TRTLLM_RETIRE_PROGRESSIVE_PREFILL", str(int(progressive)))
+        monkeypatch.setenv("TRTLLM_RETIRE_REVISION_CHUNK_TOKENS", "1024")
+        monkeypatch.setenv("TRTLLM_RETIRE_REVISION_STABLE_TOKENS", "4096")
+        manager = make_kv_cache_manager(enable_block_reuse=True, can_evict=True)
+        manager.mapping.world_size = 1
+        manager._supports_dense_resume_capacity.return_value = True
+        scheduler = make_scheduler(
+            manager,
+            max_num_tokens=4096,
+            ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64),
+        )
+        scheduler.set_execution_suspend_guard(Mock())
+        request = _revision_request(1)
+        request.prompt_len = request.context_remaining_length = 12288
+
+        def prepare(req, *, prefill_token_budget, prefill_chunk_unit):
+            assert prefill_chunk_unit == 64
+            # Enough capacity for the retained 8K prefix plus a 1K chunk,
+            # but not an unused 4K batch budget. A native refusal happens
+            # before restoring pages or allocating the request's suffix.
+            if prefill_token_budget > 1024:
+                return False
+            req.context_current_position = 8192
+            req.context_remaining_length = 4096
+            return True
+
+        manager.prepare_context.side_effect = prepare
+
+        result = scheduler.schedule_request([request], set())
+
+        assert result.context_requests == [request]
+        assert request.context_chunk_size == 1024
+        manager.prepare_context.assert_called_once_with(
+            request, prefill_token_budget=1024, prefill_chunk_unit=64
+        )
+        manager.resize_context.assert_called_once_with(request, 1024)
+        manager.suspend_request.assert_not_called()
+        manager.preempt_request.assert_not_called()
+        manager.free_resources.assert_not_called()
+
+    @pytest.mark.parametrize("kind", ["disabled", "untagged", "lora", "multimodal", "forced"])
+    def test_revision_admission_hint_preserves_exempt_request_paths(self, monkeypatch, kind):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker
+
+        manager, scheduler = _revision_scheduler(
+            monkeypatch, adaptive=kind != "disabled", enable_block_reuse=True
+        )
+        request = _revision_request(1)
+        if kind == "untagged":
+            request.py_execution_version = None
+        elif kind == "lora":
+            request.lora_task_id = 7
+        elif kind == "multimodal":
+            request.py_multimodal_data = {}
+        elif kind == "forced":
+            scheduler.chunking_policy = ContextChunkingPolicy.FORCE_CHUNK
+
+        assert scheduler._prepare_context_pair(request, BudgetTracker(1024, 16, None))
+
+        if kind in ("multimodal", "forced"):
+            manager.prepare_context.assert_called_once_with(request)
+        else:
+            manager.prepare_context.assert_called_once_with(
+                request, prefill_token_budget=1024, prefill_chunk_unit=64
+            )
+
     @staticmethod
     def recovery_capacity_manager():
         from types import SimpleNamespace

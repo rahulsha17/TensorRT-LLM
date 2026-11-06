@@ -1769,6 +1769,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                         token_budget = min(token_budget, budget.remaining_tokens)
                     if self.max_context_length is not None:
                         token_budget = min(token_budget, self.max_context_length)
+                    if (
+                        self._adaptive_prefill
+                        and self._revision_policy is not None
+                        and req.lora_task_id is None
+                    ):
+                        # Resume admission needs room for this request's next
+                        # capped chunk, not the larger unused batch budget.
+                        revision_limit = self._revision_policy.chunk_limit(req)
+                        if revision_limit is not None:
+                            token_budget = min(token_budget, revision_limit)
                 prepared = self.kv_cache_manager.prepare_context(
                     req,
                     prefill_token_budget=token_budget,
