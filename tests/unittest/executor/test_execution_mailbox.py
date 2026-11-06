@@ -450,7 +450,14 @@ def test_readiness_storm_is_coalesced_and_shutdown_detaches_listener(monkeypatch
         controller.close()
 
 
-@pytest.mark.parametrize("flag", ["TRTLLM_RETIRE_READY_NOTIFY", "TRTLLM_RETIRE_COALESCE_ADVANCE"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "TRTLLM_RETIRE_READY_NOTIFY",
+        "TRTLLM_RETIRE_COALESCE_ADVANCE",
+        "TRTLLM_RETIRE_FAST_LIFECYCLE",
+    ],
+)
 def test_private_control_flags_reject_ambiguous_values(monkeypatch, flag):
     monkeypatch.setenv(flag, "true")
     table = WorkerVersionTable("session")
@@ -721,7 +728,7 @@ class _VirtualPollingQueue:
 
 
 def _run_lifecycle_backlog(
-    monkeypatch, *, aligned=False, delayed=0.0, fail_one=False, inject=False
+    monkeypatch, *, aligned=False, delayed=0.0, fail_one=False, inject=False, count=32
 ):
     import tensorrt_llm.execution_mailbox as mailbox
     from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentReceipt
@@ -759,7 +766,7 @@ def _run_lifecycle_backlog(
         patch.setattr(mailbox, "Queue", lambda: queue)
         controller = ExecutionController("session", transport)
     results = []
-    for index in range(32):
+    for index in range(count):
         old = replace(VERSION, scope_id=f"scope-{index}")
         controller.register(old)
         results.append(
@@ -801,3 +808,59 @@ def test_pending_lifecycle_backlog_sleeps_and_checks_all_scopes(monkeypatch):
 def test_ready_lifecycle_backlog_does_not_starve_new_publication(monkeypatch):
     _, transport = _run_lifecycle_backlog(monkeypatch, aligned=True, inject=True)
     assert transport.injection_remaining >= 30
+
+
+def test_fast_lifecycle_limits_single_scope_idle_delay_without_notifications(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_FAST_LIFECYCLE", "1")
+    queue, _ = _run_lifecycle_backlog(monkeypatch, aligned=True, count=1)
+    assert queue.elapsed == pytest.approx(0.001)
+
+
+def test_fast_lifecycle_pending_work_sleeps_and_publications_remain_fair(monkeypatch):
+    monkeypatch.setenv("TRTLLM_RETIRE_FAST_LIFECYCLE", "1")
+    queue, _ = _run_lifecycle_backlog(monkeypatch, aligned=True, delayed=0.05)
+    assert 0.05 <= queue.elapsed <= 0.07
+    assert queue.idle_calls < 200
+    _, transport = _run_lifecycle_backlog(monkeypatch, aligned=True, inject=True)
+    assert transport.injection_remaining >= 30
+
+
+def test_fast_lifecycle_completes_alignment_before_pending_cleanup_poll(monkeypatch):
+    import tensorrt_llm.execution_mailbox as mailbox
+    from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentReceipt
+
+    class Transport:
+        published = False
+        checked = False
+
+        def publish(self, update, stop):
+            self.published = update.alignment is not None
+            return PublicationReceipt(update, update.version)
+
+        def poll_alignment(self, request, stop):
+            if self.published:
+                return AlignmentReceipt(request, "ready-prefix", 0)
+            return None
+
+        def poll_fence(self, request, stop):
+            if self.published:
+                assert result.alignment._future.done()
+                assert not result.fence._future.done()
+                self.checked = True
+                stop.set()
+            return None
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("TRTLLM_RETIRE_FAST_LIFECYCLE", "1")
+    monkeypatch.setattr(mailbox.Thread, "start", lambda self: None)
+    transport = Transport()
+    controller = ExecutionController("session", transport)
+    controller.register(VERSION)
+    result = controller.advance(
+        Revision("edit", VERSION, replace(VERSION, epoch=VERSION.epoch + 1)),
+        alignment=AlignmentInput((1, 2, 3)),
+    )
+    controller._run()
+    assert transport.checked

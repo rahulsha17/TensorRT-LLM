@@ -746,9 +746,14 @@ class ExecutionController:
         self._queue: Queue[
             VersionPublication | FenceRequest | AlignmentRequest | _ReadinessWake | None
         ] = Queue()
-        for flag in ("TRTLLM_RETIRE_READY_NOTIFY", "TRTLLM_RETIRE_COALESCE_ADVANCE"):
+        for flag in (
+            "TRTLLM_RETIRE_READY_NOTIFY",
+            "TRTLLM_RETIRE_COALESCE_ADVANCE",
+            "TRTLLM_RETIRE_FAST_LIFECYCLE",
+        ):
             if os.environ.get(flag, "0") not in ("0", "1"):
                 raise ValueError(f"{flag} must be 0 or 1")
+        self._fast_lifecycle = os.environ.get("TRTLLM_RETIRE_FAST_LIFECYCLE", "0") == "1"
         self._coalesce_advances = (
             isinstance(transport, LocalPublicationTransport)
             and os.environ.get("TRTLLM_RETIRE_COALESCE_ADVANCE", "0") == "1"
@@ -1133,8 +1138,12 @@ class ExecutionController:
         readiness_polls = 0
         try:
             while not self._stop.is_set():
-                fence_done = self._poll_one_fence()
-                alignment_done = self._poll_one_alignment()
+                if self._fast_lifecycle:
+                    alignment_done = self._poll_one_alignment()
+                    fence_done = self._poll_one_fence()
+                else:
+                    fence_done = self._poll_one_fence()
+                    alignment_done = self._poll_one_alignment()
                 with self._lock:
                     pending = max(len(self._pending_fences), len(self._pending_alignments))
                     # Drain ready receipts without an idle delay, but check the
@@ -1145,7 +1154,7 @@ class ExecutionController:
                         (
                             0.0
                             if fence_done or alignment_done or readiness_polls
-                            else max(0.001, 0.01 / pending)
+                            else (0.001 if self._fast_lifecycle else max(0.001, 0.01 / pending))
                         )
                         if pending
                         else None
