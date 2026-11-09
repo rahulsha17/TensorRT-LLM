@@ -1082,7 +1082,7 @@ def test_native_v2_isolated_handoff_preserves_prefix_while_source_cleanup_is_pen
         fence = FenceRequest("session", alignment.revision)
         assert table.poll_fence(fence) is None
         table.apply(VersionUpdate("session", 3, new, alignment, resume=receipt))
-        assert state.claim(new, 2, revised.input_token_ids, revised.cache_salt, None) == prefix
+        assert state.claim(new, 2, revised.input_token_ids, revised.cache_salt, None) is None
 
         successor = core.create_kv_cache(
             scope, list(revised.input_token_ids[:prefix]), expected_prompt_length=12

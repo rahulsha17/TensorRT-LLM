@@ -2045,8 +2045,11 @@ def test_isolated_alignment_resumes_while_old_gpu_work_and_cleanup_remain(guard)
     successor.py_request_id = 43
     successor.get_tokens = lambda beam: [1, 2, 3]
     successor.cache_salt = successor.lora_task_id = None
+    successor.execution_reuse_limit = None
     guard.validate_successor(successor)
-    assert successor.execution_reuse_limit == 2
+    # Implicit local RESUME keeps the held prefix as a floor so a later
+    # canonical commit can be acquired through ordinary cache matching.
+    assert successor.execution_reuse_limit is None
     assert guard._kv_manager.kv_cache_map[request.py_request_id] is cache
 
     executor = _retiring_executor(guard, request)

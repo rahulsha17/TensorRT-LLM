@@ -507,8 +507,6 @@ class WorkerAlignmentState:
             record = self._records[receipt.request]
             if record.source_only:
                 raise RuntimeError("a prefix source cannot RESUME successor execution")
-            if record.isolated and prefix_length is None:
-                prefix_length = receipt.reusable_prefix_length
             if record.resumed and record.resume_prefix_length != prefix_length:
                 raise RuntimeError("RESUME cannot change the agreed prefix")
             record.resume_prefix_length = prefix_length
@@ -568,9 +566,10 @@ class WorkerAlignmentState:
             if record.request_id is not None and record.request_id != request_id:
                 raise RuntimeError("RESUME already belongs to another request")
             record.request_id = request_id
-            # Collective and isolated RESUME fix an exact prefix. Otherwise
-            # the reservation guarantees a floor, while the runtime's bound
-            # also permits compatible cache entries acquired after ALIGN.
+            # An explicit RESUME fixes an exact prefix. Local reservations,
+            # including isolated ones, guarantee a floor. Normal cache lookup
+            # may acquire newer immutable entries within the runtime's bound;
+            # uncommitted source suffixes remain private to their old owner.
             return (
                 record.resume_prefix_length
                 if record.resume_prefix_length is not None

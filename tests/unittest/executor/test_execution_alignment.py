@@ -74,7 +74,7 @@ def test_release_boundary_captures_pending_fallback_before_owner_disappears():
     ready = Mock(return_value=False)
     order = []
     state = WorkerAlignmentState(
-        lambda _: (order.append("reserve") or Mock(num_tokens=3)),
+        lambda _: order.append("reserve") or Mock(num_tokens=3),
         lambda: None,
         prepare=lambda _: order.append("prepare"),
         prepare_ready=ready,
@@ -156,7 +156,7 @@ def test_pending_preparation_keeps_superseded_hold_until_successor_acquires():
     old_hold.close.assert_not_called()
     assert state.poll(second) is None
     ready.return_value = True
-    reserve.side_effect = lambda _: (order.append("new_reserve") or new_hold)
+    reserve.side_effect = lambda _: order.append("new_reserve") or new_hold
     state.process()
     assert order == ["new_reserve", "old_close"]
     assert state.poll(second).reusable_prefix_length == 3
@@ -182,17 +182,20 @@ def test_reuse_limit_must_cover_minimum_and_transfer():
         )
 
 
+@pytest.mark.parametrize("isolated", [False, True])
 @pytest.mark.parametrize(
     "limit,acquired,attached",
     [(0, 0, 0), (2, 0, 0), (2, 0, 2), (2, 2, 2), (4, 3, 3), (4, 3, 4), (35, 32, 32)],
 )
 def test_bounded_resume_allows_lookup_between_reservation_and_runtime_bound(
-    setup, limit, acquired, attached
+    setup, limit, acquired, attached, isolated
 ):
     controller, _, _, state, reserve, _ = setup
     revised = replace(INPUT, input_token_ids=tuple(range(limit + 2)), max_reuse_tokens=limit)
     hold = Mock(num_tokens=acquired)
     reserve.side_effect = lambda _: hold
+    if isolated:
+        state._reserve_isolated = lambda _: hold
     advance = controller.advance(REVISION, alignment=revised)
     advance.publication.wait()
     state.process()
@@ -213,12 +216,17 @@ def test_bounded_resume_allows_lookup_between_reservation_and_runtime_bound(
     hold.close.assert_called_once()
 
 
+@pytest.mark.parametrize("isolated", [False, True])
 @pytest.mark.parametrize("limit,acquired,agreed", [(0, 0, 0), (4, 3, 0), (4, 3, 2), (4, 3, 3)])
-def test_explicit_bounded_resume_keeps_exact_attachment(limit, acquired, agreed):
+def test_explicit_bounded_resume_keeps_exact_attachment(limit, acquired, agreed, isolated):
     revised = replace(INPUT, max_reuse_tokens=limit)
     request = AlignmentRequest("session", REVISION, revised)
     hold = Mock(num_tokens=acquired)
-    state = WorkerAlignmentState(lambda _: hold, lambda: None)
+    state = WorkerAlignmentState(
+        lambda _: hold,
+        lambda: None,
+        reserve_isolated=(lambda _: hold) if isolated else None,
+    )
     state.observe(NEW, request)
     state.process()
     receipt = state.poll(request)
@@ -461,7 +469,10 @@ def test_reserve_before_old_release_and_acknowledge_only_after_fence(setup):
 
 
 @pytest.mark.parametrize("prefix", [0, 3])
-def test_isolated_prefix_resumes_before_cleanup_with_exact_reuse_ceiling(setup, prefix):
+@pytest.mark.parametrize("additional", [0, 1])
+def test_isolated_prefix_resumes_before_cleanup_and_accepts_later_cache_entries(
+    setup, prefix, additional
+):
     controller, table, tracker, state, reserve, _ = setup
     tracker.enqueue(OLD, lambda: 1)
     owner = object()
@@ -489,10 +500,13 @@ def test_isolated_prefix_resumes_before_cleanup_with_exact_reuse_ceiling(setup, 
     with pytest.raises(ExecutionAuthorityError):
         with table.admission(OLD):
             pass
-    assert state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None) == prefix
-    with pytest.raises(RuntimeError, match="agreed KV prefix"):
-        state.confirm_attachment(NEW, 10, prefix + 1)
-    state.confirm_attachment(NEW, 10, prefix)
+    assert state.claim(NEW, 10, INPUT.input_token_ids, INPUT.cache_salt, None) is None
+    if prefix:
+        with pytest.raises(RuntimeError, match="aligned KV prefix"):
+            state.confirm_attachment(NEW, 10, prefix - 1)
+    with pytest.raises(RuntimeError, match="runtime bound"):
+        state.confirm_attachment(NEW, 10, len(INPUT.input_token_ids))
+    state.confirm_attachment(NEW, 10, prefix + additional)
     assert state.has_isolated_prefix(aligned.request)
     assert state._records[aligned.request].reservation is None
     # Exercise the worker's retry path after attachment, not only the cached

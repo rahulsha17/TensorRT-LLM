@@ -158,8 +158,9 @@ def test_reuse_limit_preserves_backoff_evidence(cache_fixture, limit):
 
 @pytest.mark.parametrize("limit", [0, 8, 10, 12])
 @pytest.mark.parametrize("exact", [False, True], ids=["runtime-bound", "exact-common-prefix"])
+@pytest.mark.parametrize("isolated", [False, True])
 def test_alignment_can_acquire_later_committed_pages_within_runtime_bound(
-    cache_fixture, limit, exact
+    cache_fixture, limit, exact, isolated
 ):
     core, create, _ = cache_fixture
     tokens = list(range(12))
@@ -175,7 +176,11 @@ def test_alignment_can_acquire_later_committed_pages_within_runtime_bound(
         held = create(tokens[: revised_input.reuse_limit], max_reuse_tokens=limit)
         return _Reservation(int(held.num_committed_tokens), held.close, torch.cuda.synchronize)
 
-    state = WorkerAlignmentState(reserve, lambda: None)
+    state = WorkerAlignmentState(
+        reserve,
+        lambda: None,
+        reserve_isolated=(lambda alignment: reserve(alignment.revised_input)) if isolated else None,
+    )
     try:
         state.observe(new, request)
         state.process()
@@ -221,6 +226,58 @@ def test_alignment_can_acquire_later_committed_pages_within_runtime_bound(
         original = _read(core, producer).reshape(-1)
         assert np.all(original[: 8 * bytes_per_token] == 11)
         assert np.all(original[8 * bytes_per_token :] == 17)
+    finally:
+        state.close()
+        state.process()
+
+
+def test_isolated_zero_alignment_keeps_later_committed_prefix_and_future_publication(cache_fixture):
+    core, create, _ = cache_fixture
+    tokens = list(range(12))
+    owner = create()
+    _fill(core, owner, 11)
+    old = ExecutionVersion("tenant", "scope", 0)
+    new = ExecutionVersion("tenant", "scope", 1)
+    revised = AlignmentInput(tuple(range(13)))
+    request = AlignmentRequest("session", Revision("edit", old, new), revised)
+
+    def reserve(alignment):
+        held = create(tokens)
+        return _Reservation(int(held.num_committed_tokens), held.close, torch.cuda.synchronize)
+
+    state = WorkerAlignmentState(
+        lambda _: pytest.fail("isolated handoff must not use drained preparation"),
+        lambda: None,
+        reserve_isolated=reserve,
+    )
+    try:
+        state.observe(new, request)
+        state.process()
+        receipt = state.poll(request)
+        assert receipt.reusable_prefix_length == 0
+        state.authorize_resume(receipt)
+        permitted = state.claim(new, 42, revised.input_token_ids, None, None)
+        assert permitted is None
+
+        # Accepted source work becomes canonical after RESUME is authorized.
+        # Its remaining allocation stays private while the source remains live.
+        owner.commit(tokens[:8])
+        assert owner.is_active and owner.num_committed_tokens == 8
+        successor = create(tokens, max_reuse_tokens=permitted)
+        assert successor.num_committed_tokens == 8
+        state.confirm_attachment(new, 42, successor.num_committed_tokens)
+        assert state.snapshot()["held_count"] == 0
+
+        _fill(core, successor, 29, start_token=8)
+        successor.commit(tokens[8:])
+        assert successor.num_committed_tokens == 12
+        following = create(tokens)
+        assert following.num_committed_tokens == 12
+        actual = _read(core, following).reshape(-1)
+        bytes_per_token = actual.size // 12
+        assert np.all(actual[: 8 * bytes_per_token] == 11)
+        assert np.all(actual[8 * bytes_per_token :] == 29)
+        assert np.all(_read(core, owner) == 11)
     finally:
         state.close()
         state.process()

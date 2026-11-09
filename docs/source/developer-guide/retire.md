@@ -1035,11 +1035,13 @@ V1 rounds down to complete blocks; V2 applies its normal prefix rules within
 the bound. On a single worker, the acquired reservation is the guaranteed
 minimum; the runtime's maximum remains the successor's lookup limit. For
 example, a 2K-token reservation with a 12K-token maximum permits a later 6K
-compatible cache hit, but never reuse beyond 12K. Multi-worker RESUME still
-requires the exact agreed common prefix. The isolated local handoff also fixes
-the exact acquired prefix, rather than allowing a larger later cache hit.
-The suffix is recomputed. Other
-requests keep their own ordinary cache access.
+compatible cache hit, but never reuse beyond 12K. This also applies to isolated
+local handoff: its reservation guarantees ownership of the acquired prefix,
+while later committed immutable entries remain available through ordinary
+cache matching and copy ordering. Uncommitted source suffixes remain private
+to their old owner. An explicit RESUME prefix, including the multi-worker
+common prefix, still requires exact attachment. The suffix beyond the selected
+cache match is recomputed. Other requests keep their own ordinary cache access.
 
 V2 also enforces the bound when committing computed KV. Committing can adopt
 an existing tree entry, so limiting the initial lookup alone is insufficient.
