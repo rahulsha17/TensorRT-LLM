@@ -22,12 +22,20 @@ class _Progress:
 class RevisionSchedulingPolicy:
     """Limit young versions, then restore normal chunks after observed progress.
 
-    Only scheduled chunks whose cursor subsequently advanced earn stability.
-    Reused prefixes, a new version, and an allocation rewind earn no credit.
-    All state is bounded by the executor's current request population.
+    By default only scheduled chunks whose cursor subsequently advanced earn
+    stability. Balanced mode leaves initial versions unrestricted and also uses
+    prepared prefix progress for revised versions. Neither mode changes cache
+    admission or ownership. State is bounded by the current request population.
     """
 
-    def __init__(self, chunk_tokens: int, stable_tokens: int, *, progressive: bool = False) -> None:
+    def __init__(
+        self,
+        chunk_tokens: int,
+        stable_tokens: int,
+        *,
+        progressive: bool = False,
+        balanced: bool = False,
+    ) -> None:
         if chunk_tokens <= 0 or stable_tokens < chunk_tokens:
             raise ValueError(
                 "revision chunk tokens must be positive and no larger than stability tokens"
@@ -35,6 +43,7 @@ class RevisionSchedulingPolicy:
         self.chunk_tokens = chunk_tokens
         self.stable_tokens = stable_tokens
         self.progressive = progressive
+        self.balanced = balanced
         self._progress: dict[int, _Progress] = {}
         self._stable_next = False
         self._last_group: tuple[str, str, int] | None = None
@@ -64,13 +73,29 @@ class RevisionSchedulingPolicy:
             progress.start = progress.end = position
         return progress.computed < self.stable_tokens
 
-    def chunk_limit(self, request: "LlmRequest") -> int | None:
-        """Grow a sensitive version's cap using completed computation only.
+    def chunk_limit(self, request: "LlmRequest", *, prepared: bool = False) -> int | None:
+        """Choose a compute cap without granting any resource admission.
 
         The initial cap doubles after each cap-sized amount of demonstrated
         progress. Growth stops at four initial chunks and remains chunk-unit
         aligned. A stable version returns to the scheduler's ordinary budget.
+        Balanced first-chunk hints allow the ordinary budget until preparation
+        exposes the actual prefix; callers set ``prepared`` only afterward.
         """
+        if self.balanced:
+            version = request.py_execution_version
+            if version is None or version.epoch == 0:
+                return None
+            if request.is_first_context_chunk and not prepared:
+                # The matched prefix is exposed only after cache preparation.
+                # Its admission hint must allow a full chunk if that match
+                # makes this version stable; the actual resize still checks it.
+                return None
+            if request.context_current_position >= self.stable_tokens:
+                # A prepared first cursor is locally matched KV; subsequent
+                # cursors include completed context. This changes compute
+                # granularity only, never cache ownership or accepted reuse.
+                return None
         if not self.sensitive(request):
             return None
         if not self.progressive:

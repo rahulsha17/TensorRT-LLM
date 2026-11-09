@@ -725,6 +725,7 @@ def test_revision_cohort_retains_finished_and_inflight_owners(monkeypatch):
         "TRTLLM_RETIRE_ADAPTIVE_PREFILL",
         "TRTLLM_RETIRE_REVISION_COHORT",
         "TRTLLM_RETIRE_PROGRESSIVE_PREFILL",
+        "TRTLLM_RETIRE_BALANCED_PREFILL",
     ],
 )
 def test_revision_flags_reject_ambiguous_values(monkeypatch, flag):
@@ -914,6 +915,154 @@ class TestProgressiveRevisionScheduling:
             _revision_scheduler(monkeypatch, adaptive=False, cohort=False)
 
 
+class TestBalancedRevisionScheduling:
+    @staticmethod
+    def scheduler(monkeypatch, **kwargs):
+        monkeypatch.setenv("TRTLLM_RETIRE_BALANCED_PREFILL", "1")
+        monkeypatch.setenv("TRTLLM_RETIRE_PROGRESSIVE_PREFILL", "1")
+        return _revision_scheduler(monkeypatch, **kwargs)
+
+    def test_initial_version_keeps_normal_budget_and_live_decode(self, monkeypatch):
+        _, scheduler = self.scheduler(monkeypatch)
+        initial, live = _revision_request(1), make_gen_request(2)
+
+        result = scheduler.schedule_request([initial, live], set())
+
+        assert result.context_requests == [initial]
+        assert result.generation_requests == [live]
+        assert initial.context_chunk_size == 960
+        snapshot = scheduler.execution_scheduling_snapshot()
+        assert snapshot["balanced_prefill"] and not snapshot["revision_cohort"]
+        assert snapshot["balanced_initial_chunks"] == 1
+        assert snapshot["adaptive_caps"] == snapshot["sensitive_passes"] == 0
+
+    def test_fresh_revision_keeps_small_cap_without_excluding_neighbors(self, monkeypatch):
+        _, scheduler = self.scheduler(monkeypatch)
+        revised = _revision_request(1, epoch=1)
+        ordinary = make_ctx_request(2, 4096, is_last_context_chunk=False)
+        live = make_gen_request(3)
+
+        result = scheduler.schedule_request([revised, ordinary, live], set())
+
+        assert result.context_requests == [revised, ordinary]
+        assert result.generation_requests == [live]
+        assert revised.context_chunk_size == 128
+        assert sum(req.context_chunk_size for req in result.context_requests) <= 1023
+        assert scheduler.execution_scheduling_snapshot()["balanced_revised_short_chunks"] == 1
+
+    def test_prepared_reuse_restores_full_chunk_and_matching_admission_hint(self, monkeypatch):
+        def prepare(request, **kwargs):
+            if request.is_first_context_chunk:
+                request.context_current_position = 512
+                request.context_remaining_length = request.prompt_len - 512
+            return True
+
+        manager, scheduler = self.scheduler(
+            monkeypatch, enable_block_reuse=True, prepare_context_fn=prepare
+        )
+        request = _revision_request(1, epoch=1)
+        for _ in range(2):
+            result = scheduler.schedule_request([request], set())
+            assert result.context_requests == [request]
+            assert request.context_chunk_size == 1024
+            manager.prepare_context.assert_called_with(
+                request, prefill_token_budget=1024, prefill_chunk_unit=64
+            )
+            _advance_revision_context(request)
+        snapshot = scheduler.execution_scheduling_snapshot()
+        assert snapshot["balanced_reused_prefix_chunks"] == 1
+        assert snapshot["balanced_stable_prefix_chunks"] == 2
+        assert snapshot["adaptive_caps"] == 0
+
+    def test_unmaterialized_recovery_promise_does_not_grant_stability(self, monkeypatch):
+        _, scheduler = self.scheduler(monkeypatch)
+        request = _revision_request(1, epoch=1)
+        request.py_execution_recovery_tokens = 4096
+        request.py_execution_recovery_pending = True
+
+        scheduler.schedule_request([request], set())
+
+        assert request.context_current_position == 0
+        assert request.context_chunk_size == 128
+        assert scheduler.execution_scheduling_snapshot()["balanced_reused_prefix_chunks"] == 0
+
+    def test_unknown_first_prefix_keeps_conservative_capacity_hint(self, monkeypatch):
+        def prepare(request, *, prefill_token_budget, prefill_chunk_unit):
+            return prefill_token_budget <= 128
+
+        manager, scheduler = self.scheduler(
+            monkeypatch, enable_block_reuse=True, prepare_context_fn=prepare
+        )
+        request = _revision_request(1, epoch=1)
+
+        result = scheduler.schedule_request([request], set())
+
+        # Before matching the prefix, admission allows the larger chunk that
+        # a warm match would permit. It can conservatively defer a cold request
+        # even when only its smaller compute cap fits; no resize bypass occurs.
+        assert result.context_requests == []
+        assert manager.prepare_context.call_count > 0
+        assert all(
+            invocation.kwargs["prefill_token_budget"] == 1024
+            for invocation in manager.prepare_context.call_args_list
+        )
+        manager.try_allocate_context.assert_not_called()
+
+    @pytest.mark.parametrize("change", ["epoch", "request", "rewind"])
+    def test_revised_prefix_credit_is_not_retained_after_progress_is_lost(
+        self, monkeypatch, change
+    ):
+        from tensorrt_llm.execution_version import ExecutionVersion
+
+        _, scheduler = self.scheduler(monkeypatch)
+        request = _revision_request(1, epoch=1)
+        for expected in (128, 256, 1024):
+            scheduler.schedule_request([request], set())
+            assert request.context_chunk_size == expected
+            _advance_revision_context(request)
+        if change == "request":
+            request = _revision_request(1, epoch=2)
+        else:
+            if change == "epoch":
+                request.py_execution_version = ExecutionVersion("tenant", "1", 2)
+            request.context_current_position = 0
+            request.context_remaining_length = request.prompt_len
+        scheduler.schedule_request([request], set())
+        assert request.context_chunk_size == 128
+        assert len(scheduler._revision_policy._progress) == 1
+
+    def test_pending_gpu_use_does_not_earn_prefix_credit_or_schedule(self, monkeypatch):
+        manager, scheduler = self.scheduler(monkeypatch)
+        request = _revision_request(1, epoch=1)
+        request.context_current_position = 4096
+
+        result = scheduler.schedule_request([request], {request.request_id})
+
+        assert result.context_requests == []
+        manager.prepare_context.assert_not_called()
+        assert scheduler.execution_scheduling_snapshot()["balanced_stable_prefix_chunks"] == 0
+
+    @pytest.mark.parametrize("adaptive,cohort", [(False, False), (True, True)])
+    def test_balanced_mode_rejects_incompatible_policies(self, monkeypatch, adaptive, cohort):
+        monkeypatch.setenv("TRTLLM_RETIRE_BALANCED_PREFILL", "1")
+        with pytest.raises(ValueError, match="balanced RETIRE prefill requires"):
+            _revision_scheduler(monkeypatch, adaptive=adaptive, cohort=cohort)
+
+    def test_balanced_policy_preserves_unsupported_topology(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_RETIRE_BALANCED_PREFILL", "1")
+        monkeypatch.setenv("TRTLLM_RETIRE_ADAPTIVE_PREFILL", "1")
+        manager = make_kv_cache_manager()
+        manager.mapping.world_size = 2
+        scheduler = make_scheduler(
+            manager, ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64)
+        )
+
+        scheduler.set_execution_suspend_guard(Mock())
+
+        assert scheduler._revision_policy is None
+        assert not scheduler.execution_scheduling_snapshot()["balanced_prefill"]
+
+
 def _completion_scheduler(monkeypatch, blocks: int = 8, *, bind_guard: bool = True):
     monkeypatch.setenv("TRTLLM_RETIRE_COMPLETION_BUDGET", "1")
     manager = make_kv_cache_manager(enable_block_reuse=True, can_evict=True)
@@ -1076,6 +1225,40 @@ def test_completion_budget_defers_large_prefill_until_native_cleanup(monkeypatch
     assert scheduler.schedule_request([second], set()).context_requests == []
     del manager.kv_cache_map[1]
     assert scheduler.schedule_request([second], set()).context_requests == [second]
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_balanced_prefill_preserves_exact_deferred_completion_charges(monkeypatch, shared):
+    from tensorrt_llm.execution_version import ExecutionVersion
+
+    monkeypatch.setenv("TRTLLM_RETIRE_BALANCED_PREFILL", "1")
+    monkeypatch.setenv("TRTLLM_RETIRE_ADAPTIVE_PREFILL", "1")
+    monkeypatch.setenv("TRTLLM_RETIRE_SHARED_COMPLETION_BUDGET", str(int(shared)))
+    monkeypatch.setenv("TRTLLM_RETIRE_REVISION_CHUNK_TOKENS", "64")
+    monkeypatch.setenv("TRTLLM_RETIRE_REVISION_STABLE_TOKENS", "128")
+    manager, scheduler = _completion_scheduler(monkeypatch)
+    if shared:
+        manager.execution_completion_demand.side_effect = lambda claims: sum(
+            claim[2] for claim in claims
+        )
+        manager.execution_completion_try_admit.side_effect = lambda claims, req, capacity: (
+            sum(claim[2] for claim in claims) + scheduler._completion_blocks(req) <= capacity
+        )
+    first, successor = [_completion_request(i, 384) for i in (1, 2)]
+    first.py_execution_version = ExecutionVersion("tenant", "scope", 0)
+    successor.py_execution_version = ExecutionVersion("tenant", "scope", 1)
+    first.py_multimodal_data = successor.py_multimodal_data = None
+    assert scheduler.schedule_request([first, successor], set()).context_requests == [first]
+    allocation = manager.kv_cache_map[1]
+
+    assert scheduler.schedule_request([successor], set()).context_requests == []
+    assert scheduler._completion_claims[1] == (first, allocation, 6)
+    assert 2 not in manager.kv_cache_map
+    del manager.kv_cache_map[1]
+
+    assert scheduler.schedule_request([successor], set()).context_requests == [successor]
+    assert successor.context_chunk_size == 64
+    assert 1 not in scheduler._completion_claims
 
 
 def test_completion_budget_scans_and_charges_untagged_neighbors(monkeypatch):

@@ -1565,6 +1565,7 @@ Set them before constructing the controller and worker.
 | `EARLY_ALIGNMENT` | Try isolated handoff after the sampler's final use event is recorded and again at the next overlap-loop entry before input-copy waits. The second pass catches revisions arriving between these safe points. These passes cannot prepare fallback KV or reclaim prior holds. |
 | `ADAPTIVE_PREFILL` | Newly active tagged versions use smaller chunks. Only subsequently observed progress from scheduled chunks earns the return to normal chunk sizes; reused prefixes do not. |
 | `PROGRESSIVE_PREFILL` | With adaptive prefill or revision cohorts enabled, grow the revision chunk cap from 1x to 2x to 4x as scheduled work makes observed progress, then return to the ordinary cap at the stable threshold. Cohorts use the smallest member cap. Prefix reuse does not earn growth. |
+| `BALANCED_PREFILL` | Requires adaptive prefill and disabled revision cohorts. Epoch-zero requests use the ordinary chunk budget. Revised requests return to that budget once their actual prepared context position reaches the stability threshold, including matched prefix reuse; revised requests with little prepared prefix retain adaptive/progressive caps. This changes scheduling granularity, not committed KV, ownership or admission capacity. |
 | `REVISION_COHORT` | Alternate one bounded prefill cohort sharing an authority version with normal work. The sensitive pass cannot evict unrelated owners; failed admission retries ordinary scheduling. This bounds scheduling opportunities, not memory admission or wall time. |
 | `SHARED_COMPLETION_BUDGET` | Requires `COMPLETION_BUDGET=1` and the rebuilt native API. Charge actual retained allocation capacity and future growth; count identical immutable pages once. Private destinations and partial-copy sources remain charged. Candidate credit retains the exact matched cache through admission. |
 | `ISOLATED_RESIDENCY` | Briefly protect already-ready, full GPU prefix pages for an isolated successor. Optional protection is capped at one quarter of logical GPU capacity and uses the existing bounded yield policy. It does not restore cold pages or wait for old GPU work. |
@@ -1586,6 +1587,21 @@ host scheduling counters; these are not evidence of completed GPU work.
 Adaptive recovery admission budgets the next capped chunk, rather than reserving
 the unused larger batch budget. Disabled, untagged and unsupported request paths
 retain their existing admission behavior.
+
+With balanced prefill, the first-chunk admission hint allows the ordinary budget
+because the matched prefix is not known until preparation. The post-preparation
+chunk cap uses the actual context cursor, and normal allocation and resize checks
+still apply. An expected overlap or a pending recovery promise grants no stability
+credit. Cursor rewind or request/version replacement cannot retain lost prefix
+credit. Epoch zero does not predict that a request will never be revised; ordinary
+chunks can increase cancellation granularity relative to adaptive caps.
+
+Balanced prefill can be combined with completion admission and shared completion
+accounting without changing their capacity or deferred-owner charges. It does not
+require conditional graphs or compact MLP. The scheduling snapshot includes
+`balanced_prefill` and counters for initial-version chunks, prepared reused-prefix
+chunks, stable-prefix chunks, and revised short-prefix chunks. These are host
+scheduling observations, not proof of useful GPU overlap or a throughput benefit.
 
 Conditional graph groups use `TRTLLM_RETIRE_GRAPH_LAYER_GROUP=4` by default
 (allowed range 1 through 128). The first implementation is limited to full

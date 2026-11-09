@@ -303,6 +303,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             context_tokens=0,
             sensitive_tokens=0,
             max_sensitive_tokens=0,
+            balanced_initial_chunks=0,
+            balanced_reused_prefix_chunks=0,
+            balanced_stable_prefix_chunks=0,
+            balanced_revised_short_chunks=0,
         )
 
     def set_execution_suspend_guard(self, guard: Callable[[LlmRequest], None]) -> None:
@@ -343,6 +347,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "TRTLLM_RETIRE_ADAPTIVE_PREFILL",
                 "TRTLLM_RETIRE_REVISION_COHORT",
                 "TRTLLM_RETIRE_PROGRESSIVE_PREFILL",
+                "TRTLLM_RETIRE_BALANCED_PREFILL",
             )
         ]
         if any(value not in ("0", "1") for value in settings):
@@ -350,6 +355,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         if settings[2] == "1" and "1" not in settings[:2]:
             raise ValueError(
                 "progressive RETIRE prefill requires adaptive prefill or revision cohorts"
+            )
+        if settings[3] == "1" and (settings[0] != "1" or settings[1] != "0"):
+            raise ValueError(
+                "balanced RETIRE prefill requires adaptive prefill and disables revision cohorts"
             )
         if "1" not in settings:
             return
@@ -375,7 +384,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "RETIRE revision chunk cap must be a positive multiple of chunk_unit_size"
             )
         self._revision_policy = RevisionSchedulingPolicy(
-            chunk, stable, progressive=settings[2] == "1"
+            chunk, stable, progressive=settings[2] == "1", balanced=settings[3] == "1"
         )
         self._adaptive_prefill, self._revision_cohort = (value == "1" for value in settings[:2])
 
@@ -414,6 +423,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             adaptive_prefill=self._adaptive_prefill,
             revision_cohort=self._revision_cohort,
             progressive_prefill=policy is not None and policy.progressive,
+            balanced_prefill=policy is not None and policy.balanced,
             chunk_tokens=0 if policy is None else policy.chunk_tokens,
             stable_tokens=0 if policy is None else policy.stable_tokens,
             shared_completion_budget=self._shared_completion_budget,
@@ -1494,6 +1504,20 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._claim_context_completion(req)
             if self._revision_policy is not None:
                 self._revision_policy.scheduled(req)
+                if (
+                    self._revision_policy.balanced
+                    and req.py_execution_version is not None
+                    and req.lora_task_id is None
+                    and req.py_multimodal_data is None
+                ):
+                    if req.py_execution_version.epoch == 0:
+                        self._revision_metrics["balanced_initial_chunks"] += 1
+                    elif req.context_current_position >= self._revision_policy.stable_tokens:
+                        self._revision_metrics["balanced_stable_prefix_chunks"] += 1
+                        if first_chunk:
+                            self._revision_metrics["balanced_reused_prefix_chunks"] += 1
+                    else:
+                        self._revision_metrics["balanced_revised_short_chunks"] += 1
 
         return result
 
@@ -1642,7 +1666,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             and req.lora_task_id is None
             and req.py_multimodal_data is None
         ):
-            revision_limit = self._revision_policy.chunk_limit(req)
+            revision_limit = self._revision_policy.chunk_limit(req, prepared=True)
             if revision_limit is not None and chunk_size > revision_limit:
                 self._revision_metrics["adaptive_caps"] += 1
                 chunk_size = revision_limit
