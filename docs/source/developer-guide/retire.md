@@ -1138,6 +1138,29 @@ measurements before a default-on deployment, including a native graph-startup
 check for internal cache accounting. Host tests alone do not establish that the
 recorded pressure stalls are repaired.
 
+`TRTLLM_RETIRE_BOUNDED_PREFILL=1` additionally permits one unfinished tagged
+prefill beside active decoders when shared completion accounting and balanced
+prefill are enabled. The existing decoders retain their complete reservations;
+only remaining GPU capacity can be reserved for the additional context. Its
+absolute token limit excludes the last prompt token, so it cannot enter decode
+until the scheduler promotes that exact allocation to a full completion claim.
+Native accounting includes allocated pages, immutable sharing, and partial-copy
+sources. Allocation failure cannot evict another request for this extra work.
+Recovery, pending completion, or protected residency prevents new bounded
+admission, and fresh contexts cannot bypass an existing bounded owner.
+
+This switch is off by default. It requires ordinary prefix-aware chunking without
+forced chunks, speculative/draft or cross caches, multimodal inputs, PEFT, or a KV
+connector. Scheduling snapshots expose bounded admissions, chunks, tokens,
+promotions, and waits; these host counters do not establish GPU overlap or gains.
+
+An isolated empty ALIGN match is deferred when a token-compatible accepted source
+prefix remains unpublished. Once the source's latest GPU uses and context
+receipts are ready, the guard publishes accepted progress and reacquires native
+prefix ownership before authorizing the successor. The old allocation and
+pending result remain owned until terminal cleanup; FENCE may still be pending.
+Cold or incompatible prefixes do not acquire this additional readiness condition.
+
 The receipt is a record of preparation, not a permanent right to use memory.
 RESUME must check that its version and reservation ID are still live, verify the
 submitted input, and acquire the successor's own KV before releasing this hold.
@@ -1570,6 +1593,7 @@ Set them before constructing the controller and worker.
 | `BALANCED_PREFILL` | Requires adaptive prefill and disabled revision cohorts. Epoch-zero requests use the ordinary chunk budget. Revised requests return to that budget once their actual prepared context position reaches the stability threshold, including matched prefix reuse; revised requests with little prepared prefix retain adaptive/progressive caps. This changes scheduling granularity, not committed KV, ownership or admission capacity. |
 | `REVISION_COHORT` | Alternate one bounded prefill cohort sharing an authority version with normal work. The sensitive pass cannot evict unrelated owners; failed admission retries ordinary scheduling. This bounds scheduling opportunities, not memory admission or wall time. |
 | `SHARED_COMPLETION_BUDGET` | Requires `COMPLETION_BUDGET=1` and the rebuilt native API. Charge actual retained allocation capacity and future growth; count identical immutable pages once. Private destinations and partial-copy sources remain charged. Candidate credit retains the exact matched cache through admission. |
+| `BOUNDED_PREFILL` | Requires shared completion accounting and balanced prefill. Permit one unfinished context using capacity left after active decoder completion reservations. Stop before prompt completion until full admission succeeds; retain exact ownership through cancellation and cleanup. No new bounded admission during recovery or protected residency. |
 | `ISOLATED_RESIDENCY` | Briefly protect already-ready, full GPU prefix pages for an isolated successor. Optional protection is capped at one quarter of logical GPU capacity and uses the existing bounded yield policy. It does not restore cold pages or wait for old GPU work. |
 | `INCREMENTAL_RESIDENCY` | On a capacity failure, release one oldest optional GPU-residency hold and retry before releasing another. Strict prefix promises and native ownership remain held. This preserves other hot prefixes when one released hold suffices. |
 | `ISOLATED_PARTIAL` | Permit an exact partial prefix when native committed-page coverage and completion prove it safe. Resume creates a private writable tail. Insufficient published coverage falls back to drained preparation; a strict promise is never rounded down. |

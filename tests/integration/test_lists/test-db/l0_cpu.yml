@@ -169,6 +169,7 @@ l0_cpu:
   - unittest/executor/test_execution_device_guard.py
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestRecoveryAdmission
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestProgressiveRevisionScheduling
+  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestBoundedCompletionPrefill
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestIdleGenerationRecovery
   - unittest/_torch/executor/kv_cache/test_kv_cache_v2_scheduler.py::TestDeadlockDetection
   - unittest/executor/test_execution_ngram.py

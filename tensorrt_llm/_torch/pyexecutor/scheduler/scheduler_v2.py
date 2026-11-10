@@ -291,6 +291,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._completion_internal_blocks = 0
         self._completion_claims: dict[int, tuple[LlmRequest, object, int]] = {}
         self._shared_completion_budget = False
+        self._bounded_prefill = False
+        self._bounded_contexts: dict[int, int] = {}
+        self._bounded_prefill_generators: set[int] = set()
+        self._completion_deferred_contexts: dict[int, LlmRequest] = {}
         self._revision_policy: RevisionSchedulingPolicy | None = None
         self._adaptive_prefill = False
         self._revision_cohort = False
@@ -307,6 +311,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             balanced_reused_prefix_chunks=0,
             balanced_stable_prefix_chunks=0,
             balanced_revised_short_chunks=0,
+            completion_deferrals=0,
+            bounded_prefill_admissions=0,
+            bounded_prefill_chunks=0,
+            bounded_prefill_tokens=0,
+            bounded_prefill_promotions=0,
+            bounded_prefill_waits=0,
         )
 
     def set_execution_suspend_guard(self, guard: Callable[[LlmRequest], None]) -> None:
@@ -339,6 +349,25 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._execution_suspend_guard = guard
         if self._revision_policy is None:
             self._enable_revision_policy()
+        bounded = os.environ.get("TRTLLM_RETIRE_BOUNDED_PREFILL", "0")
+        if bounded not in ("0", "1"):
+            raise ValueError("TRTLLM_RETIRE_BOUNDED_PREFILL must be 0 or 1")
+        if bounded == "1":
+            if not (
+                self._shared_completion_budget
+                and self._revision_policy is not None
+                and self._revision_policy.balanced
+                and self.chunking_enabled
+                and self.chunking_policy != ContextChunkingPolicy.FORCE_CHUNK
+                and self.enable_prefix_aware_scheduling
+                and self.draft_kv_cache_manager is None
+                and self.cross_kv_cache_manager is None
+                and self.kv_cache_manager.kv_connector_manager is None
+            ):
+                raise ValueError(
+                    "Bounded RETIRE prefill requires shared completion and balanced prefill"
+                )
+            self._bounded_prefill = True
 
     def _enable_revision_policy(self) -> None:
         settings = [
@@ -427,6 +456,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_tokens=0 if policy is None else policy.chunk_tokens,
             stable_tokens=0 if policy is None else policy.stable_tokens,
             shared_completion_budget=self._shared_completion_budget,
+            bounded_prefill_enabled=self._bounded_prefill,
         )
 
     def _enable_completion_budget(self) -> None:
@@ -493,6 +523,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             for key, claim in self._completion_claims.items()
             if caches.get(key) is claim[1]
         }
+        self._bounded_contexts = {
+            key: limit
+            for key, limit in self._bounded_contexts.items()
+            if key in self._completion_claims
+        }
         for req in requests:
             cache = caches.get(req.py_request_id)
             if (
@@ -508,9 +543,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if caches.keys() - self._completion_claims.keys() - internal_ids:
             raise RuntimeError("RETIRE completion budget found an unaccounted native cache owner")
         demand = (
-            self.kv_cache_manager.execution_completion_demand(
-                list(self._completion_claims.values())
-            )
+            self._completion_demand()
             if self._shared_completion_budget
             else sum(claim[2] for claim in self._completion_claims.values())
         )
@@ -520,17 +553,101 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"{self._completion_budget_blocks}; install execution authority before submitting work"
             )
 
+    def _completion_demand(self) -> int:
+        claims = list(self._completion_claims.values())
+        if self._bounded_contexts:
+            for key in self._bounded_contexts:
+                req = self._completion_claims[key][0]
+                if (
+                    req.is_finished is not True
+                    and req.state_value != self._context_init_state_value
+                ):
+                    raise RuntimeError(
+                        "Bounded prefill entered generation without completion admission"
+                    )
+            return self.kv_cache_manager.execution_completion_demand(
+                claims, bounded_contexts=self._bounded_contexts
+            )
+        return self.kv_cache_manager.execution_completion_demand(claims)
+
     def _can_complete_context(self, req: LlmRequest) -> bool:
-        if self._completion_budget_blocks is None or req.py_request_id in self._completion_claims:
+        if self._completion_budget_blocks is None:
             return True
+        request_id = req.py_request_id
+        if request_id in self._bounded_contexts:
+            # Promote the existing exact owner before admitting another fresh
+            # context. Every other live owner retains a full completion bound.
+            if (
+                self.kv_cache_manager.execution_completion_demand(
+                    list(self._completion_claims.values())
+                )
+                <= self._completion_budget_blocks
+            ):
+                del self._bounded_contexts[request_id]
+                self._revision_metrics["bounded_prefill_promotions"] += 1
+                return True
+            if (
+                self._bounded_contexts[request_id] - req.context_current_position
+                < self.chunk_unit_size
+            ):
+                self._revision_metrics["bounded_prefill_waits"] += 1
+                return False
+            return True
+        if request_id in self._completion_claims:
+            return True
+        if self._bounded_contexts:
+            self._revision_metrics["completion_deferrals"] += 1
+            return False
         demand = self._completion_blocks(req)
         if self._shared_completion_budget:
-            return self.kv_cache_manager.execution_completion_try_admit(
-                list(self._completion_claims.values()), req, self._completion_budget_blocks
+            bounded_retry = (
+                bool(self._bounded_prefill_generators)
+                and self._completion_deferred_contexts.get(request_id) is req
             )
+            if not bounded_retry:
+                if self.kv_cache_manager.execution_completion_try_admit(
+                    list(self._completion_claims.values()), req, self._completion_budget_blocks
+                ):
+                    return True
+                self._revision_metrics["completion_deferrals"] += 1
+                if self._bounded_prefill:
+                    self._completion_deferred_contexts[request_id] = req
+            if self._can_start_bounded_prefill(req):
+                limit = self.kv_cache_manager.execution_completion_try_bounded_prefill(
+                    list(self._completion_claims.values()),
+                    req,
+                    self._completion_budget_blocks,
+                    self.chunk_unit_size,
+                )
+                if limit is not None:
+                    self._bounded_contexts[request_id] = limit
+                    self._revision_metrics["bounded_prefill_admissions"] += 1
+                    return True
+            return False
         return (
             demand + sum(claim[2] for claim in self._completion_claims.values())
             <= self._completion_budget_blocks
+        )
+
+    def _can_start_bounded_prefill(self, req: LlmRequest) -> bool:
+        """Use spare capacity only beside decoders with guaranteed completion."""
+        return (
+            self._bounded_prefill
+            and bool(self._bounded_prefill_generators)
+            and bool(self._completion_claims)
+            and req.is_first_context_chunk
+            and req.py_execution_version is not None
+            and req.lora_task_id is None
+            and req.py_multimodal_data is None
+            and not req.py_execution_recovery_pending
+            and req.py_execution_recovery_tokens == 0
+            and not self.kv_cache_manager.has_execution_residency
+            and all(
+                owner.is_finished is not True
+                and owner.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
+                and allocation.is_active is True
+                for owner, allocation, _ in self._completion_claims.values()
+            )
         )
 
     def _claim_context_completion(self, req: LlmRequest) -> None:
@@ -598,6 +715,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         scheduled_beam_width = 0
         has_chunking = False
         blocked_generation = None
+        self._bounded_prefill_generators = set()
+        self._completion_deferred_contexts = {}
 
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
@@ -1003,6 +1122,45 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
                 fresh_context_admitted |= shared.is_first_context_chunk
                 self._record_context_admission(shared, recovery_ids, resident_recovery_ids)
+
+        if (
+            self._bounded_prefill
+            and not self._bounded_contexts
+            and scheduled_gen
+            and not (
+                scheduled_ctx
+                or scheduled_encoder
+                or recovery_ids
+                or recovery_prefill_ids
+                or pending_completion
+                or blocked_generation
+                or evicted
+                or recompute_paused
+            )
+            and not budget.requests_full
+            and self._has_context_chunk_budget(budget)
+        ):
+            # Preserve every context that fits the normal completion rule
+            # before lending spare capacity to an otherwise blocked prefix.
+            # Retry at most one candidate; its full native match was already
+            # rejected during the ordinary scan and need not be probed again.
+            self._bounded_prefill_generators = {req.py_request_id for req in scheduled_gen}
+            try:
+                for req in self._completion_deferred_contexts.values():
+                    if not self._can_start_bounded_prefill(req):
+                        continue
+                    action, tokens, chunking_flag = self._try_schedule_context(
+                        req, budget, preempt_for_pages
+                    )
+                    if action is ScheduleAction.SCHEDULED:
+                        scheduled_ctx.append(req)
+                        budget.commit(req, tokens, 0)
+                        has_chunking |= chunking_flag
+                        fresh_context_admitted = True
+                        self._record_context_admission(req, recovery_ids, resident_recovery_ids)
+                    break
+            finally:
+                self._bounded_prefill_generators = set()
 
         if (
             blocked_generation is not None
@@ -1484,6 +1642,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         first_chunk = req.is_first_context_chunk
         if not self._can_complete_context(req):
             return ScheduleAction.SKIP, 0, False
+        if req.py_request_id in self._bounded_contexts:
+            # Bounded work may consume spare capacity, never reclaim another
+            # owner's pages when physical migration cannot satisfy admission.
+            def preempt_for_pages(_: LlmRequest) -> bool:
+                return False
+
         try:
             if self.chunking_enabled:
                 result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
@@ -1502,6 +1666,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.release_context_admission(req)
         elif result[0] is ScheduleAction.SCHEDULED:
             self._claim_context_completion(req)
+            if req.py_request_id in self._bounded_contexts:
+                self._revision_metrics["bounded_prefill_chunks"] += 1
+                self._revision_metrics["bounded_prefill_tokens"] += req.context_chunk_size
             if self._revision_policy is not None:
                 self._revision_policy.scheduled(req)
                 if (
@@ -1533,6 +1700,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             if manager is not None and req.py_request_id in manager.kv_cache_map:
                 manager.free_resources(req)
+        self._bounded_contexts.pop(req.py_request_id, None)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
 
     def _try_schedule_context_full(
@@ -1660,6 +1828,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunk_size = min(
             chunk_size, remaining_budget if remaining_budget is not None else chunk_size
         )
+        if req.py_request_id in self._bounded_contexts:
+            chunk_size = min(
+                chunk_size,
+                self._bounded_contexts[req.py_request_id] - req.context_current_position,
+            )
         if (
             self._adaptive_prefill
             and self._revision_policy is not None
@@ -1803,6 +1976,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                         revision_limit = self._revision_policy.chunk_limit(req)
                         if revision_limit is not None:
                             token_budget = min(token_budget, revision_limit)
+                    if req.py_request_id in self._bounded_contexts:
+                        cache = self.kv_cache_manager.kv_cache_map[req.py_request_id]
+                        position = (
+                            cache.num_committed_tokens
+                            if req.is_first_context_chunk
+                            else req.context_current_position
+                        )
+                        token_budget = min(
+                            token_budget, self._bounded_contexts[req.py_request_id] - position
+                        )
                 prepared = self.kv_cache_manager.prepare_context(
                     req,
                     prefill_token_budget=token_budget,

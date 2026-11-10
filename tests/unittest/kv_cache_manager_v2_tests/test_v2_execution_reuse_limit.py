@@ -281,3 +281,77 @@ def test_isolated_zero_alignment_keeps_later_committed_prefix_and_future_publica
     finally:
         state.close()
         state.process()
+
+
+def test_bounded_prefill_preserves_anchor_completion_and_promotes_after_release(cache_fixture):
+    core, create, _ = cache_fixture
+    total_blocks = core.get_storage_statistics(0)[0].total
+    assert total_blocks >= 8
+    anchor_end = (total_blocks - 2) * 4
+    anchor_start = anchor_end - 8
+    anchor = create()
+    assert anchor.resize(anchor_start)
+    _fill(core, anchor, 11)
+    pending = create()
+    assert pending.resize(8)
+    _fill(core, pending, 29)
+
+    # Charge the entire physical pool: two blocks hold unfinished prefill, and
+    # the decoder retains enough capacity for its last two blocks of growth.
+    assert core.get_completion_demand([anchor, pending], [anchor_end, 8]) == [total_blocks]
+    assert core.get_completion_demand([anchor, pending], [anchor_end, 20]) == [total_blocks + 3]
+    assert anchor.resize(anchor_end)
+    _fill(core, anchor, 11, start_token=anchor_start)
+    assert core.get_completion_demand([anchor, pending], [anchor_end, 8]) == [total_blocks]
+    assert np.all(_read(core, anchor) == 11)
+    assert np.all(_read(core, pending) == 29)
+
+    anchor.close()
+    assert core.get_completion_demand([pending], [20]) == [5]
+    assert pending.resize(20)
+    _fill(core, pending, 17, start_token=8)
+    data = _read(core, pending)
+    assert np.all(data[:2] == 29)
+    assert np.all(data[2:] == 17)
+
+
+def test_bounded_prefill_demand_never_undercharges_allocated_pages(cache_fixture):
+    core, create, _ = cache_fixture
+    anchor = create()
+    pending = create()
+    assert pending.resize(8)
+    assert core.get_completion_demand([anchor, pending], [20, 0]) == [7]
+    assert pending.resize(12)
+    assert core.get_completion_demand([anchor, pending], [20, 8]) == [8]
+    pending.close()
+    assert core.get_completion_demand([anchor], [20]) == [5]
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_bounded_prefill_counts_partial_match_source_during_private_copy(cache_fixture, resume):
+    core, create, stream = cache_fixture
+    anchor = create()
+    tokens = list(range(12))
+    _fill(core, anchor, 11)
+    anchor.commit(tokens)
+    pending = core.create_kv_cache(None, tokens[:7], expected_prompt_length=20)
+    try:
+        assert pending.num_committed_tokens == 7
+        # The full shared block saves one destination; the partial block needs
+        # its own destination even though its source is owned by the anchor.
+        assert core.get_completion_demand([anchor, pending], [20, 8]) == [6]
+        # Without another owner in the query, the immutable partial source must
+        # also be charged while the suspended cache still holds that source.
+        assert core.get_completion_demand([pending], [8]) == [3]
+        if resume:
+            assert pending.resume(stream)
+            assert pending.resize(8)
+            _fill(core, pending, 29, start_token=7)
+            assert core.get_completion_demand([anchor, pending], [20, 8]) == [6]
+            actual = _read(core, pending).reshape(-1)
+            bytes_per_token = actual.size // 8
+            assert np.all(actual[: 7 * bytes_per_token] == 11)
+            assert np.all(actual[7 * bytes_per_token :] == 29)
+            assert np.all(_read(core, anchor) == 11)
+    finally:
+        pending.close()

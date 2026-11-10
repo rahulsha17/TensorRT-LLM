@@ -3381,7 +3381,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return 1 + guard_blocks, internal_ids
 
     def execution_completion_demand(
-        self, claims: Sequence[tuple[LlmRequest, _KVCache, int]]
+        self,
+        claims: Sequence[tuple[LlmRequest, _KVCache, int]],
+        *,
+        bounded_contexts: dict[int, int] | None = None,
     ) -> int:
         """Native-backed completion demand in conservative logical-block units.
 
@@ -3399,11 +3402,23 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.kv_cache_map.get(request.py_request_id) is not allocation:
                 raise RuntimeError("Completion allocation identity changed")
             caches.append(allocation)
-            capacities.append(
+            capacity = (
                 0
                 if request.is_finished is True
                 else request.prompt_len + max(request.max_new_tokens - 1, 0)
             )
+            if bounded_contexts is not None and request.py_request_id in bounded_contexts:
+                limit = bounded_contexts[request.py_request_id]
+                if type(limit) is not int or not 0 <= limit < request.prompt_len:
+                    raise ValueError("Bounded prefill must stop before prompt completion")
+                if allocation.capacity > limit:
+                    raise RuntimeError("Bounded prefill allocation exceeded its reservation")
+                capacity = 0 if request.is_finished is True else limit
+            capacities.append(capacity)
+        if bounded_contexts is not None and bounded_contexts.keys() - {
+            request.py_request_id for request, _, _ in claims
+        }:
+            raise RuntimeError("Bounded prefill reservation has no exact native owner")
         query = getattr(self.impl, "get_completion_demand", None)
         if not callable(query):
             raise RuntimeError("Shared completion budget requires rebuilt native KV demand API")
@@ -3449,6 +3464,70 @@ class KVCacheManagerV2(BaseResourceManager):
                 <= capacity_blocks
             )
             return accepted
+        finally:
+            if not accepted:
+                self.free_resources(request)
+
+    def execution_completion_try_bounded_prefill(
+        self,
+        claims: Sequence[tuple[LlmRequest, _KVCache, int]],
+        request: LlmRequest,
+        capacity_blocks: int,
+        chunk_unit: int,
+    ) -> int | None:
+        """Retain one prefix that fits beside existing full completion claims.
+
+        The returned absolute token limit excludes the final prompt token, so
+        this owner cannot enter generation before obtaining a completion claim.
+        Native accounting includes matched pages and partial-tail copy sources.
+        No existing owner's reservation or cache is changed.
+        """
+        if request.py_request_id in self.kv_cache_map:
+            raise RuntimeError("Unclaimed bounded prefill candidate already owns KV")
+        if self.conversation_manager is not None or not request.is_first_context_chunk:
+            raise ValueError("Bounded prefill admission requires a fresh text context")
+        allocation = self._create_kv_cache(
+            request.py_request_id,
+            request.lora_task_id,
+            self._context_reuse_tokens(request) if self.enable_block_reuse else None,
+            cache_salt=request.cache_salt,
+            max_reuse_tokens=request.execution_reuse_limit,
+            is_dummy=request.is_dummy,
+            enable_request_stats=request.return_perf_metrics,
+            expected_prompt_length=request.prompt_len,
+        )
+        if allocation is None:
+            return None
+        accepted = False
+        try:
+            allocation.cuda_stream = self._stream.cuda_stream
+            current_capacity = allocation.capacity
+            if current_capacity >= request.prompt_len:
+                return None
+            owners = [*claims, (request, allocation, 0)]
+            demand = self.execution_completion_demand(
+                owners, bounded_contexts={request.py_request_id: current_capacity}
+            )
+            if demand > capacity_blocks:
+                return None
+            # Each newly reserved block can add at most one logical block to
+            # the native union; all existing immutable-source charges remain.
+            blocks = (current_capacity + self.tokens_per_block - 1) // self.tokens_per_block
+            limit = min(
+                (blocks + capacity_blocks - demand) * self.tokens_per_block,
+                request.prompt_len - 1,
+            )
+            if limit - allocation.num_committed_tokens < chunk_unit:
+                return None
+            if (
+                self.execution_completion_demand(
+                    owners, bounded_contexts={request.py_request_id: limit}
+                )
+                > capacity_blocks
+            ):
+                return None
+            accepted = True
+            return limit
         finally:
             if not accepted:
                 self.free_resources(request)

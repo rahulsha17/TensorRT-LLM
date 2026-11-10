@@ -35,6 +35,7 @@ def manager():
         conversation_manager=None,
         _stream=SimpleNamespace(cuda_stream=123),
         enable_block_reuse=True,
+        tokens_per_block=4,
         _context_reuse_tokens=Mock(return_value=list(range(7))),
     )
     value.impl.get_life_cycle_pool_group_indices.return_value = [0, 0]
@@ -45,9 +46,12 @@ def manager():
     value.execution_completion_try_admit = MethodType(
         KVCacheManagerV2.execution_completion_try_admit, value
     )
+    value.execution_completion_try_bounded_prefill = MethodType(
+        KVCacheManagerV2.execution_completion_try_bounded_prefill, value
+    )
 
     def create(request_id, *args, **kwargs):
-        cache = SimpleNamespace()
+        cache = SimpleNamespace(capacity=0, num_committed_tokens=0)
         value.kv_cache_map[request_id] = cache
         return cache
 
@@ -145,3 +149,105 @@ def test_admission_rejects_nonfresh_or_conversation_requests(manager, conversati
     with pytest.raises(ValueError, match="fresh text context"):
         manager.execution_completion_try_admit([], req, 5)
     manager._create_kv_cache.assert_not_called()
+
+
+def test_bounded_demand_keeps_decoder_completion_and_exact_prefix_owner(manager):
+    decoder, prefill = request(2), request(1)
+    decoder_cache = SimpleNamespace(capacity=8)
+    prefill_cache = SimpleNamespace(capacity=3)
+    manager.kv_cache_map = {2: decoder_cache, 1: prefill_cache}
+    claims = [(decoder, decoder_cache, 3), (prefill, prefill_cache, 3)]
+    manager.execution_completion_demand(claims, bounded_contexts={1: 6})
+    manager.impl.get_completion_demand.assert_called_once_with(
+        [decoder_cache, prefill_cache], [12, 6]
+    )
+    prefill.is_finished = True
+    manager.execution_completion_demand(claims, bounded_contexts={1: 6})
+    assert manager.impl.get_completion_demand.call_args.args[1] == [12, 0]
+
+
+@pytest.mark.parametrize("limit", [-1, 7, True])
+def test_bounded_demand_rejects_limits_that_allow_unreserved_decode(manager, limit):
+    req, cache = request(), SimpleNamespace(capacity=0)
+    manager.kv_cache_map[1] = cache
+    with pytest.raises(ValueError, match="before prompt completion"):
+        manager.execution_completion_demand([(req, cache, 0)], bounded_contexts={1: limit})
+    manager.impl.get_completion_demand.assert_not_called()
+
+
+def test_bounded_demand_fails_closed_for_growth_or_missing_owner(manager):
+    req, cache = request(), SimpleNamespace(capacity=5)
+    manager.kv_cache_map[1] = cache
+    with pytest.raises(RuntimeError, match="exceeded its reservation"):
+        manager.execution_completion_demand([(req, cache, 0)], bounded_contexts={1: 4})
+    with pytest.raises(RuntimeError, match="no exact native owner"):
+        manager.execution_completion_demand([], bounded_contexts={1: 4})
+    manager.impl.get_completion_demand.assert_not_called()
+
+
+def test_bounded_admission_retains_only_unreserved_capacity(manager):
+    decoder = request(2)
+    old_cache = SimpleNamespace(capacity=8)
+    manager.kv_cache_map[2] = old_cache
+    req = request()
+    req.prompt_len = 21
+    manager.impl.get_completion_demand.side_effect = lambda caches, bounds: [
+        2 * sum((max(cache.capacity, bound) + 3) // 4 for cache, bound in zip(caches, bounds))
+    ]
+    limit = manager.execution_completion_try_bounded_prefill([(decoder, old_cache, 3)], req, 5, 4)
+    assert limit == 8
+    candidate = manager.kv_cache_map[1]
+    assert manager.impl.get_completion_demand.call_args.args == ([old_cache, candidate], [12, 8])
+    assert manager.kv_cache_map[2] is old_cache
+    assert candidate.cuda_stream == 123
+    manager.free_resources.assert_not_called()
+
+
+def test_bounded_partial_match_reserves_private_tail_and_native_copy_source(manager):
+    decoder, req = request(2), request()
+    req.prompt_len = 21
+    old_cache = SimpleNamespace(capacity=8)
+    manager.kv_cache_map[2] = old_cache
+
+    def create(*args, **kwargs):
+        cache = SimpleNamespace(capacity=6, num_committed_tokens=6)
+        manager.kv_cache_map[1] = cache
+        return cache
+
+    manager._create_kv_cache.side_effect = create
+    manager.impl.get_completion_demand.side_effect = lambda caches, bounds: [
+        2 * (1 + sum((max(cache.capacity, bound) + 3) // 4 for cache, bound in zip(caches, bounds)))
+    ]
+    assert (
+        manager.execution_completion_try_bounded_prefill([(decoder, old_cache, 3)], req, 8, 4) == 16
+    )
+    assert manager.impl.get_completion_demand.call_args.args[1] == [12, 16]
+    manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["no_slack", "copy_source", "exception"])
+def test_bounded_admission_releases_candidate_if_native_proof_fails(manager, failure):
+    req = request()
+    req.prompt_len = 21
+    old_cache = SimpleNamespace(capacity=8)
+    old = request(2)
+    manager.kv_cache_map[2] = old_cache
+    if failure == "exception":
+        manager.impl.get_completion_demand.side_effect = RuntimeError("native failure")
+        with pytest.raises(RuntimeError, match="native failure"):
+            manager.execution_completion_try_bounded_prefill([(old, old_cache, 3)], req, 5, 4)
+    else:
+        # A copy-source charge can consume the slack before any GPU work starts.
+        manager.impl.get_completion_demand.return_value = [10 if failure == "no_slack" else 12]
+        assert (
+            manager.execution_completion_try_bounded_prefill([(old, old_cache, 3)], req, 5, 4)
+            is None
+        )
+    assert manager.kv_cache_map == {2: old_cache}
+    manager.free_resources.assert_called_once_with(req)
+
+
+def test_bounded_admission_cannot_finish_prompt_without_completion_claim(manager):
+    req = request()
+    manager.impl.get_completion_demand.return_value = [0]
+    assert manager.execution_completion_try_bounded_prefill([], req, 100, 1) == req.prompt_len - 1
