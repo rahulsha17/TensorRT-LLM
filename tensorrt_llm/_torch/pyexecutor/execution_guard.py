@@ -191,6 +191,7 @@ class ExecutionDeviceGuard:
         self._context_owners: dict[int, _ContextOwner] = {}
         self._context_chunks: dict[int, list[_ContextChunk]] = {}
         self._isolated_requests: dict[int, _IsolatedRequest] = {}
+        self._failed_alignment_reservations: list[PrefixReservation] = []
         self._pending_releases: dict[int, LlmRequest] = {}
         self._release_error: Exception | None = None
         table.bind_device_publisher(self.device)
@@ -268,14 +269,16 @@ class ExecutionDeviceGuard:
                     ) from error
 
     def _reserve_isolated_prefix(self, alignment: AlignmentRequest) -> PrefixReservation | None:
-        """Acquire only canonical full blocks, leaving old GPU owners untouched.
+        """Acquire a canonical prefix before isolating obsolete GPU owners.
 
         The alignment lock is held here. Never reenter the authority table or
-        wait for CUDA: the mailbox takes the table lock before the alignment
-        lock. The observed revision has already closed old host authority.
+        wait for unfinished CUDA work: the mailbox takes the table lock before
+        the alignment lock. The observed revision has closed old host authority.
         """
         if not getattr(self, "_async_context", False) or self._rank_consensus is not None:
             return None
+        if getattr(self, "_failed_alignment_reservations", []):
+            raise AlignmentSafetyError("isolated ALIGN cleanup is unknown")
         old = alignment.revision.expected_version
         sources = []
         for use in self._uses.values():
@@ -303,6 +306,28 @@ class ExecutionDeviceGuard:
         if reservation is None:
             return None
         try:
+            if reservation.num_tokens == 0 and self._has_unpublished_matching_prefix(
+                alignment, sources
+            ):
+                # A zero match can precede publication of accepted source KV.
+                # Do not let the successor allocate a permanently empty match
+                # while that prefix is about to become available. Readiness
+                # covers every latest use and receipt, not merely the forward
+                # whose frontier is already accepted. CPU result consumption
+                # and native retirement may still remain after this point.
+                empty_reservation = reservation
+                reservation = None
+                try:
+                    empty_reservation.close()
+                except Exception as error:
+                    self._failed_alignment_reservations.append(empty_reservation)
+                    raise AlignmentSafetyError("isolated ALIGN cleanup is unknown") from error
+                if not self._prefix_preparation_ready(alignment):
+                    return None
+                self._prepare_prefix(alignment)
+                reservation = self._alignment_adapter.reserve_isolated(alignment.revised_input)
+                if reservation is None:
+                    return None
             tracker = self.table.drain_tracker
             assert tracker is not None
             for request, cache in sources:
@@ -321,10 +346,54 @@ class ExecutionDeviceGuard:
             return reservation
         except Exception as error:
             try:
-                reservation.close()
+                if reservation is not None:
+                    reservation.close()
             except Exception as cleanup_error:
                 raise AlignmentSafetyError("isolated ALIGN cleanup is unknown") from cleanup_error
             raise AlignmentSafetyError("source isolation failed; restart required") from error
+
+    def _has_unpublished_matching_prefix(
+        self, alignment: AlignmentRequest, sources: list[tuple[LlmRequest, "_KVCache"]]
+    ) -> bool:
+        """Whether an accepted text prefix can improve an empty canonical match.
+
+        This is a scheduling hint, not reuse authority. Native reservation must
+        acquire the published pages after all readers complete. Unaccepted
+        receipt progress and speculative cursors never provide this hint.
+        """
+        manager = self._kv_manager
+        if not manager.enable_block_reuse or not manager._can_publish_block_reuse:
+            return False
+        revised = alignment.revised_input
+        block_size = manager.tokens_per_block
+        for request, cache in sources:
+            if (
+                not cache.is_commit_allowed
+                or request.is_dummy_request
+                or getattr(request, "py_multimodal_data", None) is not None
+                or request.cache_salt != revised.cache_salt
+                or request.lora_task_id != revised.lora_task_id
+            ):
+                continue
+            # Decode publication is whole-block only. A completed context
+            # receipt may additionally authorize a partial prompt boundary.
+            frontier = self._kv_frontiers.get(id(request), 0) // block_size * block_size
+            owner = self._current_context_owner(request)
+            if owner is not None:
+                frontier = max(frontier, owner.frontier)
+            limit = min(frontier, revised.reuse_limit)
+            if limit <= cache.num_committed_tokens or limit < block_size:
+                continue
+            common = 0
+            for old_token, new_token in zip(
+                request.get_tokens(0)[:limit], revised.input_token_ids[:limit]
+            ):
+                if old_token != new_token:
+                    break
+                common += 1
+            if common >= block_size and common > cache.num_committed_tokens:
+                return True
+        return False
 
     @property
     def pending_releases(self) -> int:

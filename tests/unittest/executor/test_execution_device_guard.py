@@ -362,6 +362,7 @@ def guard(monkeypatch):
     result.device.submission.side_effect = lambda *, capture_possible=True: nullcontext()
     result._uses = {}
     result._kv_frontiers = {}
+    result._failed_alignment_reservations = []
     result._early_exit_enabled = True
     result._native_kv_guards = False
     result._v1_manager = None
@@ -2067,6 +2068,184 @@ def test_isolated_alignment_resumes_while_old_gpu_work_and_cleanup_remain(guard)
     assert request.py_request_id not in executor.result_wait_queues
     assert guard.pending_releases == 0
     assert guard.table.poll_fence(fence) is not None
+
+
+def _unpublished_decode_handoff(guard):
+    request, cache, alignment = _isolated_handoff(guard)
+    request.is_dummy_request = False
+    request.prompt_len = request.context_current_position = 2
+    request.context_remaining_length = 0
+    request.num_tokens = 3
+    request.get_tokens = lambda beam: [1, 2, 4]
+    request.cache_salt = request.lora_task_id = None
+    cache.is_commit_allowed = True
+    cache.num_committed_tokens = 0
+    guard._kv_frontiers[id(request)] = 2
+    guard._kv_manager.tokens_per_block = 2
+    guard._kv_manager.enable_block_reuse = True
+    guard._kv_manager._can_publish_block_reuse = True
+    guard.table.alignment_state._prepare_ready = guard._prefix_preparation_ready
+    reservations = []
+
+    def reserve(revised):
+        reservation = Mock(num_tokens=cache.num_committed_tokens)
+        reservations.append(reservation)
+        return reservation
+
+    def publish(req, frontier):
+        assert req is request
+        assert guard._uses[id(request)].event.query()
+        assert frontier == 2
+        cache.num_committed_tokens = frontier
+
+    guard._alignment_adapter.reserve_isolated.side_effect = reserve
+    guard._kv_manager.preserve_execution_prefix.side_effect = publish
+    return request, cache, alignment, reservations
+
+
+def test_empty_isolated_match_publishes_accepted_decode_prefix_before_successor(guard):
+    from tensorrt_llm.execution_fence import FenceRequest
+
+    request, cache, alignment, reservations = _unpublished_decode_handoff(guard)
+    # The previous sample accepted prompt KV, but a newer decode still reads
+    # its private allocation. An empty canonical lookup must not become the
+    # successor's permanent first-context match.
+    guard.process_alignment()
+    assert guard.table.poll_alignment(alignment) is None
+    reservations[0].close.assert_called_once()
+    guard.device.wait_event.assert_not_called()
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+    assert not request.is_finished
+
+    guard._uses[id(request)].event.query.return_value = True
+    guard.process_alignment()
+    receipt = guard.table.poll_alignment(alignment)
+    assert receipt.reusable_prefix_length == 2
+    assert guard.table.alignment_state.has_isolated_prefix(alignment)
+    assert guard.table.poll_fence(FenceRequest("session", alignment.revision)) is None
+    assert guard._kv_manager.kv_cache_map[request.py_request_id] is cache
+    guard._kv_manager.preserve_execution_prefix.assert_called_once_with(request, 2)
+    reservations[-1].close.assert_not_called()
+
+    # RESUME does not wait for the retained old sampler result or cleanup.
+    guard.table.apply(VersionUpdate("session", 3, NEXT, alignment, resume=receipt))
+    assert request.is_finished
+    assert guard.defer_release(request)
+    assert guard.pending_releases == 1
+
+
+@pytest.mark.parametrize(
+    "unavailable", ["cold", "tokens", "salt", "limit", "dummy", "multimodal", "frozen"]
+)
+def test_empty_isolated_match_without_publishable_benefit_stays_nonblocking(guard, unavailable):
+    request, cache, alignment, reservations = _unpublished_decode_handoff(guard)
+    if unavailable == "cold":
+        guard._kv_frontiers[id(request)] = 0
+    elif unavailable == "tokens":
+        request.get_tokens = lambda beam: [9, 2, 4]
+    elif unavailable == "salt":
+        request.cache_salt = "other-namespace"
+    elif unavailable == "limit":
+        alignment = replace(
+            alignment, revised_input=replace(alignment.revised_input, max_reuse_tokens=1)
+        )
+    elif unavailable == "dummy":
+        request.is_dummy_request = True
+    elif unavailable == "multimodal":
+        request.py_multimodal_data = {}
+    else:
+        cache.is_commit_allowed = False
+    reservation = guard._reserve_isolated_prefix(alignment)
+    assert reservation.num_tokens == 0
+    assert reservation is reservations[-1]
+    reservation.close.assert_not_called()
+    guard.device.wait_event.assert_not_called()
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+
+
+def test_empty_match_waits_for_latest_sampling_use_not_an_earlier_decode(guard):
+    request, _, alignment, _ = _unpublished_decode_handoff(guard)
+    old_event = guard._uses[id(request)].event
+    old_event.query.return_value = True
+    with guard.sampling(_batch(request)):
+        pass
+    latest = guard._uses[id(request)].event
+    latest.query.return_value = False
+    assert latest is not old_event
+    guard.process_alignment()
+    assert guard.table.poll_alignment(alignment) is None
+    guard.device.wait_event.assert_not_called()
+    latest.query.return_value = True
+    guard.process_alignment()
+    assert guard.table.poll_alignment(alignment).reusable_prefix_length == 2
+    guard.device.wait_event.assert_called_once_with(latest)
+
+
+def test_empty_match_defers_while_context_verdict_is_pending(guard):
+    request, _, alignment, _ = _unpublished_decode_handoff(guard)
+    guard._uses[id(request)].event.query.return_value = True
+    ticket = Mock()
+    ticket.query.return_value = False
+    guard._context_chunks = {id(request): [SimpleNamespace(ticket=ticket)]}
+    guard.process_alignment()
+    assert guard.table.poll_alignment(alignment) is None
+    ticket.wait.assert_not_called()
+    guard.device.wait_event.assert_not_called()
+    guard._kv_manager.preserve_execution_prefix.assert_not_called()
+
+
+@pytest.mark.parametrize("fault", ["none", "identity"])
+def test_empty_match_publication_cannot_accept_a_receipt_without_host_progress(guard, fault):
+    from tensorrt_llm._torch.pyexecutor.execution_guard import _ContextChunk, _ContextOwner
+    from tensorrt_llm.execution_alignment import AlignmentSafetyError
+
+    request, cache, alignment, _ = _unpublished_decode_handoff(guard)
+    request.prompt_len = 4
+    request.context_remaining_length = 2
+    request.get_tokens = lambda beam: [1, 2, 4, 5]
+    owner = _ContextOwner(request, request.py_request_id, VERSION, cache, 2)
+    ticket = Mock(versions=(VERSION if fault == "none" else NEXT,))
+    ticket.query.return_value = True
+    ticket.wait.return_value = [True]
+    guard._context_owners = {id(request): owner}
+    guard._context_chunks = {id(request): [_ContextChunk(owner, 2, 4, ticket, 0)]}
+    guard._uses[id(request)].event.query.return_value = True
+    if fault == "identity":
+        with pytest.raises(AlignmentSafetyError):
+            guard.process_alignment()
+        guard._kv_manager.preserve_execution_context.assert_not_called()
+        guard._kv_manager.preserve_execution_prefix.assert_not_called()
+        return
+    guard.process_alignment()
+    assert guard.table.poll_alignment(alignment).reusable_prefix_length == 2
+    assert owner.frontier == 2
+    guard._kv_manager.preserve_execution_context.assert_called_once_with(request, 2, cache)
+    guard._kv_manager.preserve_execution_prefix.assert_called_once_with(request, 2)
+
+
+@pytest.mark.parametrize("failure", ["publish", "close"])
+def test_empty_match_publication_and_cleanup_fail_closed(guard, failure):
+    from tensorrt_llm.execution_alignment import AlignmentSafetyError
+
+    request, cache, alignment, reservations = _unpublished_decode_handoff(guard)
+    guard._uses[id(request)].event.query.return_value = True
+    if failure == "publish":
+        guard._kv_manager.preserve_execution_prefix.side_effect = RuntimeError("commit failed")
+    else:
+        reservation = Mock(num_tokens=0)
+        reservation.close.side_effect = RuntimeError("close failed")
+        guard._alignment_adapter.reserve_isolated.side_effect = None
+        guard._alignment_adapter.reserve_isolated.return_value = reservation
+    with pytest.raises(AlignmentSafetyError):
+        guard.process_alignment()
+    assert guard._kv_manager.kv_cache_map[request.py_request_id] is cache
+    assert not guard.table.drain_tracker.isolated(VERSION)
+    guard._kv_manager.stop_request_committing.assert_not_called()
+    if failure == "close":
+        reservation.close.assert_called_once()
+        assert guard._failed_alignment_reservations == [reservation]
+    else:
+        reservations[0].close.assert_called_once()
 
 
 @pytest.mark.parametrize("invalid", ["event", "allocation", "native_cleanup"])
