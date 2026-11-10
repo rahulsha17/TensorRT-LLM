@@ -305,29 +305,78 @@ class ExecutionDeviceGuard:
         reservation = self._alignment_adapter.reserve_isolated(alignment.revised_input)
         if reservation is None:
             return None
+        improved = None
         try:
-            if reservation.num_tokens == 0 and self._has_unpublished_matching_prefix(
-                alignment, sources
-            ):
-                # A zero match can precede publication of accepted source KV.
-                # Do not let the successor allocate a permanently empty match
-                # while that prefix is about to become available. Readiness
-                # covers every latest use and receipt, not merely the forward
-                # whose frontier is already accepted. CPU result consumption
-                # and native retirement may still remain after this point.
+            matching_sources = self._unpublished_matching_prefix_sources(
+                alignment, sources, reservation.num_tokens
+            )
+            if reservation.num_tokens == 0 and matching_sources:
+                # An empty lookup must not become the successor's permanent
+                # first-context match while accepted KV awaits publication.
+                # Check latest uses and receipts; CPU consumption and native
+                # retirement may still remain after publication.
                 empty_reservation = reservation
                 reservation = None
-                try:
-                    empty_reservation.close()
-                except Exception as error:
-                    self._failed_alignment_reservations.append(empty_reservation)
-                    raise AlignmentSafetyError("isolated ALIGN cleanup is unknown") from error
+                self._close_isolated_reservation(empty_reservation)
                 if not self._prefix_preparation_ready(alignment):
                     return None
                 self._prepare_prefix(alignment)
                 reservation = self._alignment_adapter.reserve_isolated(alignment.revised_input)
                 if reservation is None:
                     return None
+            elif matching_sources:
+                ready_sources = [
+                    (request, count)
+                    for request, _, count in matching_sources
+                    if self._prefix_source_ready(request)
+                ]
+                best_ready = max((count for _, count in ready_sources), default=0)
+                best_available = max(count for _, _, count in matching_sources)
+                if best_ready < best_available and any(
+                    cache.num_committed_tokens >= reservation.num_tokens
+                    for _, cache, _ in matching_sources
+                ):
+                    # A matching source still owns the entire acquired floor.
+                    # Leave it live and retry after its latest GPU use, without
+                    # latching a shorter successor match or retaining a second
+                    # hold. releasing_owner acquires ALIGN before source free.
+                    held_reservation = reservation
+                    reservation = None
+                    self._close_isolated_reservation(held_reservation)
+                    return None
+                for request, _ in ready_sources:
+                    self._settle_prefix(request)
+                if ready_sources:
+                    floor = reservation.num_tokens
+                    if any(cache.num_committed_tokens >= floor for _, cache, _ in matching_sources):
+                        # The source independently retains the floor. Return
+                        # temporary reservation credit before reacquiring, so
+                        # the same prefix is not charged twice under pressure.
+                        previous = reservation
+                        reservation = None
+                        self._close_isolated_reservation(previous)
+                        reservation = self._alignment_adapter.reserve_isolated(
+                            alignment.revised_input
+                        )
+                        if reservation is None:
+                            return None
+                        if reservation.num_tokens < floor:
+                            raise AlignmentSafetyError("published source lost its retained prefix")
+                    else:
+                        # A floor owned only by ALIGN cannot be released until
+                        # a strictly better native reservation exists. Keep it
+                        # if capacity prevents the opportunistic upgrade.
+                        improved = self._alignment_adapter.reserve_isolated(alignment.revised_input)
+                        if improved is not None:
+                            if improved.num_tokens > floor:
+                                previous = reservation
+                                reservation = improved
+                                improved = None
+                                self._close_isolated_reservation(previous)
+                            else:
+                                discarded = improved
+                                improved = None
+                                self._close_isolated_reservation(discarded)
             tracker = self.table.drain_tracker
             assert tracker is not None
             for request, cache in sources:
@@ -345,17 +394,42 @@ class ExecutionDeviceGuard:
                 tracker.isolate(request.py_request_id, request.py_execution_version, owner)
             return reservation
         except Exception as error:
-            try:
-                if reservation is not None:
-                    reservation.close()
-            except Exception as cleanup_error:
+            cleanup_error = None
+            for owned in (improved, reservation):
+                if owned is not None:
+                    try:
+                        self._close_isolated_reservation(owned)
+                    except AlignmentSafetyError as failure:
+                        cleanup_error = failure
+            if cleanup_error is not None:
                 raise AlignmentSafetyError("isolated ALIGN cleanup is unknown") from cleanup_error
             raise AlignmentSafetyError("source isolation failed; restart required") from error
 
-    def _has_unpublished_matching_prefix(
-        self, alignment: AlignmentRequest, sources: list[tuple[LlmRequest, "_KVCache"]]
-    ) -> bool:
-        """Whether an accepted text prefix can improve an empty canonical match.
+    def _close_isolated_reservation(self, reservation: PrefixReservation) -> None:
+        try:
+            reservation.close()
+        except Exception as error:
+            # Closing may already have changed native ownership. Retain the
+            # handle and poison further acquisition; never retry its close.
+            self._failed_alignment_reservations.append(reservation)
+            raise AlignmentSafetyError("isolated ALIGN cleanup is unknown") from error
+
+    def _prefix_source_ready(self, request: LlmRequest) -> bool:
+        use = self._uses.get(id(request))
+        if use is None or use.request is not request or use.event is None:
+            raise AlignmentSafetyError("source GPU completion is unknown")
+        return use.event.query() and all(
+            chunk.ticket.query()
+            for chunk in getattr(self, "_context_chunks", {}).get(id(request), [])
+        )
+
+    def _unpublished_matching_prefix_sources(
+        self,
+        alignment: AlignmentRequest,
+        sources: list[tuple[LlmRequest, "_KVCache"]],
+        matched_tokens: int,
+    ) -> list[tuple[LlmRequest, "_KVCache", int]]:
+        """Find accepted text prefixes that can improve the acquired match.
 
         This is a scheduling hint, not reuse authority. Native reservation must
         acquire the published pages after all readers complete. Unaccepted
@@ -363,9 +437,12 @@ class ExecutionDeviceGuard:
         """
         manager = self._kv_manager
         if not manager.enable_block_reuse or not manager._can_publish_block_reuse:
-            return False
+            return []
         revised = alignment.revised_input
+        if matched_tokens >= revised.reuse_limit:
+            return []
         block_size = manager.tokens_per_block
+        matching = []
         for request, cache in sources:
             if (
                 not cache.is_commit_allowed
@@ -382,7 +459,8 @@ class ExecutionDeviceGuard:
             if owner is not None:
                 frontier = max(frontier, owner.frontier)
             limit = min(frontier, revised.reuse_limit)
-            if limit <= cache.num_committed_tokens or limit < block_size:
+            floor = max(cache.num_committed_tokens, matched_tokens)
+            if limit <= floor or limit < block_size:
                 continue
             common = 0
             for old_token, new_token in zip(
@@ -391,9 +469,9 @@ class ExecutionDeviceGuard:
                 if old_token != new_token:
                     break
                 common += 1
-            if common >= block_size and common > cache.num_committed_tokens:
-                return True
-        return False
+            if common >= block_size and common > floor:
+                matching.append((request, cache, common))
+        return matching
 
     @property
     def pending_releases(self) -> int:
