@@ -293,6 +293,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._shared_completion_budget = False
         self._bounded_prefill = False
         self._bounded_contexts: dict[int, int] = {}
+        self._bounded_prefill_bypassed: set[int] = set()
+        self._bounded_prefill_last_attempt: LlmRequest | None = None
         self._bounded_prefill_generators: set[int] = set()
         self._completion_deferred_contexts: dict[int, LlmRequest] = {}
         self._revision_policy: RevisionSchedulingPolicy | None = None
@@ -317,6 +319,25 @@ class KVCacheV2Scheduler(RequestScheduler):
             bounded_prefill_tokens=0,
             bounded_prefill_promotions=0,
             bounded_prefill_waits=0,
+            bounded_prefill_full_bypasses=0,
+            bounded_prefill_bypass_capacity=0,
+            bounded_prefill_bypass_promotion=0,
+            bounded_prefill_bypass_fairness=0,
+            bounded_prefill_blocked_partial=0,
+            bounded_prefill_blocked_no_decoder=0,
+            bounded_prefill_blocked_batch=0,
+            bounded_prefill_blocked_recovery=0,
+            bounded_prefill_blocked_cleanup=0,
+            bounded_prefill_blocked_preemption=0,
+            bounded_prefill_blocked_budget=0,
+            bounded_prefill_blocked_candidate=0,
+            bounded_prefill_blocked_residency=0,
+            bounded_prefill_blocked_anchor=0,
+            bounded_prefill_no_slot=0,
+            bounded_prefill_complete_match=0,
+            bounded_prefill_matched_capacity=0,
+            bounded_prefill_minimum_chunk=0,
+            bounded_prefill_final_capacity=0,
         )
 
     def set_execution_suspend_guard(self, guard: Callable[[LlmRequest], None]) -> None:
@@ -528,6 +549,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             for key, limit in self._bounded_contexts.items()
             if key in self._completion_claims
         }
+        self._bounded_prefill_bypassed.intersection_update(self._bounded_contexts)
         for req in requests:
             cache = caches.get(req.py_request_id)
             if (
@@ -595,10 +617,32 @@ class KVCacheV2Scheduler(RequestScheduler):
             return True
         if request_id in self._completion_claims:
             return True
+        demand = self._completion_blocks(req)
         if self._bounded_contexts:
+            # Keep promotion ahead of fresh work when the full promise fits.
+            # Otherwise permit one independently completing context alongside
+            # the exact partial reservation. A bounded bypass count prevents
+            # a stream of small contexts from postponing promotion forever.
+            if self._bounded_prefill_bypassed:
+                self._revision_metrics["bounded_prefill_bypass_fairness"] += 1
+            elif (
+                self.kv_cache_manager.execution_completion_demand(
+                    list(self._completion_claims.values())
+                )
+                <= self._completion_budget_blocks
+            ):
+                self._revision_metrics["bounded_prefill_bypass_promotion"] += 1
+            elif self.kv_cache_manager.execution_completion_try_admit(
+                list(self._completion_claims.values()),
+                req,
+                self._completion_budget_blocks,
+                bounded_contexts=self._bounded_contexts,
+            ):
+                return True
+            else:
+                self._revision_metrics["bounded_prefill_bypass_capacity"] += 1
             self._revision_metrics["completion_deferrals"] += 1
             return False
-        demand = self._completion_blocks(req)
         if self._shared_completion_budget:
             bounded_retry = (
                 bool(self._bounded_prefill_generators)
@@ -618,6 +662,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req,
                     self._completion_budget_blocks,
                     self.chunk_unit_size,
+                    rejection_counters=self._revision_metrics,
                 )
                 if limit is not None:
                     self._bounded_contexts[request_id] = limit
@@ -630,29 +675,42 @@ class KVCacheV2Scheduler(RequestScheduler):
         )
 
     def _can_start_bounded_prefill(self, req: LlmRequest) -> bool:
-        """Use spare capacity only beside decoders with guaranteed completion."""
-        return (
-            self._bounded_prefill
-            and bool(self._bounded_prefill_generators)
-            and bool(self._completion_claims)
-            and req.is_first_context_chunk
-            and req.py_execution_version is not None
-            and req.lora_task_id is None
-            and req.py_multimodal_data is None
-            and not req.py_execution_recovery_pending
-            and req.py_execution_recovery_tokens == 0
-            and not self.kv_cache_manager.has_execution_residency
-            and all(
-                owner.is_finished is not True
-                and owner.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
-                and allocation.is_active is True
-                for owner, allocation, _ in self._completion_claims.values()
-            )
-        )
+        return self._bounded_prefill_rejection(req) is None
+
+    def _bounded_prefill_rejection(self, req: LlmRequest) -> str | None:
+        """Explain why a candidate cannot borrow spare completion capacity."""
+        if not self._bounded_prefill or not self._bounded_prefill_generators:
+            return "bounded_prefill_blocked_no_decoder"
+        if (
+            not req.is_first_context_chunk
+            or req.py_execution_version is None
+            or req.lora_task_id is not None
+            or req.py_multimodal_data is not None
+        ):
+            return "bounded_prefill_blocked_candidate"
+        if req.py_execution_recovery_pending or req.py_execution_recovery_tokens != 0:
+            return "bounded_prefill_blocked_recovery"
+        if self.kv_cache_manager.has_execution_residency:
+            return "bounded_prefill_blocked_residency"
+        if not self._completion_claims or any(
+            owner.is_finished is True
+            or owner.state_value != LlmRequestState.GENERATION_IN_PROGRESS.value
+            or allocation.is_active is not True
+            for owner, allocation, _ in self._completion_claims.values()
+        ):
+            return "bounded_prefill_blocked_anchor"
+        return None
 
     def _claim_context_completion(self, req: LlmRequest) -> None:
         if self._completion_budget_blocks is not None:
             cache = self.kv_cache_manager.kv_cache_map[req.py_request_id]
+            if (
+                req.py_request_id not in self._completion_claims
+                and self._bounded_contexts
+                and req.py_request_id not in self._bounded_contexts
+            ):
+                self._bounded_prefill_bypassed.update(self._bounded_contexts)
+                self._revision_metrics["bounded_prefill_full_bypasses"] += 1
             self._completion_claims[req.py_request_id] = (req, cache, self._completion_blocks(req))
 
     def set_async_transfer_manager(self, mgr) -> None:
@@ -721,6 +779,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
+        if self._bounded_prefill_last_attempt is not None and not any(
+            req is self._bounded_prefill_last_attempt for req in requests_list
+        ):
+            self._bounded_prefill_last_attempt = None
         self._refresh_completion_claims(requests_list)
         selected, cohort_tokens = (
             self._revision_selection(requests_list, inflight_request_ids)
@@ -1123,44 +1185,55 @@ class KVCacheV2Scheduler(RequestScheduler):
                 fresh_context_admitted |= shared.is_first_context_chunk
                 self._record_context_admission(shared, recovery_ids, resident_recovery_ids)
 
-        if (
-            self._bounded_prefill
-            and not self._bounded_contexts
-            and scheduled_gen
-            and not (
-                scheduled_ctx
-                or scheduled_encoder
-                or recovery_ids
-                or recovery_prefill_ids
-                or pending_completion
-                or blocked_generation
-                or evicted
-                or recompute_paused
-            )
-            and not budget.requests_full
-            and self._has_context_chunk_budget(budget)
-        ):
-            # Preserve every context that fits the normal completion rule
-            # before lending spare capacity to an otherwise blocked prefix.
-            # Retry at most one candidate; its full native match was already
-            # rejected during the ordinary scan and need not be probed again.
-            self._bounded_prefill_generators = {req.py_request_id for req in scheduled_gen}
-            try:
-                for req in self._completion_deferred_contexts.values():
-                    if not self._can_start_bounded_prefill(req):
-                        continue
-                    action, tokens, chunking_flag = self._try_schedule_context(
-                        req, budget, preempt_for_pages
-                    )
-                    if action is ScheduleAction.SCHEDULED:
-                        scheduled_ctx.append(req)
-                        budget.commit(req, tokens, 0)
-                        has_chunking |= chunking_flag
-                        fresh_context_admitted = True
-                        self._record_context_admission(req, recovery_ids, resident_recovery_ids)
-                    break
-            finally:
-                self._bounded_prefill_generators = set()
+        bounded_block = None
+        if not self._completion_deferred_contexts:
+            self._bounded_prefill_last_attempt = None
+        if self._bounded_prefill and self._completion_deferred_contexts:
+            if self._bounded_contexts:
+                bounded_block = "bounded_prefill_blocked_partial"
+            elif pending_completion:
+                bounded_block = "bounded_prefill_blocked_cleanup"
+            elif recovery_ids or recovery_prefill_ids:
+                bounded_block = "bounded_prefill_blocked_recovery"
+            elif blocked_generation or evicted or recompute_paused:
+                bounded_block = "bounded_prefill_blocked_preemption"
+            elif not scheduled_gen:
+                bounded_block = "bounded_prefill_blocked_no_decoder"
+            elif scheduled_ctx or scheduled_encoder:
+                bounded_block = "bounded_prefill_blocked_batch"
+            elif budget.requests_full or not self._has_context_chunk_budget(budget):
+                bounded_block = "bounded_prefill_blocked_budget"
+            if bounded_block is not None:
+                self._revision_metrics[bounded_block] += 1
+            else:
+                # Full-completion candidates have already had priority. Probe
+                # one partial candidate per pass, rotating past a failed match
+                # so a large first match cannot starve a later feasible one.
+                candidates = list(self._completion_deferred_contexts.values())
+                for index, req in enumerate(candidates):
+                    if req is self._bounded_prefill_last_attempt:
+                        candidates = candidates[index + 1 :] + candidates[: index + 1]
+                        break
+                self._bounded_prefill_generators = {req.py_request_id for req in scheduled_gen}
+                try:
+                    for req in candidates:
+                        reason = self._bounded_prefill_rejection(req)
+                        if reason is not None:
+                            self._revision_metrics[reason] += 1
+                            continue
+                        self._bounded_prefill_last_attempt = req
+                        action, tokens, chunking_flag = self._try_schedule_context(
+                            req, budget, preempt_for_pages
+                        )
+                        if action is ScheduleAction.SCHEDULED:
+                            scheduled_ctx.append(req)
+                            budget.commit(req, tokens, 0)
+                            has_chunking |= chunking_flag
+                            fresh_context_admitted = True
+                            self._record_context_admission(req, recovery_ids, resident_recovery_ids)
+                        break
+                finally:
+                    self._bounded_prefill_generators = set()
 
         if (
             blocked_generation is not None
@@ -1642,9 +1715,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         first_chunk = req.is_first_context_chunk
         if not self._can_complete_context(req):
             return ScheduleAction.SKIP, 0, False
-        if req.py_request_id in self._bounded_contexts:
-            # Bounded work may consume spare capacity, never reclaim another
-            # owner's pages when physical migration cannot satisfy admission.
+        if self._bounded_contexts:
+            # Neither a bounded prefix nor its full-completion bypass may
+            # reclaim another owner's pages when physical migration fails.
             def preempt_for_pages(_: LlmRequest) -> bool:
                 return False
 

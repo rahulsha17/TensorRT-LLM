@@ -1124,14 +1124,14 @@ class TestBoundedCompletionPrefill:
 
         manager.execution_completion_demand.side_effect = demand
 
-        def admit(claims, req, capacity):
+        def admit(claims, req, capacity, *, bounded_contexts=None):
             candidate = Mock(capacity=0, num_committed_tokens=0, is_active=False)
-            if demand([*claims, (req, candidate, 0)]) > capacity:
+            if demand([*claims, (req, candidate, 0)], bounded_contexts=bounded_contexts) > capacity:
                 return False
             manager.kv_cache_map[req.py_request_id] = candidate
             return True
 
-        def bounded(claims, req, capacity, chunk_unit):
+        def bounded(claims, req, capacity, chunk_unit, **kwargs):
             assert capacity == 8 and chunk_unit == 64
             manager.kv_cache_map[req.py_request_id] = Mock(
                 capacity=0, num_committed_tokens=0, is_active=False
@@ -1227,7 +1227,7 @@ class TestBoundedCompletionPrefill:
         other.context_remaining_length = 384
         other.max_new_tokens = 1
         other.is_finished = False
-        manager.execution_completion_try_bounded_prefill.side_effect = lambda *args: None
+        manager.execution_completion_try_bounded_prefill.side_effect = lambda *args, **kwargs: None
         for iteration in (1, 2):
             result = scheduler.schedule_request([decoder, prefill, other], set())
             assert result.generation_requests == [decoder]
@@ -1236,7 +1236,7 @@ class TestBoundedCompletionPrefill:
             assert manager.execution_completion_try_bounded_prefill.call_count == iteration
             assert set(manager.kv_cache_map) == {1}
 
-    def test_only_one_partial_owner_and_no_overtaking_before_promotion(self, monkeypatch):
+    def test_promotable_partial_keeps_priority_over_fresh_context(self, monkeypatch):
         manager, scheduler, decoder, prefill = self.setup(monkeypatch)
         other = _revision_request(3)
         other.prompt_len = 384
@@ -1251,6 +1251,129 @@ class TestBoundedCompletionPrefill:
         assert result.context_requests == [prefill]
         assert 3 not in manager.kv_cache_map
         assert scheduler._bounded_contexts == {}
+
+    def test_full_bypass_retains_partial_and_retired_owner_until_cleanup(self, monkeypatch):
+        manager, scheduler, decoder, prefill = self.setup(monkeypatch)
+        manager.kv_cache_map[1].capacity = 256
+        scheduler.schedule_request([decoder, prefill], set())
+        _advance_revision_context(prefill)
+        decoder.is_finished = True
+        decoder.state_value = GEN_TO_COMPLETE
+        scheduler._refresh_completion_claims([prefill])
+        short = _completion_request(3, 64)
+        short.is_finished = False
+
+        assert scheduler._can_complete_context(short)
+        admission = manager.execution_completion_try_admit.call_args
+        assert admission.kwargs == {"bounded_contexts": {2: 128}}
+        assert {claim[0].py_request_id for claim in admission.args[0]} == {1, 2}
+        scheduler._claim_context_completion(short)
+        assert scheduler._completion_demand() == 7
+        assert scheduler._bounded_contexts == {2: 128}
+        assert manager.kv_cache_map[1].capacity == 256
+        manager.preempt_request.assert_not_called()
+        manager.suspend_request.assert_not_called()
+
+        # Even after the bypass finishes, a continuing stream of short requests
+        # cannot repeatedly overtake the older partial owner.
+        del manager.kv_cache_map[3]
+        scheduler._refresh_completion_claims([prefill])
+        next_short = _completion_request(4, 64)
+        assert not scheduler._can_complete_context(next_short)
+        assert 4 not in manager.kv_cache_map
+        assert not scheduler._can_complete_context(prefill)
+        del manager.kv_cache_map[1]
+        scheduler._refresh_completion_claims([prefill])
+        assert scheduler._can_complete_context(prefill)
+        assert scheduler._bounded_contexts == {}
+        counters = scheduler.execution_scheduling_snapshot()
+        assert counters["bounded_prefill_full_bypasses"] == 1
+        assert counters["bounded_prefill_bypass_fairness"] == 1
+
+    def test_bypass_cannot_spend_partial_or_decoder_reservations(self, monkeypatch):
+        manager, scheduler, decoder, prefill = self.setup(monkeypatch)
+        scheduler.schedule_request([decoder, prefill], set())
+        _advance_revision_context(prefill)
+        short = _completion_request(3, 64)
+        assert not scheduler._can_complete_context(short)
+        assert set(manager.kv_cache_map) == {1, 2}
+        assert scheduler._completion_demand() == 8
+        assert scheduler._bounded_prefill_bypassed == set()
+        assert scheduler.execution_scheduling_snapshot()["bounded_prefill_bypass_capacity"] == 1
+
+    def test_failed_bypass_preparation_does_not_spend_fairness_or_preempt(self, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
+            BudgetTracker,
+            ScheduleAction,
+        )
+
+        manager, scheduler, decoder, prefill = self.setup(monkeypatch)
+        manager.kv_cache_map[1].capacity = 256
+        scheduler.schedule_request([decoder, prefill], set())
+        _advance_revision_context(prefill)
+        decoder.is_finished = True
+        decoder.state_value = GEN_TO_COMPLETE
+        scheduler._refresh_completion_claims([prefill])
+        short = _completion_request(3, 64)
+        manager.prepare_context.side_effect = lambda *args, **kwargs: False
+        budget = BudgetTracker(256, 8, None)
+        preempt = Mock(return_value=True)
+        result = scheduler._try_schedule_context(short, budget, preempt)
+        assert result[0] is not ScheduleAction.SCHEDULED
+        assert scheduler._bounded_prefill_bypassed == set()
+        assert set(manager.kv_cache_map) == {1, 2}
+        assert scheduler._bounded_contexts == {2: 128}
+        preempt.assert_not_called()
+
+    def test_failed_first_bounded_candidate_does_not_starve_later_match(self, monkeypatch):
+        manager, scheduler, decoder, prefill = self.setup(monkeypatch)
+        later = _revision_request(3)
+        later.prompt_len = later.context_remaining_length = 384
+        later.max_new_tokens = 1
+        later.is_finished = False
+        normal_bounded = manager.execution_completion_try_bounded_prefill.side_effect
+
+        def bounded(claims, req, *args, **kwargs):
+            if req is prefill:
+                return None
+            return normal_bounded(claims, req, *args, **kwargs)
+
+        manager.execution_completion_try_bounded_prefill.side_effect = bounded
+        first = scheduler.schedule_request([decoder, prefill, later], set())
+        assert first.context_requests == []
+        second = scheduler.schedule_request([decoder, prefill, later], set())
+        assert second.context_requests == [later]
+        assert manager.execution_completion_try_bounded_prefill.call_count == 2
+        assert scheduler._bounded_contexts == {3: 128}
+
+    def test_bounded_rotation_releases_absent_request_identity(self, monkeypatch):
+        manager, scheduler, decoder, prefill = self.setup(monkeypatch)
+        manager.execution_completion_try_bounded_prefill.side_effect = lambda *args, **kwargs: None
+        scheduler.schedule_request([decoder, prefill], set())
+        assert scheduler._bounded_prefill_last_attempt is prefill
+        replacement = _revision_request(2)
+        replacement.prompt_len = replacement.context_remaining_length = 384
+        replacement.max_new_tokens = 1
+        replacement.py_execution_version = None
+        scheduler.schedule_request([decoder, replacement], set())
+        assert scheduler._bounded_prefill_last_attempt is None
+        scheduler.schedule_request([], set())
+        assert scheduler._bounded_prefill_last_attempt is None
+
+    @pytest.mark.parametrize("reason", ["recovery", "residency", "anchor", "candidate"])
+    def test_bounded_candidate_rejection_counter_identifies_blocker(self, monkeypatch, reason):
+        manager, scheduler, decoder, prefill = self.setup(monkeypatch)
+        scheduler._refresh_completion_claims([decoder])
+        scheduler._bounded_prefill_generators = {1}
+        if reason == "recovery":
+            prefill.py_execution_recovery_pending = True
+        elif reason == "residency":
+            manager.has_execution_residency = True
+        elif reason == "anchor":
+            manager.kv_cache_map[1].is_active = False
+        else:
+            prefill.py_execution_version = None
+        assert scheduler._bounded_prefill_rejection(prefill) == "bounded_prefill_blocked_" + reason
 
     def test_canceled_partial_keeps_actual_charge_until_exact_cleanup(self, monkeypatch):
         manager, scheduler, decoder, prefill = self.setup(monkeypatch)
@@ -1267,7 +1390,7 @@ class TestBoundedCompletionPrefill:
     def test_resume_hint_subtracts_retained_prefix_before_allocating(self, monkeypatch):
         manager, scheduler, decoder, prefill = self.setup(monkeypatch)
 
-        def bounded(*args):
+        def bounded(*args, **kwargs):
             manager.kv_cache_map[2] = Mock(capacity=64, num_committed_tokens=64, is_active=False)
             return 128
 

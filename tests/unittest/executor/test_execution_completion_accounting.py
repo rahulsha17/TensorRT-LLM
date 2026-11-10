@@ -251,3 +251,70 @@ def test_bounded_admission_cannot_finish_prompt_without_completion_claim(manager
     req = request()
     manager.impl.get_completion_demand.return_value = [0]
     assert manager.execution_completion_try_bounded_prefill([], req, 100, 1) == req.prompt_len - 1
+
+
+def test_full_admission_preserves_exact_bounded_and_obsolete_owners(manager):
+    partial, obsolete = request(2), request(3, finished=True)
+    partial_cache = SimpleNamespace(capacity=4)
+    old_cache = SimpleNamespace(capacity=8)
+    manager.kv_cache_map = {2: partial_cache, 3: old_cache}
+    claims = [(partial, partial_cache, 3), (obsolete, old_cache, 3)]
+    assert manager.execution_completion_try_admit(claims, request(), 5, bounded_contexts={2: 6})
+    candidate = manager.kv_cache_map[1]
+    manager.impl.get_completion_demand.assert_called_once_with(
+        [partial_cache, old_cache, candidate], [6, 0, 12]
+    )
+    manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("demand", [[11], RuntimeError("native failure")])
+def test_failed_full_admission_with_partial_releases_only_candidate(manager, demand):
+    partial, partial_cache = request(2), SimpleNamespace(capacity=4)
+    manager.kv_cache_map[2] = partial_cache
+    if isinstance(demand, Exception):
+        manager.impl.get_completion_demand.side_effect = demand
+        with pytest.raises(RuntimeError, match="native failure"):
+            manager.execution_completion_try_admit(
+                [(partial, partial_cache, 3)], request(), 5, bounded_contexts={2: 6}
+            )
+    else:
+        manager.impl.get_completion_demand.return_value = demand
+        assert not manager.execution_completion_try_admit(
+            [(partial, partial_cache, 3)], request(), 5, bounded_contexts={2: 6}
+        )
+    assert manager.kv_cache_map == {2: partial_cache}
+    manager.free_resources.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "reason", ["no_slot", "complete_match", "matched_capacity", "minimum_chunk", "final_capacity"]
+)
+def test_bounded_rejection_counters_distinguish_native_capacity_causes(manager, reason):
+    req = request()
+    req.prompt_len = 20
+    counters = {}
+    manager.impl.get_completion_demand.return_value = [4]
+    if reason == "no_slot":
+        manager._create_kv_cache.side_effect = None
+        manager._create_kv_cache.return_value = None
+    elif reason == "complete_match":
+        create = manager._create_kv_cache.side_effect
+
+        def complete(*args, **kwargs):
+            cache = create(*args, **kwargs)
+            cache.capacity = 20
+            return cache
+
+        manager._create_kv_cache.side_effect = complete
+    elif reason == "matched_capacity":
+        manager.impl.get_completion_demand.return_value = [100]
+    elif reason == "minimum_chunk":
+        manager.impl.get_completion_demand.return_value = [10]
+    else:
+        manager.impl.get_completion_demand.side_effect = [[4], [100]]
+    assert (
+        manager.execution_completion_try_bounded_prefill([], req, 5, 4, rejection_counters=counters)
+        is None
+    )
+    assert counters == {"bounded_prefill_" + reason: 1}
+    assert manager.kv_cache_map == {}

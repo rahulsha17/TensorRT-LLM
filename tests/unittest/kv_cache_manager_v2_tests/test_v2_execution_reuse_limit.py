@@ -358,3 +358,35 @@ def test_bounded_prefill_counts_partial_match_source_during_private_copy(cache_f
             assert np.all(_read(core, anchor) == 11)
     finally:
         pending.close()
+
+
+def test_bounded_prefill_full_bypass_preserves_all_native_reservations(cache_fixture):
+    core, create, _ = cache_fixture
+    total = core.get_storage_statistics(0)[0].total
+    anchor, partial, bypass = create(), create(), create()
+    assert partial.resize(8)
+    assert bypass.resize(4)
+    anchor_end = (total - 3) * 4
+    assert anchor.resize(anchor_end - 8)
+    _fill(core, anchor, 11)
+    _fill(core, partial, 29)
+    _fill(core, bypass, 37)
+    # Both the partial prefix and the separately completing bypass coexist
+    # without reducing the anchor's protected growth or sharing writable pages.
+    assert core.get_completion_demand([anchor, partial, bypass], [anchor_end, 8, 4]) == [total]
+    assert core.get_completion_demand([anchor, partial, bypass], [anchor_end, 20, 4]) == [total + 3]
+    assert anchor.resize(anchor_end)
+    _fill(core, anchor, 11, start_token=anchor_end - 8)
+    assert np.all(_read(core, anchor) == 11)
+    assert np.all(_read(core, partial) == 29)
+    assert np.all(_read(core, bypass) == 37)
+    # Finishing an owner releases its future growth, never its actual pages.
+    assert core.get_completion_demand([anchor, partial, bypass], [0, 8, 4]) == [total]
+    bypass.close()
+    assert core.get_completion_demand([anchor, partial], [anchor_end, 8]) == [total - 1]
+    anchor.close()
+    assert partial.resize(20)
+    _fill(core, partial, 17, start_token=8)
+    data = _read(core, partial)
+    assert np.all(data[:2] == 29)
+    assert np.all(data[2:] == 17)

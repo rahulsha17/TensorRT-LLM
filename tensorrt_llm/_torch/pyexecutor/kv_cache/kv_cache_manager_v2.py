@@ -3432,6 +3432,8 @@ class KVCacheManagerV2(BaseResourceManager):
         claims: Sequence[tuple[LlmRequest, _KVCache, int]],
         request: LlmRequest,
         capacity_blocks: int,
+        *,
+        bounded_contexts: dict[int, int] | None = None,
     ) -> bool:
         """Retain the exact candidate match before granting immutable-page credit.
 
@@ -3460,7 +3462,9 @@ class KVCacheManagerV2(BaseResourceManager):
         try:
             allocation.cuda_stream = self._stream.cuda_stream
             accepted = (
-                self.execution_completion_demand([*claims, (request, allocation, 0)])
+                self.execution_completion_demand(
+                    [*claims, (request, allocation, 0)], bounded_contexts=bounded_contexts
+                )
                 <= capacity_blocks
             )
             return accepted
@@ -3474,6 +3478,8 @@ class KVCacheManagerV2(BaseResourceManager):
         request: LlmRequest,
         capacity_blocks: int,
         chunk_unit: int,
+        *,
+        rejection_counters: dict[str, int] | None = None,
     ) -> int | None:
         """Retain one prefix that fits beside existing full completion claims.
 
@@ -3482,6 +3488,11 @@ class KVCacheManagerV2(BaseResourceManager):
         Native accounting includes matched pages and partial-tail copy sources.
         No existing owner's reservation or cache is changed.
         """
+
+        def reject(reason: str) -> None:
+            if rejection_counters is not None:
+                rejection_counters[reason] = rejection_counters.get(reason, 0) + 1
+
         if request.py_request_id in self.kv_cache_map:
             raise RuntimeError("Unclaimed bounded prefill candidate already owns KV")
         if self.conversation_manager is not None or not request.is_first_context_chunk:
@@ -3497,18 +3508,21 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=request.prompt_len,
         )
         if allocation is None:
+            reject("bounded_prefill_no_slot")
             return None
         accepted = False
         try:
             allocation.cuda_stream = self._stream.cuda_stream
             current_capacity = allocation.capacity
             if current_capacity >= request.prompt_len:
+                reject("bounded_prefill_complete_match")
                 return None
             owners = [*claims, (request, allocation, 0)]
             demand = self.execution_completion_demand(
                 owners, bounded_contexts={request.py_request_id: current_capacity}
             )
             if demand > capacity_blocks:
+                reject("bounded_prefill_matched_capacity")
                 return None
             # Each newly reserved block can add at most one logical block to
             # the native union; all existing immutable-source charges remain.
@@ -3518,6 +3532,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 request.prompt_len - 1,
             )
             if limit - allocation.num_committed_tokens < chunk_unit:
+                reject("bounded_prefill_minimum_chunk")
                 return None
             if (
                 self.execution_completion_demand(
@@ -3525,6 +3540,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 > capacity_blocks
             ):
+                reject("bounded_prefill_final_capacity")
                 return None
             accepted = True
             return limit
