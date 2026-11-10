@@ -290,10 +290,13 @@ def test_bounded_prefill_preserves_anchor_completion_and_promotes_after_release(
     anchor_end = (total_blocks - 2) * 4
     anchor_start = anchor_end - 8
     anchor = create()
-    assert anchor.resize(anchor_start)
-    _fill(core, anchor, 11)
     pending = create()
     assert pending.resize(8)
+    # Resume both owners before filling the pool: native admission refuses new
+    # contexts above its 97% utilization threshold. The invariant under test is
+    # reserved growth of already-admitted owners, which may fill the pool.
+    assert anchor.resize(anchor_start)
+    _fill(core, anchor, 11)
     _fill(core, pending, 29)
 
     # Charge the entire physical pool: two blocks hold unfinished prefill, and
