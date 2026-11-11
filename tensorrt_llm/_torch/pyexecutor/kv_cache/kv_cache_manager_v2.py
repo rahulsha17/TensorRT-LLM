@@ -3434,6 +3434,7 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity_blocks: int,
         *,
         bounded_contexts: dict[int, int] | None = None,
+        admission_observer: Callable[[object | None, int | None], None] | None = None,
     ) -> bool:
         """Retain the exact candidate match before granting immutable-page credit.
 
@@ -3457,20 +3458,155 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=request.prompt_len,
         )
         if allocation is None:
+            if admission_observer is not None:
+                try:
+                    admission_observer(None, None)
+                except Exception:
+                    # Diagnostic failures must not change ownership or admission.
+                    logger.warning("Ignoring admission diagnostic observer failure")
             return False
         accepted = False
         try:
             allocation.cuda_stream = self._stream.cuda_stream
-            accepted = (
-                self.execution_completion_demand(
-                    [*claims, (request, allocation, 0)], bounded_contexts=bounded_contexts
-                )
-                <= capacity_blocks
+            demand = self.execution_completion_demand(
+                [*claims, (request, allocation, 0)], bounded_contexts=bounded_contexts
             )
+            accepted = demand <= capacity_blocks
+            if admission_observer is not None:
+                try:
+                    admission_observer(allocation, demand)
+                except Exception:
+                    logger.warning("Ignoring admission diagnostic observer failure")
             return accepted
         finally:
             if not accepted:
                 self.free_resources(request)
+
+    def execution_admission_demand_snapshot(
+        self,
+        claims: Sequence[tuple[LlmRequest, _KVCache, int]],
+        request: LlmRequest,
+        allocation: _KVCache,
+        current_candidate_union_blocks: int,
+        *,
+        bounded_contexts: dict[int, int] | None = None,
+    ) -> dict:
+        """Read-only native counterfactuals for an already retained candidate.
+
+        Each query takes its own native lock; the group is not an atomic
+        snapshot. Unions are non-additive because immutable pages are shared.
+        Native demand charges max(allocated capacity, requested capacity), even
+        for suspended/retired owners. It is not instantaneous HBM occupancy.
+        No cache, page, residency hold or future reservation is changed here.
+        """
+        if len(claims) > 64:
+            return dict(unavailable="owner_limit", owner_count=len(claims))
+        all_claims = [*claims, (request, allocation, 0)]
+        ids = [owner.py_request_id for owner, _, _ in all_claims]
+        if len(set(ids)) != len(ids):
+            raise RuntimeError("Admission diagnostic requires distinct exact owners")
+        groups = self.impl.get_life_cycle_pool_group_indices(0)
+        if not groups or any(group != 0 for group in groups):
+            raise ValueError("Admission diagnostic requires one dense GPU pool")
+        if bounded_contexts is not None and bounded_contexts.keys() - set(ids):
+            raise RuntimeError("Admission diagnostic reservation has no exact owner")
+
+        caches, full, committed, decoders, descriptors = [], [], [], [], []
+        for owner, cache, _ in all_claims:
+            if self.kv_cache_map.get(owner.py_request_id) is not cache:
+                raise RuntimeError("Admission diagnostic allocation identity changed")
+            capacity = (
+                0
+                if owner.is_finished is True
+                else (owner.prompt_len + max(owner.max_new_tokens - 1, 0))
+            )
+            limit = (bounded_contexts or {}).get(owner.py_request_id)
+            if limit is not None:
+                if type(limit) is not int or not 0 <= limit < owner.prompt_len:
+                    raise ValueError("Invalid diagnostic bounded prefill reservation")
+                if cache.capacity > limit:
+                    raise RuntimeError("Diagnostic bounded allocation exceeded reservation")
+            is_decoder = (
+                owner.is_finished is not True
+                and owner.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
+            )
+            commitment = capacity if limit is None or owner.is_finished is True else limit
+            caches.append(cache)
+            full.append(capacity)
+            committed.append(commitment)
+            decoders.append(capacity if is_decoder else 0)
+            descriptors.append(
+                dict(
+                    request_id=owner.py_request_id,
+                    candidate=owner is request,
+                    finished=owner.is_finished is True,
+                    state_value=owner.state_value,
+                    active=cache.is_active is True,
+                    allocated_capacity_tokens=cache.capacity,
+                    requested_completion_tokens=capacity,
+                    requested_commitment_tokens=commitment,
+                    bounded_limit_tokens=limit,
+                    decoder_full_claim=is_decoder,
+                    unfinished_prefill=(
+                        owner.is_finished is not True
+                        and owner.state_value == LlmRequestState.CONTEXT_INIT.value
+                    ),
+                )
+            )
+
+        def query(selected: list, capacities: list[int]) -> int:
+            demand = self.impl.get_completion_demand(selected, capacities)
+            if len(demand) != 1 or type(demand[0]) is not int or demand[0] < 0:
+                raise RuntimeError("Invalid native admission diagnostic demand")
+            return (demand[0] + len(groups) - 1) // len(groups)
+
+        count = len(claims)
+        unions = dict(
+            allocated_capacity_union_blocks=query(caches[:count], [0] * count),
+            allocated_plus_decoder_completion_union_blocks=query(caches[:count], decoders[:count]),
+            current_commitment_union_blocks=query(caches[:count], committed[:count]),
+            candidate_alone_completion_union_blocks=query([allocation], [full[-1]]),
+            current_plus_candidate_completion_union_blocks=current_candidate_union_blocks,
+            allocated_plus_decoder_completion_plus_candidate_union_blocks=query(
+                caches, [*decoders[:count], full[-1]]
+            ),
+        )
+        # One diagnostic loan only: cap the largest unfinished prefill's future
+        # request at its existing capacity while preserving every physical owner
+        # and every other completion promise. This is not an admission decision
+        # or a proof that lending would make progress without starvation.
+        prefill_indices = [
+            index
+            for index, owner in enumerate(descriptors[:count])
+            if owner["unfinished_prefill"] and committed[index] > owner["allocated_capacity_tokens"]
+        ]
+        loan_id = None
+        if prefill_indices:
+            index = max(
+                prefill_indices,
+                key=lambda item: committed[item] - descriptors[item]["allocated_capacity_tokens"],
+            )
+            loan = list(committed)
+            loan[index] = 0
+            loan_id = descriptors[index]["request_id"]
+            unions["one_prefill_future_removed_plus_candidate_union_blocks"] = query(caches, loan)
+        storage = self.impl.get_storage_statistics(0)
+        return dict(
+            semantics="separate native lock snapshots; non-additive shared unions; logical blocks",
+            allocated_capacity_is_hbm_occupancy=False,
+            protected_align_hold_attribution="unknown: holds outside these exact request owners",
+            owner_count=count,
+            owners=descriptors,
+            unions=unions,
+            one_prefill_future_removed_request_id=loan_id,
+            gpu_pool_storage_slots=[
+                {
+                    name: getattr(item, name, None)
+                    for name in ("total", "free", "evictable", "available", "unavailable")
+                }
+                for item in storage
+            ],
+        )
 
     def execution_completion_try_bounded_prefill(
         self,

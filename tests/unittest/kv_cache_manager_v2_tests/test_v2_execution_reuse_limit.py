@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reuse bounds must protect the physical suffix after commit, not just lookup."""
 
+from types import SimpleNamespace
+
 import cuda.bindings.runtime as cudart
 import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.execution_alignment import _Reservation
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentRequest, WorkerAlignmentState
 from tensorrt_llm.execution_authority import Revision
 from tensorrt_llm.execution_version import ExecutionVersion
@@ -390,3 +394,67 @@ def test_bounded_prefill_full_bypass_preserves_all_native_reservations(cache_fix
     data = _read(core, partial)
     assert np.all(data[:2] == 29)
     assert np.all(data[2:] == 17)
+
+
+def test_admission_diagnostic_counterfactuals_preserve_real_shared_pages(cache_fixture):
+    core, create, _ = cache_fixture
+    tokens = list(range(12))
+    anchor = create()
+    _fill(core, anchor, 11)
+    anchor.commit(tokens)
+    prefill, retired = create(), create()
+    assert prefill.resize(8)
+    assert retired.resize(4)
+    _fill(core, prefill, 29)
+    _fill(core, retired, 37)
+    successor = create(tokens)
+    caches = [anchor, prefill, retired, successor]
+    requests = [
+        SimpleNamespace(
+            py_request_id=index,
+            prompt_len=prompt,
+            max_new_tokens=1,
+            is_finished=index == 2,
+            state_value=(
+                LlmRequestState.GENERATION_IN_PROGRESS.value
+                if index == 0
+                else LlmRequestState.CONTEXT_INIT.value
+            ),
+        )
+        for index, prompt in enumerate((20, 24, 12, 20))
+    ]
+    wrapper = SimpleNamespace(impl=core, kv_cache_map=dict(enumerate(caches)))
+    before = [(cache.capacity, cache.is_active, _read(core, cache)) for cache in caches]
+    full_union = core.get_completion_demand(caches, [20, 24, 0, 20])[0]
+    result = KVCacheManagerV2.execution_admission_demand_snapshot(
+        wrapper,
+        list(zip(requests[:3], caches[:3], (0, 0, 0))),
+        requests[3],
+        successor,
+        full_union,
+    )
+    unions = result["unions"]
+    assert (
+        unions["allocated_capacity_union_blocks"]
+        == core.get_completion_demand(caches[:3], [0, 0, 0])[0]
+    )
+    assert (
+        unions["allocated_plus_decoder_completion_plus_candidate_union_blocks"]
+        == core.get_completion_demand(caches, [20, 0, 0, 20])[0]
+    )
+    assert (
+        unions["one_prefill_future_removed_plus_candidate_union_blocks"]
+        == core.get_completion_demand(caches, [20, 0, 0, 20])[0]
+    )
+    assert unions["current_plus_candidate_completion_union_blocks"] == full_union
+    # The retired owner retains its physical four-token allocation even though
+    # the diagnostic requests zero future growth for it.
+    assert (
+        core.get_completion_demand(caches, [20, 0, 0, 20])[0]
+        > core.get_completion_demand([anchor, prefill, successor], [20, 0, 20])[0]
+    )
+    for cache, (capacity, active, content) in zip(caches, before):
+        assert cache.capacity == capacity and cache.is_active is active
+        assert np.array_equal(_read(core, cache), content)
+    assert successor.num_committed_tokens == 12
+    assert result["gpu_pool_storage_slots"][0]["available"] is not None

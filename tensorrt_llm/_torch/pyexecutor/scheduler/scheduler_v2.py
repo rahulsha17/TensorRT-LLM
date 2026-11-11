@@ -15,7 +15,11 @@
 
 import enum
 import os
-from collections import Counter
+import time
+from collections import Counter, deque
+from copy import deepcopy
+from functools import wraps
+from threading import RLock
 from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
@@ -53,6 +57,205 @@ class _RecomputePauseState:
     def __init__(self, frontier: int):
         self.frontier = frontier
         self.victim_indices: set[int] = set()
+
+
+def _diagnostic_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+class _AdmissionDiagnostics:
+    """Bounded, opt-in observations, never an input to admission decisions.
+
+    Times start at the first observed scheduler pass, not client enqueue. State
+    durations describe the last observed gate, not continuous GPU occupancy.
+    Only context requests are tracked; departure releases the strong reference.
+    A monotonically increasing observation ID distinguishes reused engine IDs.
+    """
+
+    MAX_REQUESTS = 128
+    MAX_EVENTS = 1024
+    MAX_SAMPLES = 128
+    SAMPLE_INTERVAL_S = 1.0
+
+    def __init__(self):
+        # FeatureObserver may export from a client thread. Protect only bounded
+        # host bookkeeping/copies; native counterfactuals run outside this lock.
+        self._lock = RLock()
+        self._records: dict[int, tuple[LlmRequest, dict]] = {}
+        self._events: deque[dict] = deque(maxlen=self.MAX_EVENTS)
+        self._samples: deque[dict] = deque(maxlen=self.MAX_SAMPLES)
+        self._completed: deque[dict] = deque(maxlen=self.MAX_REQUESTS)
+        self._next_id = 0
+        self._last_sample = float("-inf")
+        self._counts = Counter()
+
+    def _event(self, record: dict, now: float, state: str) -> None:
+        if len(self._events) == self.MAX_EVENTS:
+            self._counts["events_overwritten"] += 1
+        self._events.append(
+            dict(
+                observation_id=record["observation_id"],
+                request_id=record["request_id"],
+                state=state,
+                seconds_since_first_observed=now - record["first_observed"],
+                state_seconds=dict(record["state_seconds"]),
+                checks=record["checks"],
+                reasons=dict(record["reasons"]),
+                first_scheduled_seconds=record["first_scheduled_seconds"],
+            )
+        )
+
+    def _leave(self, key: int, now: float, reason: str) -> None:
+        _, record = self._records.pop(key)
+        self._apply_state(record, now)
+        record["state_seconds"][record["state"]] += now - record["state_started"]
+        self._event(record, now, reason)
+        result = deepcopy(record)
+        result["seconds_since_first_observed"] = now - result.pop("first_observed")
+        result.pop("state_started")
+        result.pop("last_sample")
+        result["departure_reason"] = reason
+        if len(self._completed) == self.MAX_REQUESTS:
+            self._counts["completed_overwritten"] += 1
+        self._completed.append(result)
+
+    @_diagnostic_locked
+    def observe(self, requests: RequestList, context_state: int) -> None:
+        now = time.monotonic()
+        # Limit both retained identities and work per pass. No prompt or scope
+        # strings enter the trace. Records beyond the cap are explicitly lost.
+        identities = {id(req) for req in requests}
+        for key in list(self._records):
+            if key not in identities:
+                self._leave(key, now, "left_active_requests")
+        for req in requests:
+            if req.state_value != context_state or id(req) in self._records:
+                continue
+            if len(self._records) >= self.MAX_REQUESTS:
+                self._counts["untracked_observations"] += 1
+                continue
+            self._next_id += 1
+            record = dict(
+                observation_id=self._next_id,
+                request_id=req.py_request_id,
+                first_observed=now,
+                first_scheduled_seconds=None,
+                state="awaiting_context_attempt",
+                pending_state="awaiting_context_attempt",
+                state_started=now,
+                state_seconds=Counter(),
+                checks=0,
+                reasons=Counter(),
+                last_sample=float("-inf"),
+                first_demand_sample=None,
+                latest_demand_sample=None,
+            )
+            self._records[id(req)] = (req, record)
+            self._event(record, now, record["state"])
+
+    @_diagnostic_locked
+    def record(self, req: LlmRequest, state: str) -> None:
+        entry = self._records.get(id(req))
+        if entry is None or entry[0] is not req:
+            return
+        record = entry[1]
+        now = time.monotonic()
+        record["checks"] += 1
+        record["reasons"][state] += 1
+        if state == "context_scheduled" and record["first_scheduled_seconds"] is None:
+            record["first_scheduled_seconds"] = now - record["first_observed"]
+        record["pending_state"] = state
+
+    def _apply_state(self, record: dict, now: float) -> None:
+        state = record["pending_state"]
+        if record["state"] != state:
+            record["state_seconds"][record["state"]] += now - record["state_started"]
+            record["state"] = state
+            record["state_started"] = now
+            self._event(record, now, state)
+
+    @_diagnostic_locked
+    def flush(self) -> None:
+        # A full-completion rejection followed by a bounded-prefill rejection
+        # in the same pass is one final observed state, not two transitions on
+        # every poll. Reason counters still retain both attempted gates.
+        now = time.monotonic()
+        for _, record in self._records.values():
+            self._apply_state(record, now)
+
+    @_diagnostic_locked
+    def eligible_candidates(self, claimed: dict) -> set[int]:
+        return {
+            key
+            for key, (candidate, _) in self._records.items()
+            if candidate.is_first_context_chunk and candidate.py_request_id not in claimed
+        }
+
+    @_diagnostic_locked
+    def sample_due(self, req: LlmRequest, eligible: set[int]) -> bool:
+        entry = self._records.get(id(req))
+        if entry is None or entry[0] is not req:
+            return False
+        now = time.monotonic()
+        if now - self._last_sample < self.SAMPLE_INTERVAL_S:
+            return False
+        # A per-candidate cooldown prevents a first-row monopoly. A candidate
+        # that stops reaching the gate cannot reserve or block the next sample.
+        if id(req) not in eligible or (
+            now - entry[1]["last_sample"] < max(1, len(eligible)) * self.SAMPLE_INTERVAL_S
+        ):
+            return False
+        self._last_sample = now
+        entry[1]["last_sample"] = now
+        return True
+
+    @_diagnostic_locked
+    def sample(self, req: LlmRequest, payload: dict) -> None:
+        entry = self._records.get(id(req))
+        if entry is None or entry[0] is not req:
+            return
+        if len(self._samples) == self.MAX_SAMPLES:
+            self._counts["samples_overwritten"] += 1
+        record = entry[1]
+        sample = dict(
+            observation_id=record["observation_id"],
+            request_id=req.py_request_id,
+            seconds_since_first_observed=time.monotonic() - record["first_observed"],
+            **payload,
+        )
+        self._samples.append(sample)
+        if record["first_demand_sample"] is None:
+            record["first_demand_sample"] = sample
+        record["latest_demand_sample"] = sample
+
+    @_diagnostic_locked
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        records = []
+        for _, record in list(self._records.values()):
+            result = deepcopy(record)
+            result["state_seconds"][result["state"]] += now - result.pop("state_started")
+            result["seconds_since_first_observed"] = now - result.pop("first_observed")
+            result.pop("last_sample")
+            records.append(result)
+        return dict(
+            schema_version=1,
+            timing_scope="since first context observation; last observed scheduler state",
+            max_requests=self.MAX_REQUESTS,
+            max_events=self.MAX_EVENTS,
+            max_samples=self.MAX_SAMPLES,
+            sample_interval_seconds=self.SAMPLE_INTERVAL_S,
+            counts=dict(self._counts),
+            requests=records,
+            completed_requests=deepcopy(list(self._completed)),
+            events=deepcopy(list(self._events)),
+            demand_samples=deepcopy(list(self._samples)),
+        )
 
 
 class BudgetTracker:
@@ -297,6 +500,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._bounded_prefill_last_attempt: LlmRequest | None = None
         self._bounded_prefill_generators: set[int] = set()
         self._completion_deferred_contexts: dict[int, LlmRequest] = {}
+        diagnostics = os.environ.get("TRTLLM_RETIRE_ADMISSION_DIAGNOSTICS", "0")
+        if diagnostics not in ("0", "1"):
+            raise ValueError("TRTLLM_RETIRE_ADMISSION_DIAGNOSTICS must be 0 or 1")
+        self._admission_diagnostics = _AdmissionDiagnostics() if diagnostics == "1" else None
         self._revision_policy: RevisionSchedulingPolicy | None = None
         self._adaptive_prefill = False
         self._revision_cohort = False
@@ -465,10 +672,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         stable = [req for req in eligible if req.state_value != self._context_init_state_value]
         return policy.cohort(contexts, stable)
 
-    def execution_scheduling_snapshot(self) -> dict[str, int | bool]:
+    def execution_scheduling_snapshot(self) -> dict:
         """Return host admission counters; these do not prove GPU execution."""
         policy = self._revision_policy
-        return dict(
+        result = dict(
             self._revision_metrics,
             adaptive_prefill=self._adaptive_prefill,
             revision_cohort=self._revision_cohort,
@@ -479,6 +686,54 @@ class KVCacheV2Scheduler(RequestScheduler):
             shared_completion_budget=self._shared_completion_budget,
             bounded_prefill_enabled=self._bounded_prefill,
         )
+        if self._admission_diagnostics is not None:
+            result["admission_diagnostics"] = self._admission_diagnostics.snapshot()
+        return result
+
+    def _admission_observer(self, req: LlmRequest) -> dict:
+        """Optional observer keyword; disabled operation adds no native queries."""
+        diagnostic = self._admission_diagnostics
+        if diagnostic is None:
+            return {}
+        eligible = diagnostic.eligible_candidates(self._completion_claims)
+        if not diagnostic.sample_due(req, eligible):
+            return {}
+
+        def observe(allocation: object | None, demand: int | None) -> None:
+            started = time.monotonic()
+            try:
+                details = (
+                    dict(unavailable="no_native_request_slot")
+                    if allocation is None
+                    else self.kv_cache_manager.execution_admission_demand_snapshot(
+                        list(self._completion_claims.values()),
+                        req,
+                        allocation,
+                        demand,
+                        bounded_contexts=self._bounded_contexts,
+                    )
+                )
+                details.update(
+                    usable_budget_blocks=self._completion_budget_blocks,
+                    recovery_pending=req.py_execution_recovery_pending is True,
+                    recovery_tokens=req.py_execution_recovery_tokens,
+                    has_pending_align_residency=self.kv_cache_manager.has_execution_residency,
+                    resident_recovery=self.kv_cache_manager.has_execution_resident_recovery(req),
+                    bounded_candidate_ineligibility=self._bounded_prefill_rejection(req),
+                )
+            except Exception as error:
+                # Observability must not change acceptance or cleanup, including
+                # on older native bindings. Never export exception text (which
+                # may contain tenant or prompt material), only its type.
+                details = dict(unavailable="diagnostic_error", error_type=type(error).__name__)
+            details["query_duration_seconds"] = time.monotonic() - started
+            diagnostic.sample(req, details)
+
+        return dict(admission_observer=observe)
+
+    def _admission_blocked(self, req: LlmRequest, reason: str) -> None:
+        if self._admission_diagnostics is not None:
+            self._admission_diagnostics.record(req, "blocked_" + reason)
 
     def _enable_completion_budget(self) -> None:
         manager = self.kv_cache_manager
@@ -613,6 +868,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 < self.chunk_unit_size
             ):
                 self._revision_metrics["bounded_prefill_waits"] += 1
+                self._admission_blocked(req, "bounded_prefix_exhausted")
                 return False
             return True
         if request_id in self._completion_claims:
@@ -625,6 +881,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # a stream of small contexts from postponing promotion forever.
             if self._bounded_prefill_bypassed:
                 self._revision_metrics["bounded_prefill_bypass_fairness"] += 1
+                self._admission_blocked(req, "bounded_bypass_fairness")
             elif (
                 self.kv_cache_manager.execution_completion_demand(
                     list(self._completion_claims.values())
@@ -632,15 +889,18 @@ class KVCacheV2Scheduler(RequestScheduler):
                 <= self._completion_budget_blocks
             ):
                 self._revision_metrics["bounded_prefill_bypass_promotion"] += 1
+                self._admission_blocked(req, "bounded_owner_promotion_priority")
             elif self.kv_cache_manager.execution_completion_try_admit(
                 list(self._completion_claims.values()),
                 req,
                 self._completion_budget_blocks,
                 bounded_contexts=self._bounded_contexts,
+                **self._admission_observer(req),
             ):
                 return True
             else:
                 self._revision_metrics["bounded_prefill_bypass_capacity"] += 1
+                self._admission_blocked(req, "bounded_bypass_completion_capacity")
             self._revision_metrics["completion_deferrals"] += 1
             return False
         if self._shared_completion_budget:
@@ -650,10 +910,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
             if not bounded_retry:
                 if self.kv_cache_manager.execution_completion_try_admit(
-                    list(self._completion_claims.values()), req, self._completion_budget_blocks
+                    list(self._completion_claims.values()),
+                    req,
+                    self._completion_budget_blocks,
+                    **self._admission_observer(req),
                 ):
                     return True
                 self._revision_metrics["completion_deferrals"] += 1
+                self._admission_blocked(req, "full_completion_capacity")
                 if self._bounded_prefill:
                     self._completion_deferred_contexts[request_id] = req
             if self._can_start_bounded_prefill(req):
@@ -669,10 +933,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                     self._revision_metrics["bounded_prefill_admissions"] += 1
                     return True
             return False
-        return (
+        accepted = (
             demand + sum(claim[2] for claim in self._completion_claims.values())
             <= self._completion_budget_blocks
         )
+        if not accepted:
+            self._admission_blocked(req, "legacy_completion_capacity")
+        return accepted
 
     def _can_start_bounded_prefill(self, req: LlmRequest) -> bool:
         return self._bounded_prefill_rejection(req) is None
@@ -744,6 +1011,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
+        if self._admission_diagnostics is not None:
+            self._admission_diagnostics.flush()
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -779,6 +1048,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
+        if self._admission_diagnostics is not None:
+            self._admission_diagnostics.observe(requests_list, self._context_init_state_value)
         if self._bounded_prefill_last_attempt is not None and not any(
             req is self._bounded_prefill_last_attempt for req in requests_list
         ):
@@ -1205,6 +1476,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 bounded_block = "bounded_prefill_blocked_budget"
             if bounded_block is not None:
                 self._revision_metrics[bounded_block] += 1
+                if self._admission_diagnostics is not None:
+                    for req in self._completion_deferred_contexts.values():
+                        self._admission_blocked(req, bounded_block)
             else:
                 # Full-completion candidates have already had priority. Probe
                 # one partial candidate per pass, rotating past a failed match
@@ -1220,6 +1494,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                         reason = self._bounded_prefill_rejection(req)
                         if reason is not None:
                             self._revision_metrics[reason] += 1
+                            self._admission_blocked(req, reason)
                             continue
                         self._bounded_prefill_last_attempt = req
                         action, tokens, chunking_flag = self._try_schedule_context(
@@ -1758,6 +2033,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                             self._revision_metrics["balanced_reused_prefix_chunks"] += 1
                     else:
                         self._revision_metrics["balanced_revised_short_chunks"] += 1
+
+        if self._admission_diagnostics is not None:
+            self._admission_diagnostics.record(
+                req,
+                "context_scheduled"
+                if result[0] is ScheduleAction.SCHEDULED
+                else "blocked_context_prepare_or_iteration_budget",
+            )
 
         return result
 

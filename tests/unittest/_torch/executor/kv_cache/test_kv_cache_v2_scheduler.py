@@ -18,6 +18,9 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
@@ -30,9 +33,223 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _AdmissionDiagnostics
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
+
+
+class TestAdmissionDiagnostics:
+    def test_export_is_consistent_during_scheduler_updates(self):
+        diagnostic = _AdmissionDiagnostics()
+        started = Event()
+
+        def update():
+            started.set()
+            for index in range(100):
+                req = make_ctx_request(index, 64)
+                diagnostic.observe([req], req.state_value)
+                diagnostic.record(req, "blocked_full_completion_capacity")
+                diagnostic.flush()
+                diagnostic.sample(req, dict(unions=dict(allocated_capacity_union_blocks=1)))
+                diagnostic.observe([], req.state_value)
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(update)
+            assert started.wait(timeout=5)
+            for _ in range(100):
+                snapshot = diagnostic.snapshot()
+                json.dumps(snapshot, allow_nan=False)
+                records = snapshot["requests"] + snapshot["completed_requests"]
+                ids = [record["observation_id"] for record in records]
+                assert len(ids) == len(set(ids))
+                assert all(
+                    all(seconds >= 0 for seconds in record["state_seconds"].values())
+                    for record in records
+                )
+            future.result(timeout=5)
+        assert len(diagnostic.snapshot()["completed_requests"]) == 100
+
+    def test_default_off_never_reads_clock_or_queries_diagnostics(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_RETIRE_ADMISSION_DIAGNOSTICS", raising=False)
+        manager, scheduler, decoder, prefill = TestBoundedCompletionPrefill().setup(monkeypatch)
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.time.monotonic",
+            side_effect=AssertionError("disabled clock"),
+        ):
+            result = scheduler.schedule_request([decoder, prefill], set())
+            snapshot = scheduler.execution_scheduling_snapshot()
+        assert result.generation_requests == [decoder]
+        assert result.context_requests == [prefill]
+        assert "admission_diagnostics" not in snapshot
+        manager.execution_admission_demand_snapshot.assert_not_called()
+        assert all(
+            "admission_observer" not in call.kwargs
+            for call in manager.execution_completion_try_admit.call_args_list
+        )
+
+    def test_invalid_flag_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_RETIRE_ADMISSION_DIAGNOSTICS", "yes")
+        with pytest.raises(ValueError, match="ADMISSION_DIAGNOSTICS must be 0 or 1"):
+            make_scheduler(make_kv_cache_manager())
+
+    def test_native_without_completion_budget_preserves_scheduling(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_RETIRE_ADMISSION_DIAGNOSTICS", "1")
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(manager)
+        req = make_ctx_request(1, 64)
+        result = scheduler.schedule_request([req], set())
+        assert result.context_requests == [req]
+        record = scheduler.execution_scheduling_snapshot()["admission_diagnostics"]["requests"][0]
+        assert record["state"] == "context_scheduled"
+        assert record["first_scheduled_seconds"] is not None
+        manager.execution_completion_try_admit.assert_not_called()
+        manager.execution_admission_demand_snapshot.assert_not_called()
+
+    def test_durations_coalesce_same_pass_gates_and_retain_completed_summary(self, monkeypatch):
+        now = [10.0]
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.time.monotonic", lambda: now[0]
+        )
+        diagnostic = _AdmissionDiagnostics()
+        req = make_ctx_request(1, 64)
+        diagnostic.observe([req], req.state_value)
+        now[0] = 12.0
+        for _ in range(20):
+            diagnostic.record(req, "blocked_full_completion_capacity")
+            diagnostic.record(req, "blocked_bounded_prefill_blocked_recovery")
+            diagnostic.flush()
+        assert len(diagnostic.snapshot()["events"]) == 2
+        now[0] = 17.0
+        diagnostic.record(req, "context_scheduled")
+        diagnostic.flush()
+        record = diagnostic.snapshot()["requests"][0]
+        assert record["state_seconds"] == {
+            "awaiting_context_attempt": 2.0,
+            "blocked_bounded_prefill_blocked_recovery": 5.0,
+            "context_scheduled": 0.0,
+        }
+        assert record["reasons"]["blocked_full_completion_capacity"] == 20
+        assert record["first_scheduled_seconds"] == 7.0
+        now[0] = 19.0
+        diagnostic.observe([], req.state_value)
+        completed = diagnostic.snapshot()["completed_requests"][0]
+        assert completed["state_seconds"]["context_scheduled"] == 2.0
+        assert completed["seconds_since_first_observed"] == 9.0
+        assert not diagnostic._records
+        # Returned snapshots cannot corrupt retained summaries or ownership.
+        completed["reasons"].clear()
+        assert diagnostic.snapshot()["completed_requests"][0]["reasons"]
+
+    def test_exact_request_identity_distinguishes_reused_engine_id(self):
+        diagnostic = _AdmissionDiagnostics()
+        old, new = make_ctx_request(7, 64), make_ctx_request(7, 64)
+        diagnostic.observe([old], old.state_value)
+        diagnostic.record(old, "blocked_full_completion_capacity")
+        diagnostic.flush()
+        diagnostic.observe([new], new.state_value)
+        diagnostic.record(old, "context_scheduled")
+        snapshot = diagnostic.snapshot()
+        assert snapshot["completed_requests"][0]["observation_id"] == 1
+        assert snapshot["requests"][0]["observation_id"] == 2
+        assert snapshot["requests"][0]["state"] == "awaiting_context_attempt"
+        assert snapshot["requests"][0]["checks"] == 0
+
+    def test_sampling_cannot_be_stalled_by_a_blocked_request_not_reaching_admission(
+        self, monkeypatch
+    ):
+        now = [1.0]
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.time.monotonic", lambda: now[0]
+        )
+        diagnostic = _AdmissionDiagnostics()
+        stalled, candidate = make_ctx_request(1, 64), make_ctx_request(2, 64)
+        diagnostic.observe([stalled, candidate], candidate.state_value)
+        diagnostic.record(stalled, "blocked_bounded_prefix_exhausted")
+        diagnostic.flush()
+        assert diagnostic.sample_due(candidate, {id(candidate)})
+        assert not diagnostic.sample_due(candidate, {id(candidate)})
+        now[0] = 2.0
+        assert diagnostic.sample_due(candidate, {id(candidate)})
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_observer_exports_recovery_metadata_or_nonsensitive_failure(self, monkeypatch, fails):
+        monkeypatch.setenv("TRTLLM_RETIRE_ADMISSION_DIAGNOSTICS", "1")
+        manager, scheduler = _completion_scheduler(monkeypatch)
+        req = _completion_request(1, 128)
+        req.py_execution_recovery_pending = True
+        req.py_execution_recovery_tokens = 64
+        manager.has_execution_residency = True
+        manager.has_execution_resident_recovery.return_value = True
+        manager.execution_admission_demand_snapshot.return_value = dict(unions={"test_union": 7})
+        if fails:
+            manager.execution_admission_demand_snapshot.side_effect = ValueError("sensitive tenant")
+        diagnostic = scheduler._admission_diagnostics
+        diagnostic.observe([req], req.state_value)
+        scheduler._admission_observer(req)["admission_observer"](object(), 7)
+        sample = diagnostic.snapshot()["demand_samples"][0]
+        if fails:
+            assert sample["unavailable"] == "diagnostic_error"
+            assert sample["error_type"] == "ValueError"
+            assert "sensitive tenant" not in str(sample)
+        else:
+            assert sample["recovery_pending"] is True
+            assert sample["recovery_tokens"] == 64
+            assert sample["has_pending_align_residency"] is True
+            assert sample["resident_recovery"] is True
+            assert sample["unions"] == {"test_union": 7}
+        assert sample["query_duration_seconds"] >= 0
+
+    def test_storage_is_bounded_and_first_sample_survives_ring_overwrite(self, monkeypatch):
+        monkeypatch.setattr(_AdmissionDiagnostics, "MAX_REQUESTS", 2)
+        monkeypatch.setattr(_AdmissionDiagnostics, "MAX_EVENTS", 4)
+        monkeypatch.setattr(_AdmissionDiagnostics, "MAX_SAMPLES", 3)
+        diagnostic = _AdmissionDiagnostics()
+        reqs = [make_ctx_request(index, 64) for index in range(3)]
+        diagnostic.observe(reqs, reqs[0].state_value)
+        assert len(diagnostic._records) == 2
+        assert diagnostic.snapshot()["counts"]["untracked_observations"] == 1
+        for index in range(diagnostic.MAX_SAMPLES + 5):
+            diagnostic.sample(reqs[0], dict(sequence=index))
+        diagnostic.observe([], reqs[0].state_value)
+        snapshot = diagnostic.snapshot()
+        assert len(snapshot["demand_samples"]) == diagnostic.MAX_SAMPLES
+        assert snapshot["counts"]["samples_overwritten"] == 5
+        completed = snapshot["completed_requests"][0]
+        assert completed["first_demand_sample"]["sequence"] == 0
+        assert completed["latest_demand_sample"]["sequence"] == diagnostic.MAX_SAMPLES + 4
+        for index in range(10):
+            req = make_ctx_request(index + 10, 64)
+            diagnostic.observe([req], req.state_value)
+            diagnostic.observe([], req.state_value)
+        snapshot = diagnostic.snapshot()
+        assert len(snapshot["events"]) == 4
+        assert len(snapshot["completed_requests"]) == 2
+        assert snapshot["counts"]["completed_overwritten"] == 10
+        assert snapshot["counts"]["events_overwritten"] > 0
+        assert not diagnostic._records
+
+    @pytest.mark.parametrize("bounded", [False, True])
+    def test_completion_rejection_remains_specific_in_schedule_result(self, monkeypatch, bounded):
+        monkeypatch.setenv("TRTLLM_RETIRE_ADMISSION_DIAGNOSTICS", "1")
+        manager, scheduler, decoder, candidate = TestBoundedCompletionPrefill().setup(
+            monkeypatch, enabled=bounded
+        )
+        candidate.py_execution_recovery_pending = True
+        manager.has_execution_residency = False
+        # The mock models an exact full-completion rejection; native query
+        # callback lifetime and counterfactuals are covered in accounting tests.
+        manager.execution_completion_try_admit.side_effect = lambda *args, **kwargs: False
+        result = scheduler.schedule_request([decoder, candidate], set())
+        assert result.context_requests == []
+        assert result.generation_requests == [decoder]
+        record = scheduler.execution_scheduling_snapshot()["admission_diagnostics"]["requests"][0]
+        assert record["state"] == (
+            "blocked_bounded_prefill_blocked_recovery"
+            if bounded
+            else "blocked_full_completion_capacity"
+        )
+        assert "blocked_context_prepare_or_iteration_budget" not in record["reasons"]
 
 
 @pytest.mark.parametrize("active", [False, True])

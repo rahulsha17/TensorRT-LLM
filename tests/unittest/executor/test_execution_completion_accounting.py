@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
 
@@ -48,6 +49,9 @@ def manager():
     )
     value.execution_completion_try_bounded_prefill = MethodType(
         KVCacheManagerV2.execution_completion_try_bounded_prefill, value
+    )
+    value.execution_admission_demand_snapshot = MethodType(
+        KVCacheManagerV2.execution_admission_demand_snapshot, value
     )
 
     def create(request_id, *args, **kwargs):
@@ -318,3 +322,119 @@ def test_bounded_rejection_counters_distinguish_native_capacity_causes(manager, 
     )
     assert counters == {"bounded_prefill_" + reason: 1}
     assert manager.kv_cache_map == {}
+
+
+def test_admission_diagnostic_queries_keep_retired_capacity_and_decoder_promises(manager):
+    decoder, prefill, retired, candidate = [request(index) for index in range(1, 5)]
+    for req in (decoder, prefill, retired, candidate):
+        req.state_value = LlmRequestState.CONTEXT_INIT.value
+    decoder.state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
+    prefill.prompt_len, prefill.max_new_tokens = 20, 1
+    retired.is_finished = True
+    candidate.prompt_len, candidate.max_new_tokens = 12, 1
+    caches = [SimpleNamespace(capacity=capacity, is_active=False) for capacity in (8, 4, 8, 4)]
+    manager.kv_cache_map = dict(zip(range(1, 5), caches))
+    manager.impl.get_storage_statistics.return_value = [
+        SimpleNamespace(total=100, free=16, evictable=20, available=36, unavailable=64)
+    ]
+    queries = []
+
+    def native_union(selected, capacities):
+        queries.append((list(selected), list(capacities)))
+        # A native-like shared prefix: the first four tokens are immutable and
+        # common to every owner. Distinct futures therefore are not additive.
+        lengths = [max(cache.capacity, final) for cache, final in zip(selected, capacities)]
+        union = 4 + sum(length - 4 for length in lengths) if lengths else 0
+        return [2 * union]
+
+    manager.impl.get_completion_demand.side_effect = native_union
+    before = [(cache.capacity, cache.is_active) for cache in caches]
+    result = manager.execution_admission_demand_snapshot(
+        [(decoder, caches[0], 0), (prefill, caches[1], 0), (retired, caches[2], 0)],
+        candidate,
+        caches[3],
+        40,
+    )
+    assert [capacities for _, capacities in queries] == [
+        [0, 0, 0],
+        [12, 0, 0],
+        [12, 20, 0],
+        [12],
+        [12, 0, 0, 12],
+        [12, 0, 0, 12],
+    ]
+    assert result["unions"] == dict(
+        allocated_capacity_union_blocks=12,
+        allocated_plus_decoder_completion_union_blocks=16,
+        current_commitment_union_blocks=32,
+        candidate_alone_completion_union_blocks=12,
+        current_plus_candidate_completion_union_blocks=40,
+        allocated_plus_decoder_completion_plus_candidate_union_blocks=24,
+        one_prefill_future_removed_plus_candidate_union_blocks=24,
+    )
+    assert result["owners"][2]["allocated_capacity_tokens"] == 8
+    assert result["owners"][2]["requested_completion_tokens"] == 0
+    assert result["one_prefill_future_removed_request_id"] == 2
+    assert "unknown" in result["protected_align_hold_attribution"]
+    assert result["allocated_capacity_is_hbm_occupancy"] is False
+    assert result["gpu_pool_storage_slots"] == [
+        dict(total=100, free=16, evictable=20, available=36, unavailable=64)
+    ]
+    assert [(cache.capacity, cache.is_active) for cache in caches] == before
+    assert manager.kv_cache_map == dict(zip(range(1, 5), caches))
+    manager._create_kv_cache.assert_not_called()
+    manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_diagnostic_rejects_reused_id_or_changed_allocation_without_query(manager, duplicate):
+    old, candidate = request(1), request(1 if duplicate else 2)
+    old_cache, new_cache = object(), object()
+    manager.kv_cache_map = {1: object(), candidate.py_request_id: new_cache}
+    with pytest.raises(RuntimeError, match="distinct exact owners|identity changed"):
+        manager.execution_admission_demand_snapshot([(old, old_cache, 0)], candidate, new_cache, 4)
+    manager.impl.get_completion_demand.assert_not_called()
+    manager._create_kv_cache.assert_not_called()
+    manager.free_resources.assert_not_called()
+
+
+def test_diagnostic_owner_limit_does_not_query_a_truncated_union(manager):
+    result = manager.execution_admission_demand_snapshot(
+        [(request(index), object(), 0) for index in range(65)], request(66), object(), 99
+    )
+    assert result == dict(unavailable="owner_limit", owner_count=65)
+    manager.impl.get_completion_demand.assert_not_called()
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_diagnostic_callback_runs_before_candidate_cleanup_and_cannot_change_decision(
+    manager, accepted
+):
+    req = request()
+    observed = []
+
+    def observe(cache, demand):
+        assert manager.kv_cache_map[1] is cache
+        observed.append((cache, demand))
+        raise RuntimeError("diagnostic failure")
+
+    assert (
+        manager.execution_completion_try_admit(
+            [], req, 5 if accepted else 4, admission_observer=observe
+        )
+        is accepted
+    )
+    assert observed[0][1] == 5
+    assert manager.kv_cache_map == ({1: observed[0][0]} if accepted else {})
+    assert manager.free_resources.call_count == int(not accepted)
+    assert manager.impl.get_completion_demand.call_count == 1
+
+
+def test_diagnostic_reports_no_slot_without_inventing_a_candidate(manager):
+    manager._create_kv_cache.side_effect = None
+    manager._create_kv_cache.return_value = None
+    observer = Mock()
+    assert not manager.execution_completion_try_admit([], request(), 5, admission_observer=observer)
+    observer.assert_called_once_with(None, None)
+    manager.impl.get_completion_demand.assert_not_called()
+    manager.free_resources.assert_not_called()
