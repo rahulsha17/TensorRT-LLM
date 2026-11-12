@@ -8177,3 +8177,250 @@ class TestAdmissionPolicyModes:
         monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", policy)
         with pytest.raises(ValueError, match="Unknown TRTLLM_RETIRE_AGED_ADMISSION_POLICY"):
             TestAgedCachedAdmission().setup(monkeypatch)
+
+
+class TestBoundedAdmissionPreference:
+    def setup(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", "bounded")
+        return TestAgedCachedAdmission().setup(monkeypatch)
+
+    def rescue(self, monkeypatch):
+        helper = TestAgedCachedAdmission()
+        manager, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        victim = helper.fresh(3, 384)
+        clock[0] = 3.0
+        scheduler.schedule_request([decoder, cached, victim], set())
+        clock[0] = 11.1
+        result = scheduler.schedule_request([decoder, cached, victim], set())
+        assert result.generation_requests == [decoder]
+        assert result.context_requests == []
+        assert scheduler._admission_fairness_wait.request is victim
+        assert scheduler._admission_ticket is None
+        return manager, scheduler, decoder, cached, victim, clock, matches
+
+    def test_expired_holder_cannot_reacquire_another_full_lease(self, monkeypatch):
+        helper = TestAgedCachedAdmission()
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        for now in (10.2, 12.3, 20.0, 30.0):
+            clock[0] = now
+            fresh = helper.fresh(3)
+            result = scheduler.schedule_request([decoder, cached, fresh], set())
+            assert result.context_requests == [fresh]
+            del manager.kv_cache_map[3]
+            assert scheduler._admission_ticket is None
+        assert scheduler._admission_waits[2].ticket_seconds == 8.0
+        snapshot = scheduler.execution_scheduling_snapshot()
+        assert snapshot["admission_ticket_grants"] == 1
+        assert snapshot["admission_ticket_budget_exhausted"] == 1
+
+    def test_partial_lease_reentry_keeps_only_remaining_budget(self, monkeypatch):
+        helper = TestAgedCachedAdmission()
+        _, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        clock[0] = 4.1
+        matches[2] = 0
+        scheduler.schedule_request([decoder, cached], set())
+        assert scheduler._admission_ticket is None
+        assert scheduler._admission_waits[2].ticket_seconds == pytest.approx(2.0)
+        matches[2] = 320
+        for now in (5.0, 6.0, 6.2):
+            clock[0] = now
+            scheduler.schedule_request([decoder, cached], set())
+        assert scheduler._admission_ticket.request is cached
+        assert scheduler._admission_deadline == pytest.approx(12.2)
+        clock[0] = 12.3
+        scheduler.schedule_request([decoder, cached], set())
+        assert scheduler._admission_ticket is None
+        assert scheduler._admission_waits[2].ticket_seconds == 8.0
+
+    def test_policy_deferred_victim_earns_turn_without_native_match_observation(self, monkeypatch):
+        helper = TestAgedCachedAdmission()
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        victim = helper.fresh(3, 384)
+        manager.execution_completion_try_admit.reset_mock()
+        for now in (3.0, 5.0, 9.0):
+            clock[0] = now
+            scheduler.schedule_request([decoder, cached, victim], set())
+        wait = scheduler._admission_waits[3]
+        assert wait.pending_since == wait.bypass_since == 3.0
+        assert wait.blocked_since is None and wait.rejections == 0
+        assert all(
+            call.args[1] is not victim
+            for call in manager.execution_completion_try_admit.call_args_list
+        )
+        clock[0] = 11.1
+        scheduler.schedule_request([decoder, cached, victim], set())
+        assert scheduler._admission_fairness_wait is wait
+        assert any(
+            call.args[1] is victim for call in manager.execution_completion_try_admit.call_args_list
+        )
+        del manager.kv_cache_map[decoder.py_request_id]
+        clock[0] = 11.2
+        result = scheduler.schedule_request([cached, victim], set())
+        assert result.context_requests == [victim]
+        assert scheduler._admission_fairness_wait is None
+        assert scheduler.execution_scheduling_snapshot()["admission_fairness_fulfilled"] == 1
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+
+    @pytest.mark.parametrize("policy", ["legacy", "bounded"])
+    def test_older_cold_request_wins_release_boundary_when_both_candidates_fit(
+        self, monkeypatch, policy
+    ):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", policy)
+        helper = TestAgedCachedAdmission()
+        manager, scheduler, decoder, cached, clock, _ = helper.setup(monkeypatch)
+        older = helper.fresh(3, 384)
+        for now in (0.0, 1.0, 2.1, 10.2, 12.3):
+            clock[0] = now
+            result = scheduler.schedule_request([decoder, older, cached], set())
+            assert result.context_requests == []
+            assert result.generation_requests == [decoder]
+        del manager.kv_cache_map[decoder.py_request_id]
+        result = scheduler.schedule_request([cached, older], set())
+        assert result.context_requests == ([older] if policy == "bounded" else [cached])
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+
+    def test_successive_holders_do_not_restart_victim_bypass_age(self, monkeypatch):
+        helper = TestAgedCachedAdmission()
+        _, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        victim = helper.fresh(3, 384)
+        clock[0] = 3.0
+        scheduler.schedule_request([decoder, cached, victim], set())
+        replacement = helper.fresh(4, 384)
+        matches[4] = 320
+        for now in (4.0, 5.0, 6.2):
+            clock[0] = now
+            scheduler.schedule_request([decoder, replacement, victim], set())
+        assert scheduler._admission_ticket.request is replacement
+        assert scheduler._admission_waits[3].bypass_since == 3.0
+        clock[0] = 11.1
+        scheduler.schedule_request([decoder, replacement, victim], set())
+        assert scheduler._admission_ticket is None
+        assert scheduler._admission_fairness_wait.request is victim
+        assert scheduler.execution_scheduling_snapshot()["admission_ticket_yielded"] == 1
+        assert scheduler._admission_waits[4].ticket_seconds == pytest.approx(4.9)
+
+    @pytest.mark.parametrize("change", ["cancel", "remove", "epoch", "identity", "inflight"])
+    def test_fairness_turn_is_bound_to_exact_pending_lifetime(self, monkeypatch, change):
+        from tensorrt_llm.execution_version import ExecutionVersion
+
+        _, scheduler, decoder, cached, victim, clock, _ = self.rescue(monkeypatch)
+        old = scheduler._admission_fairness_wait
+        inflight = set()
+        if change == "cancel":
+            victim.is_finished = True
+            victim.state_value = GEN_TO_COMPLETE
+        elif change == "epoch":
+            victim.py_execution_version = ExecutionVersion("tenant", "3", 1)
+        elif change == "identity":
+            victim = TestAgedCachedAdmission.fresh(3, 384)
+        elif change == "inflight":
+            inflight.add(3)
+        clock[0] = 11.2
+        active = [decoder, cached] if change == "remove" else [decoder, cached, victim]
+        scheduler.schedule_request(active, inflight)
+        assert scheduler._admission_fairness_wait is not old
+        assert scheduler.execution_scheduling_snapshot()["admission_fairness_invalidated"] == 1
+        if change in ("epoch", "identity"):
+            assert scheduler._admission_waits[3].pending_since == 11.2
+            assert scheduler._admission_waits[3].ticket_seconds == 0.0
+            assert scheduler._admission_waits[3].bypass_since is None
+
+    def test_fairness_idle_escape_keeps_retired_physical_claim_charged(self, monkeypatch):
+        manager, scheduler, decoder, _, victim, clock, _ = self.rescue(monkeypatch)
+        decoder.is_finished = True
+        decoder.state_value = GEN_TO_COMPLETE
+        fresh = TestAgedCachedAdmission.fresh(4)
+        clock[0] = 11.2
+        result = scheduler.schedule_request([decoder, victim, fresh], set())
+        assert result.context_requests == [fresh] and result.generation_requests == []
+        assert manager.kv_cache_map[1].capacity == 321
+        assert scheduler._admission_fairness_wait.request is victim
+        assert scheduler.execution_scheduling_snapshot()["admission_fairness_idle_escapes"] == 1
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+
+    def test_fairness_physical_prepare_stop_does_not_block_idle_escape(self, monkeypatch):
+        manager, scheduler, _, _, victim, clock, _ = self.rescue(monkeypatch)
+        del manager.kv_cache_map[1]
+        prepare = manager.prepare_context.side_effect
+        manager.prepare_context.side_effect = lambda req, **kwargs: (
+            False if req is victim else prepare(req, **kwargs)
+        )
+        manager.can_evict = False
+        fresh = TestAgedCachedAdmission.fresh(4)
+        clock[0] = 11.2
+        result = scheduler.schedule_request([victim, fresh], set())
+        assert result.context_requests == [fresh]
+        assert victim.py_request_id not in manager.kv_cache_map
+        assert result.paused_requests == result.recompute_paused_requests == []
+
+    def test_admitted_bounded_owner_promotes_before_fairness_turn(self, monkeypatch):
+        manager, scheduler, _, _, victim, clock, _ = self.rescue(monkeypatch)
+        partial = TestAgedCachedAdmission.fresh(4, 384)
+        partial.is_first_context_chunk = False
+        partial.context_current_position = 128
+        partial.context_remaining_length = 256
+        manager.kv_cache_map[4] = Mock(capacity=128, num_committed_tokens=0, is_active=True)
+        scheduler._completion_claims[4] = (partial, manager.kv_cache_map[4], 6)
+        scheduler._bounded_contexts[4] = 128
+        del manager.kv_cache_map[1]
+        clock[0] = 11.2
+        result = scheduler.schedule_request([victim, partial], set())
+        assert result.context_requests == [partial]
+        assert scheduler._bounded_contexts == {}
+        assert manager.kv_cache_map[4].capacity == 384
+        assert scheduler._admission_fairness_wait.request is victim
+
+    def test_unversioned_victim_gets_fairness_without_cached_ticket_eligibility(self, monkeypatch):
+        helper = TestAgedCachedAdmission()
+        manager, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        victim = helper.fresh(3, 384)
+        victim.py_execution_version = None
+        matches[3] = 320
+        for now in (3.0, 5.0, 11.1):
+            clock[0] = now
+            scheduler.schedule_request([decoder, cached, victim], set())
+        assert scheduler._admission_fairness_wait.request is victim
+        assert scheduler._admission_waits[3].version is None
+        assert scheduler._admission_ticket is None
+        del manager.kv_cache_map[1]
+        result = scheduler.schedule_request([cached, victim], set())
+        assert result.context_requests == [victim]
+        assert scheduler.execution_scheduling_snapshot()["admission_ticket_grants"] == 1
+
+    def test_unversioned_request_cannot_acquire_cached_ticket(self, monkeypatch):
+        _, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        cached.py_execution_version = None
+        for now in (0.0, 1.0, 2.1, 10.0):
+            clock[0] = now
+            scheduler.schedule_request([decoder, cached], set())
+        assert scheduler._admission_ticket is None
+        assert scheduler.execution_scheduling_snapshot()["admission_ticket_grants"] == 0
+
+    @pytest.mark.parametrize("fairness", [False, True])
+    def test_incomplete_tracking_disables_preference_and_veto(self, monkeypatch, fairness):
+        helper = TestAgedCachedAdmission()
+        if fairness:
+            manager, scheduler, decoder, cached, victim, clock, _ = self.rescue(monkeypatch)
+            initial = [cached, victim]
+        else:
+            manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+            helper.age(scheduler, decoder, cached, clock)
+            initial = [cached]
+        pending = [helper.fresh(10 + index, 384) for index in range(128)]
+        fitting = helper.fresh(200)
+        clock[0] += 0.1
+        result = scheduler.schedule_request([decoder, *initial, *pending, fitting], set())
+        assert result.context_requests == [fitting]
+        assert result.generation_requests == [decoder]
+        assert len(scheduler._admission_waits) == 128
+        assert fitting.py_request_id not in scheduler._admission_waits
+        assert scheduler.execution_scheduling_snapshot()["admission_policy_fallbacks"] == 1
+        assert scheduler._admission_ticket is None
+        assert (scheduler._admission_fairness_wait is not None) == fairness
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks

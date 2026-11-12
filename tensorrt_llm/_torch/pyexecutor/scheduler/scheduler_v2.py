@@ -61,11 +61,14 @@ class _RecomputePauseState:
 @dataclass
 class _AdmissionWait:
     request: LlmRequest
-    version: ExecutionVersion
+    version: ExecutionVersion | None
     ordinal: int
+    pending_since: float
     blocked_since: float | None = None
     rejections: int = 0
     last_rejection_pass: int = -1
+    bypass_since: float | None = None
+    ticket_seconds: float = 0.0
 
 
 class BudgetTracker:
@@ -310,12 +313,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._completion_deferred_contexts: dict[int, LlmRequest] = {}
         self._aged_admission = False
         self._aged_admission_policy = "off"
+        self._bounded_admission = False
+        self._admission_policy_suppressed = False
         self._admission_waits: dict[int, _AdmissionWait] = {}
         self._admission_ticket: _AdmissionWait | None = None
+        self._admission_fairness_wait: _AdmissionWait | None = None
         self._admission_next_ordinal = 0
         self._admission_pass = 0
         self._admission_now = 0.0
         self._admission_deadline = 0.0
+        self._admission_ticket_started = 0.0
         self._admission_cooldown_until = 0.0
         self._revision_policy: RevisionSchedulingPolicy | None = None
         self._adaptive_prefill = False
@@ -344,8 +351,17 @@ class KVCacheV2Scheduler(RequestScheduler):
             admission_ticket_fulfilled=0,
             admission_ticket_expired=0,
             admission_ticket_invalidated=0,
+            admission_ticket_yielded=0,
+            admission_ticket_budget_exhausted=0,
             admission_ticket_deferrals=0,
             admission_ticket_idle_escapes=0,
+            admission_bypass_started=0,
+            admission_policy_fallbacks=0,
+            admission_fairness_grants=0,
+            admission_fairness_fulfilled=0,
+            admission_fairness_invalidated=0,
+            admission_fairness_deferrals=0,
+            admission_fairness_idle_escapes=0,
             admission_tracking_overflow=0,
         )
 
@@ -405,10 +421,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             if not self._shared_completion_budget or self._completion_budget_blocks is None:
                 raise ValueError("Aged RETIRE admission requires shared completion budgeting")
             policy = os.environ.get("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", "legacy")
-            if policy not in ("legacy", "rank_only"):
+            if policy not in ("legacy", "rank_only", "bounded"):
                 raise ValueError("Unknown TRTLLM_RETIRE_AGED_ADMISSION_POLICY")
             self._aged_admission = True
             self._aged_admission_policy = policy
+            self._bounded_admission = policy == "bounded"
 
     def _enable_revision_policy(self) -> None:
         settings = [
@@ -502,6 +519,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             aged_admission_policy=self._aged_admission_policy,
             admission_min_age_ms=2000,
             admission_max_hold_ms=8000,
+            admission_bypass_trigger_ms=8000,
             admission_cooldown_ms=2000,
             admission_min_cached_percent=75,
             admission_tracking_limit=self._ADMISSION_TRACKING_LIMIT,
@@ -510,13 +528,28 @@ class KVCacheV2Scheduler(RequestScheduler):
     _ADMISSION_TRACKING_LIMIT = 128
     _ADMISSION_MIN_AGE = 2.0
     _ADMISSION_MAX_HOLD = 8.0
+    _ADMISSION_BYPASS_TRIGGER = 8.0
     _ADMISSION_COOLDOWN = 2.0
 
     def _release_admission_ticket(self, reason: str) -> None:
         if self._admission_ticket is not None:
+            if self._bounded_admission:
+                wait = self._admission_ticket
+                previous = wait.ticket_seconds
+                wait.ticket_seconds = min(
+                    self._ADMISSION_MAX_HOLD,
+                    previous + max(0.0, self._admission_now - self._admission_ticket_started),
+                )
+                if previous < self._ADMISSION_MAX_HOLD <= wait.ticket_seconds:
+                    self._revision_metrics["admission_ticket_budget_exhausted"] += 1
             self._revision_metrics["admission_ticket_" + reason] += 1
             self._admission_ticket = None
             self._admission_cooldown_until = self._admission_now + self._ADMISSION_COOLDOWN
+
+    def _release_admission_fairness(self, reason: str) -> None:
+        if self._admission_fairness_wait is not None:
+            self._revision_metrics["admission_fairness_" + reason] += 1
+            self._admission_fairness_wait = None
 
     def _refresh_admission_waits(self, requests: RequestList) -> None:
         if not self._aged_admission:
@@ -529,7 +562,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             if req.is_finished is not True
             and req.state_value == self._context_init_state_value
             and req.is_first_context_chunk
-            and req.py_execution_version is not None
+            and (req.py_execution_version is not None or self._bounded_admission)
             and req.py_request_id not in self._completion_claims
         }
         self._admission_waits = {
@@ -538,6 +571,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             if eligible.get(key) is wait.request
             and wait.request.py_execution_version == wait.version
         }
+        fairness = self._admission_fairness_wait
+        if (
+            fairness is not None
+            and self._admission_waits.get(fairness.request.py_request_id) is not fairness
+        ):
+            self._release_admission_fairness("invalidated")
         ticket = self._admission_ticket
         if ticket is not None:
             if self._admission_waits.get(ticket.request.py_request_id) is not ticket:
@@ -551,9 +590,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 self._revision_metrics["admission_tracking_overflow"] += 1
                 break
             self._admission_waits[key] = _AdmissionWait(
-                req, req.py_execution_version, self._admission_next_ordinal
+                req, req.py_execution_version, self._admission_next_ordinal, self._admission_now
             )
             self._admission_next_ordinal += 1
+        self._admission_policy_suppressed = self._bounded_admission and any(
+            key not in self._admission_waits for key in eligible
+        )
 
     def _observe_admission_rejection(self, req: LlmRequest, cached_tokens: int) -> None:
         wait = self._admission_waits.get(req.py_request_id)
@@ -581,21 +623,78 @@ class KVCacheV2Scheduler(RequestScheduler):
         ticket = self._admission_ticket
         if ticket is not None and id(ticket.request) not in present:
             self._release_admission_ticket("invalidated")
-        if self._admission_ticket is None and self._admission_now >= self._admission_cooldown_until:
+        if self._bounded_admission:
+            fairness = self._admission_fairness_wait
+            if fairness is not None and id(fairness.request) not in present:
+                self._release_admission_fairness("invalidated")
+            self._admission_policy_suppressed = self._admission_policy_suppressed or any(
+                req.py_request_id not in self._completion_claims
+                and (
+                    req.py_request_id not in self._admission_waits
+                    or self._admission_waits[req.py_request_id].request is not req
+                )
+                for req in pending
+            )
+            if self._admission_policy_suppressed:
+                # Without complete lifetime coverage, preserve ordinary order
+                # and never let tracked requests veto untracked work.
+                self._release_admission_ticket("yielded")
+                self._revision_metrics["admission_policy_fallbacks"] += 1
+                return
+            if self._admission_fairness_wait is None:
+                bypassed = [
+                    wait
+                    for wait in self._admission_waits.values()
+                    if id(wait.request) in present
+                    and wait.bypass_since is not None
+                    and self._admission_now - wait.bypass_since >= self._ADMISSION_BYPASS_TRIGGER
+                ]
+                if bypassed:
+                    self._admission_fairness_wait = min(
+                        bypassed, key=lambda wait: (wait.pending_since, wait.ordinal)
+                    )
+                    self._release_admission_ticket("yielded")
+                    self._revision_metrics["admission_fairness_grants"] += 1
+        if (
+            self._admission_ticket is None
+            and self._admission_fairness_wait is None
+            and self._admission_now >= self._admission_cooldown_until
+        ):
             eligible = [
                 wait
                 for wait in self._admission_waits.values()
                 if id(wait.request) in present
+                and wait.version is not None
                 and wait.blocked_since is not None
                 and wait.rejections >= 2
-                and self._admission_now - wait.blocked_since >= self._ADMISSION_MIN_AGE
+                and self._admission_now
+                - (wait.pending_since if self._bounded_admission else wait.blocked_since)
+                >= self._ADMISSION_MIN_AGE
+                and (not self._bounded_admission or wait.ticket_seconds < self._ADMISSION_MAX_HOLD)
             ]
             if eligible:
                 self._admission_ticket = min(eligible, key=lambda wait: wait.ordinal)
-                self._admission_deadline = self._admission_now + self._ADMISSION_MAX_HOLD
+                remaining = self._ADMISSION_MAX_HOLD
+                if self._bounded_admission:
+                    remaining -= self._admission_ticket.ticket_seconds
+                self._admission_ticket_started = self._admission_now
+                self._admission_deadline = self._admission_now + remaining
                 self._revision_metrics["admission_ticket_grants"] += 1
-        ticket = self._admission_ticket
+        ticket = self._admission_fairness_wait or self._admission_ticket
         if ticket is not None:
+            if self._bounded_admission:
+                for req in pending:
+                    wait = self._admission_waits.get(req.py_request_id)
+                    if (
+                        wait is not None
+                        and wait.request is req
+                        and wait is not ticket
+                        and wait.bypass_since is None
+                    ):
+                        # Elapsed time since first policy bypass includes cooldowns;
+                        # it is not a measurement of time blocked by this policy.
+                        wait.bypass_since = self._admission_now
+                        self._revision_metrics["admission_bypass_started"] += 1
             pending.sort(
                 key=lambda req: (
                     0
@@ -607,9 +706,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
     def _defer_for_admission_ticket(self, req: LlmRequest, productive: bool) -> bool:
-        if self._aged_admission_policy == "rank_only":
+        if self._aged_admission_policy == "rank_only" or self._admission_policy_suppressed:
             return False
-        ticket = self._admission_ticket
+        ticket = self._admission_fairness_wait or self._admission_ticket
         if ticket is None or req.py_request_id in self._completion_claims:
             return False
         wait = self._admission_waits.get(req.py_request_id)
@@ -621,9 +720,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             return False
         if not productive:
-            self._revision_metrics["admission_ticket_idle_escapes"] += 1
+            counter = (
+                "admission_fairness_idle_escapes"
+                if self._admission_fairness_wait is not None
+                else "admission_ticket_idle_escapes"
+            )
+            self._revision_metrics[counter] += 1
             return False
-        self._revision_metrics["admission_ticket_deferrals"] += 1
+        counter = (
+            "admission_fairness_deferrals"
+            if self._admission_fairness_wait is not None
+            else "admission_ticket_deferrals"
+        )
+        self._revision_metrics[counter] += 1
         return True
 
     def _enable_completion_budget(self) -> None:
@@ -835,6 +944,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._completion_claims[req.py_request_id] = (req, cache, self._completion_blocks(req))
         if self._admission_ticket is not None and self._admission_ticket.request is req:
             self._release_admission_ticket("fulfilled")
+        if (
+            self._admission_fairness_wait is not None
+            and self._admission_fairness_wait.request is req
+        ):
+            self._release_admission_fairness("fulfilled")
 
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
@@ -1269,6 +1383,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                         or (
                             self._admission_ticket is not None
                             and self._admission_ticket.request is req
+                        )
+                        or (
+                            self._admission_fairness_wait is not None
+                            and self._admission_fairness_wait.request is req
                         )
                     ) and not (evicted or recompute_paused):
                         # Priority must not turn a failed recovery admission
