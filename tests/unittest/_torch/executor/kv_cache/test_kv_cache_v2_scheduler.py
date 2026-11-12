@@ -8133,3 +8133,47 @@ class TestAgedCachedAdmission:
         assert fresh.py_request_id not in manager.kv_cache_map
         manager.execution_completion_try_bounded_prefill.assert_not_called()
         assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+
+
+class TestAdmissionPolicyModes:
+    @pytest.mark.parametrize("policy", ["legacy", "rank_only"])
+    def test_rank_only_keeps_priority_without_vetoing_fitting_work(self, monkeypatch, policy):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", policy)
+        helper = TestAgedCachedAdmission()
+        manager, scheduler, decoder, cached, clock, _ = helper.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        fresh = helper.fresh(3)
+        result = scheduler.schedule_request([decoder, cached, fresh], set())
+        assert result.generation_requests == [decoder]
+        assert result.context_requests == ([fresh] if policy == "rank_only" else [])
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+        if policy == "rank_only":
+            del manager.kv_cache_map[fresh.py_request_id]
+        del manager.kv_cache_map[decoder.py_request_id]
+        clock[0] = 3.0
+        result = scheduler.schedule_request([helper.fresh(4), cached], set())
+        assert result.context_requests[0] is cached
+        snapshot = scheduler.execution_scheduling_snapshot()
+        assert snapshot["aged_admission_policy"] == policy
+        assert snapshot["admission_ticket_deferrals"] == int(policy == "legacy")
+        assert snapshot["admission_ticket_fulfilled"] == 1
+
+    @pytest.mark.parametrize("policy", ["rank_only", "invalid"])
+    def test_disabled_policy_does_not_change_native_like_admission(self, monkeypatch, policy):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", policy)
+        helper = TestAgedCachedAdmission()
+        manager, scheduler, decoder, cached, _, _ = helper.setup(monkeypatch, enabled=False)
+        fresh = helper.fresh(3)
+        result = scheduler.schedule_request([decoder, cached, fresh], set())
+        assert result.context_requests == [fresh]
+        assert scheduler.execution_scheduling_snapshot()["aged_admission_policy"] == "off"
+        assert scheduler._admission_waits == {}
+        assert all(
+            not call.kwargs for call in manager.execution_completion_try_admit.call_args_list
+        )
+
+    @pytest.mark.parametrize("policy", ["", "invalid"])
+    def test_enabled_policy_rejects_unknown_selector(self, monkeypatch, policy):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", policy)
+        with pytest.raises(ValueError, match="Unknown TRTLLM_RETIRE_AGED_ADMISSION_POLICY"):
+            TestAgedCachedAdmission().setup(monkeypatch)

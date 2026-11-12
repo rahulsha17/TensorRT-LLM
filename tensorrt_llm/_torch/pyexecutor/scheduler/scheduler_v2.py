@@ -309,6 +309,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._bounded_prefill_generators: set[int] = set()
         self._completion_deferred_contexts: dict[int, LlmRequest] = {}
         self._aged_admission = False
+        self._aged_admission_policy = "off"
         self._admission_waits: dict[int, _AdmissionWait] = {}
         self._admission_ticket: _AdmissionWait | None = None
         self._admission_next_ordinal = 0
@@ -403,7 +404,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         if aged == "1":
             if not self._shared_completion_budget or self._completion_budget_blocks is None:
                 raise ValueError("Aged RETIRE admission requires shared completion budgeting")
+            policy = os.environ.get("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", "legacy")
+            if policy not in ("legacy", "rank_only"):
+                raise ValueError("Unknown TRTLLM_RETIRE_AGED_ADMISSION_POLICY")
             self._aged_admission = True
+            self._aged_admission_policy = policy
 
     def _enable_revision_policy(self) -> None:
         settings = [
@@ -480,7 +485,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         stable = [req for req in eligible if req.state_value != self._context_init_state_value]
         return policy.cohort(contexts, stable)
 
-    def execution_scheduling_snapshot(self) -> dict[str, int | bool]:
+    def execution_scheduling_snapshot(self) -> dict[str, int | bool | str]:
         """Return host admission counters; these do not prove GPU execution."""
         policy = self._revision_policy
         return dict(
@@ -494,6 +499,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             shared_completion_budget=self._shared_completion_budget,
             bounded_prefill_enabled=self._bounded_prefill,
             aged_admission_enabled=self._aged_admission,
+            aged_admission_policy=self._aged_admission_policy,
             admission_min_age_ms=2000,
             admission_max_hold_ms=8000,
             admission_cooldown_ms=2000,
@@ -601,6 +607,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
     def _defer_for_admission_ticket(self, req: LlmRequest, productive: bool) -> bool:
+        if self._aged_admission_policy == "rank_only":
+            return False
         ticket = self._admission_ticket
         if ticket is None or req.py_request_id in self._completion_claims:
             return False
