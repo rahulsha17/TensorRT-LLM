@@ -251,3 +251,49 @@ def test_bounded_admission_cannot_finish_prompt_without_completion_claim(manager
     req = request()
     manager.impl.get_completion_demand.return_value = [0]
     assert manager.execution_completion_try_bounded_prefill([], req, 100, 1) == req.prompt_len - 1
+
+
+def test_rejection_observer_uses_existing_exact_match_before_cleanup(manager):
+    req = request()
+    seen = []
+    original = manager._create_kv_cache.side_effect
+
+    def create(*args, **kwargs):
+        cache = original(*args, **kwargs)
+        cache.num_committed_tokens = 6
+        return cache
+
+    manager._create_kv_cache.side_effect = create
+
+    def observe(tokens):
+        assert manager.kv_cache_map[req.py_request_id].num_committed_tokens == tokens
+        seen.append(tokens)
+
+    assert not manager.execution_completion_try_admit([], req, 4, rejection_observer=observe)
+    assert seen == [6]
+    assert manager.kv_cache_map == {}
+    assert manager.impl.get_completion_demand.call_count == 1
+    manager.free_resources.assert_called_once_with(req)
+
+
+def test_rejection_observer_is_not_called_for_success_or_missing_slot(manager):
+    observe = Mock()
+    assert manager.execution_completion_try_admit([], request(), 5, rejection_observer=observe)
+    observe.assert_not_called()
+    manager.kv_cache_map.clear()
+    manager._create_kv_cache.side_effect = lambda *args, **kwargs: None
+    assert not manager.execution_completion_try_admit([], request(), 5, rejection_observer=observe)
+    observe.assert_not_called()
+
+
+def test_rejection_observer_failure_still_releases_only_the_candidate(manager):
+    old = request(2, finished=True)
+    old_cache = object()
+    manager.kv_cache_map[2] = old_cache
+    observe = Mock(side_effect=ValueError("test observer"))
+    with pytest.raises(ValueError, match="test observer"):
+        manager.execution_completion_try_admit(
+            [(old, old_cache, 99)], request(), 4, rejection_observer=observe
+        )
+    assert manager.kv_cache_map == {2: old_cache}
+    assert manager.impl.get_completion_demand.call_args.args[1] == [0, 12]

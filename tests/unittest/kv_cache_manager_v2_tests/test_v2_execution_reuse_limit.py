@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reuse bounds must protect the physical suffix after commit, not just lookup."""
 
+from types import MethodType, SimpleNamespace
+
 import cuda.bindings.runtime as cudart
 import numpy as np
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.execution_alignment import _Reservation
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.execution_alignment import AlignmentInput, AlignmentRequest, WorkerAlignmentState
 from tensorrt_llm.execution_authority import Revision
 from tensorrt_llm.execution_version import ExecutionVersion
@@ -358,3 +361,69 @@ def test_bounded_prefill_counts_partial_match_source_during_private_copy(cache_f
             assert np.all(_read(core, anchor) == 11)
     finally:
         pending.close()
+
+
+def test_aged_admission_match_observation_preserves_native_owners(cache_fixture):
+    core, create, _ = cache_fixture
+    tokens = list(range(12))
+    anchor, retired = create(), create()
+    _fill(core, anchor, 11)
+    _fill(core, retired, 37)
+    anchor.commit(tokens)
+    old = SimpleNamespace(py_request_id=1, prompt_len=12, max_new_tokens=9, is_finished=False)
+    done = SimpleNamespace(py_request_id=2, prompt_len=12, max_new_tokens=9, is_finished=True)
+    candidate = SimpleNamespace(
+        py_request_id=3,
+        prompt_len=20,
+        max_new_tokens=1,
+        is_finished=False,
+        is_first_context_chunk=True,
+        lora_task_id=None,
+        cache_salt=None,
+        execution_reuse_limit=7,
+        is_dummy=False,
+        return_perf_metrics=False,
+    )
+    manager = SimpleNamespace(
+        impl=core,
+        kv_cache_map={1: anchor, 2: retired},
+        conversation_manager=None,
+        _stream=SimpleNamespace(cuda_stream=torch.cuda.current_stream().cuda_stream),
+        enable_block_reuse=True,
+        _context_reuse_tokens=lambda req: tokens[:7],
+    )
+
+    def retain(request_id, lora, matched, **kwargs):
+        cache = core.create_kv_cache(None, matched, expected_prompt_length=20)
+        manager.kv_cache_map[request_id] = cache
+        return cache
+
+    def release(req):
+        manager.kv_cache_map.pop(req.py_request_id).close()
+
+    manager._create_kv_cache = retain
+    manager.free_resources = release
+    manager.execution_completion_demand = MethodType(
+        KVCacheManagerV2.execution_completion_demand, manager
+    )
+    claims = [(old, anchor, 0), (done, retired, 0)]
+    before = core.get_completion_demand([anchor, retired], [20, 0])
+    observed = []
+    assert not KVCacheManagerV2.execution_completion_try_admit(
+        manager, claims, candidate, 1, rejection_observer=observed.append
+    )
+    assert observed == [7]
+    assert set(manager.kv_cache_map) == {1, 2}
+    assert core.get_completion_demand([anchor, retired], [20, 0]) == before
+    assert np.all(_read(core, anchor) == 11)
+    assert np.all(_read(core, retired) == 37)
+    assert anchor.capacity == 12 and retired.capacity == 12
+    assert KVCacheManagerV2.execution_completion_try_admit(
+        manager, claims, candidate, before[0] + 20, rejection_observer=observed.append
+    )
+    try:
+        assert observed == [7]
+        assert manager.kv_cache_map[3].num_committed_tokens == 7
+        assert not manager.kv_cache_map[3].is_active
+    finally:
+        release(candidate)

@@ -7849,3 +7849,287 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
     output = scheduler.schedule_request([loading, generation], set())
     assert output.generation_requests == []
     assert output.recompute_paused_requests == []
+
+
+class TestAgedCachedAdmission:
+    def setup(self, monkeypatch, *, enabled=True):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.pyexecutor.scheduler import scheduler_v2
+
+        clock = [0.0]
+        monkeypatch.setattr(scheduler_v2, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION", str(int(enabled)))
+        manager, scheduler, decoder, cached = TestBoundedCompletionPrefill().setup(
+            monkeypatch, enabled=False
+        )
+        matches = {cached.py_request_id: 320}
+
+        def admit(claims, req, capacity, *, rejection_observer=None):
+            matched = matches.get(req.py_request_id, 0)
+            candidate = Mock(capacity=matched, num_committed_tokens=matched, is_active=False)
+            if manager.execution_completion_demand([*claims, (req, candidate, 0)]) > capacity:
+                if rejection_observer is not None:
+                    rejection_observer(matched)
+                return False
+            manager.kv_cache_map[req.py_request_id] = candidate
+            return True
+
+        def prepare(req, **kwargs):
+            cache = manager.kv_cache_map[req.py_request_id]
+            cache.is_active = True
+            if req.is_first_context_chunk:
+                req.context_current_position = cache.num_committed_tokens
+                req.context_remaining_length = req.prompt_len - req.context_current_position
+            return True
+
+        manager.execution_completion_try_admit.side_effect = admit
+        manager.prepare_context.side_effect = prepare
+        return manager, scheduler, decoder, cached, clock, matches
+
+    @staticmethod
+    def fresh(request_id, tokens=128):
+        req = _revision_request(request_id)
+        req.prompt_len = tokens
+        req.context_remaining_length = tokens
+        req.max_new_tokens = 1
+        req.is_finished = False
+        return req
+
+    def age(self, scheduler, decoder, cached, clock):
+        for now in (0.0, 1.0, 2.1):
+            clock[0] = now
+            result = scheduler.schedule_request([decoder, cached], set())
+            assert result.generation_requests == [decoder]
+            assert result.context_requests == []
+        assert scheduler._admission_ticket.request is cached
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_continuous_overtaking_stops_without_weakening_capacity(self, monkeypatch, enabled):
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch, enabled=enabled)
+        for iteration, now in enumerate((0.0, 1.0, 2.1, 3.0, 4.0)):
+            clock[0] = now
+            fresh = self.fresh(10 + iteration)
+            result = scheduler.schedule_request([decoder, cached, fresh], set())
+            assert result.generation_requests == [decoder]
+            assert cached not in result.context_requests
+            assert (fresh in result.context_requests) == (not enabled or now < 2.0)
+            if fresh in result.context_requests:
+                del manager.kv_cache_map[fresh.py_request_id]
+            assert cached.py_request_id not in manager.kv_cache_map
+            assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+        counters = scheduler.execution_scheduling_snapshot()
+        assert counters["admission_ticket_grants"] == int(enabled)
+        assert counters["admission_ticket_deferrals"] == (3 if enabled else 0)
+        del manager.kv_cache_map[decoder.py_request_id]
+        clock[0] = 5.0
+        result = scheduler.schedule_request([self.fresh(30), cached], set())
+        if enabled:
+            assert result.context_requests[0] is cached
+            assert scheduler._admission_ticket is None
+            assert scheduler.execution_scheduling_snapshot()["admission_ticket_fulfilled"] == 1
+
+    def test_default_off_does_not_observe_or_retain_request_records(self, monkeypatch):
+        manager, scheduler, decoder, cached, _, _ = self.setup(monkeypatch, enabled=False)
+        scheduler.schedule_request([decoder, cached], set())
+        assert not scheduler.execution_scheduling_snapshot()["aged_admission_enabled"]
+        assert scheduler._admission_waits == {} and scheduler._admission_ticket is None
+        assert manager.execution_completion_try_admit.call_args.kwargs == {}
+
+    @pytest.mark.parametrize("matched", [0, 287, 288])
+    def test_exact_match_threshold_controls_eligibility(self, monkeypatch, matched):
+        _, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch)
+        matches[cached.py_request_id] = matched
+        for now in (0.0, 1.0, 2.1):
+            clock[0] = now
+            scheduler.schedule_request([decoder, cached], set())
+        assert (scheduler._admission_ticket is not None) == (matched >= 288)
+
+    def test_repeated_rejections_require_elapsed_time(self, monkeypatch):
+        _, scheduler, decoder, cached, _, _ = self.setup(monkeypatch)
+        for _ in range(20):
+            scheduler.schedule_request([decoder, cached], set())
+        assert scheduler._admission_ticket is None
+
+    @pytest.mark.parametrize("change", ["cancel", "remove", "epoch", "identity", "inflight"])
+    def test_ticket_is_invalidated_for_exact_request_lifetime(self, monkeypatch, change):
+        from tensorrt_llm.execution_version import ExecutionVersion
+
+        _, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        self.age(scheduler, decoder, cached, clock)
+        inflight = set()
+        if change == "cancel":
+            cached.is_finished = True
+            cached.state_value = GEN_TO_COMPLETE
+        elif change == "epoch":
+            cached.py_execution_version = ExecutionVersion("tenant", "2", 1)
+        elif change == "identity":
+            cached = self.fresh(2, 384)
+        elif change == "inflight":
+            inflight.add(cached.py_request_id)
+        active = [decoder] if change == "remove" else [decoder, cached]
+        scheduler.schedule_request(active, inflight)
+        assert scheduler._admission_ticket is None
+        assert scheduler.execution_scheduling_snapshot()["admission_ticket_invalidated"] == 1
+        if change in ("cancel", "remove"):
+            assert 2 not in scheduler._admission_waits
+
+    def test_evicted_match_invalidates_ticket_without_retaining_cache(self, monkeypatch):
+        manager, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch)
+        self.age(scheduler, decoder, cached, clock)
+        matches[cached.py_request_id] = 0
+        fresh = self.fresh(3)
+        result = scheduler.schedule_request([decoder, cached, fresh], set())
+        assert result.context_requests == [fresh]
+        assert scheduler._admission_ticket is None
+        assert cached.py_request_id not in manager.kv_cache_map
+
+    def test_expiry_has_a_cooldown_before_another_ticket(self, monkeypatch):
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        self.age(scheduler, decoder, cached, clock)
+        for now in (10.1, 11.0):
+            clock[0] = now
+            fresh = self.fresh(3)
+            result = scheduler.schedule_request([decoder, cached, fresh], set())
+            assert result.context_requests == [fresh]
+            del manager.kv_cache_map[3]
+            assert scheduler._admission_ticket is None
+        clock[0] = 12.1
+        scheduler.schedule_request([decoder, cached], set())
+        assert scheduler._admission_ticket.request is cached
+        assert scheduler.execution_scheduling_snapshot()["admission_ticket_expired"] == 1
+
+    def test_idle_escape_keeps_other_context_runnable(self, monkeypatch):
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        self.age(scheduler, decoder, cached, clock)
+        decoder.is_finished = True
+        decoder.state_value = GEN_TO_COMPLETE
+        # The retired allocation remains charged until actual cleanup. No
+        # decoder is scheduled, so the ticket must not stop otherwise fitting work.
+        fresh = self.fresh(3)
+        result = scheduler.schedule_request([decoder, cached, fresh], set())
+        assert result.generation_requests == []
+        assert result.context_requests == [fresh]
+        assert manager.kv_cache_map[1].capacity == 321
+        assert scheduler.execution_scheduling_snapshot()["admission_ticket_idle_escapes"] == 1
+
+    def test_existing_bounded_owner_promotes_before_the_ticket(self, monkeypatch):
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        self.age(scheduler, decoder, cached, clock)
+        partial = self.fresh(3, 384)
+        partial.is_first_context_chunk = False
+        partial.context_current_position = 128
+        partial.context_remaining_length = 256
+        manager.kv_cache_map[3] = Mock(capacity=128, num_committed_tokens=0, is_active=True)
+        scheduler._completion_claims[3] = (partial, manager.kv_cache_map[3], 6)
+        scheduler._bounded_contexts[3] = 128
+        del manager.kv_cache_map[1]
+        result = scheduler.schedule_request([cached, partial], set())
+        assert result.context_requests == [partial]
+        assert scheduler._bounded_contexts == {}
+        assert manager.kv_cache_map[3].capacity == 384
+        assert scheduler._admission_ticket.request is cached
+
+    def test_records_are_bounded_and_removed_when_requests_leave(self, monkeypatch):
+        _, scheduler, decoder, _, _, _ = self.setup(monkeypatch)
+        pending = [self.fresh(10 + i, 384) for i in range(140)]
+        scheduler.schedule_request([decoder, *pending], set())
+        assert len(scheduler._admission_waits) == 128
+        assert scheduler.execution_scheduling_snapshot()["admission_tracking_overflow"] == 1
+        scheduler.schedule_request([decoder], set())
+        assert scheduler._admission_waits == {}
+
+    def test_earlier_context_is_not_deferred_by_younger_ticket(self, monkeypatch):
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        older = self.fresh(3, 384)
+        scheduler.schedule_request([decoder, older, cached], set())
+        for now in (1.0, 2.1):
+            clock[0] = now
+            scheduler.schedule_request([decoder, older, cached], set())
+        older.prompt_len = 128
+        older.context_remaining_length = 128
+        result = scheduler.schedule_request([decoder, older, cached], set())
+        assert result.context_requests == [older]
+        assert scheduler._admission_ticket.request is cached
+
+    @pytest.mark.parametrize("value", ["invalid", "2"])
+    def test_flag_rejects_invalid_values(self, monkeypatch, value):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION", value)
+        with pytest.raises(ValueError, match="AGED_ADMISSION must be"):
+            _completion_scheduler(monkeypatch)
+
+    def test_flag_requires_shared_completion_budget(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION", "1")
+        with pytest.raises(ValueError, match="requires shared completion budgeting"):
+            _completion_scheduler(monkeypatch)
+
+    def test_idle_physical_prepare_stop_does_not_block_later_work(self, monkeypatch):
+        manager, scheduler, decoder, cached, clock, _ = self.setup(monkeypatch)
+        self.age(scheduler, decoder, cached, clock)
+        del manager.kv_cache_map[1]
+        prepare = manager.prepare_context.side_effect
+        manager.prepare_context.side_effect = lambda req, **kwargs: (
+            False if req is cached else prepare(req, **kwargs)
+        )
+        manager.can_evict = False
+        fresh = self.fresh(3)
+        result = scheduler.schedule_request([cached, fresh], set())
+        assert result.context_requests == [fresh]
+        assert cached.py_request_id not in manager.kv_cache_map
+        assert result.paused_requests == []
+        assert result.recompute_paused_requests == []
+
+    def test_native_without_execution_guard_never_enables_ticket(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION", "1")
+        _, scheduler = _completion_scheduler(monkeypatch, bind_guard=False)
+        assert not scheduler.execution_scheduling_snapshot()["aged_admission_enabled"]
+        scheduler.schedule_request([self.fresh(1)], set())
+        assert scheduler._admission_waits == {}
+
+    def test_fair_share_does_not_bypass_ticket_or_shrink_donor(self, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker
+
+        helper = self
+        manager, scheduler, decoder, cached, clock, _ = helper.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        fresh = helper.fresh(3)
+        scheduler._refresh_admission_waits([decoder, cached, fresh])
+        scheduler._ordinary_prefill_wait[fresh.py_request_id] = (
+            fresh,
+            scheduler._RECOVERY_FAIR_SHARE_PASSES,
+        )
+        donor = helper.fresh(4, 384)
+        donor.is_first_context_chunk = False
+        donor.py_execution_recovery_prefill = True
+        donor.context_current_position = 128
+        donor.context_remaining_length = 256
+        donor.context_chunk_size = 256
+        budget = BudgetTracker(256, 16, None)
+        budget.commit(donor, 256, 0)
+        manager.execution_completion_try_admit.reset_mock()
+        assert scheduler._share_recovery_prefill([fresh], [donor], [], budget, None) is None
+        assert donor.context_chunk_size == 256 and budget.remaining_tokens == 0
+        manager.execution_completion_try_admit.assert_not_called()
+        assert fresh.py_request_id not in manager.kv_cache_map
+        assert scheduler.execution_scheduling_snapshot()["admission_ticket_deferrals"] == 1
+        # The candidate actually fits the optional-share path without the ticket.
+        scheduler._admission_ticket = None
+        assert scheduler._share_recovery_prefill([fresh], [donor], [], budget, None) is fresh
+        assert donor.context_chunk_size == 128
+
+    def test_bounded_fallback_cannot_start_later_work_behind_recovery_ticket(self, monkeypatch):
+        helper = self
+        manager, scheduler, decoder, cached, clock, _ = helper.setup(monkeypatch)
+        helper.age(scheduler, decoder, cached, clock)
+        scheduler._bounded_prefill = True
+        cached.py_execution_recovery_pending = True
+        cached.py_execution_recovery_tokens = 320
+        fresh = helper.fresh(3, 384)
+        manager.execution_completion_try_bounded_prefill.reset_mock()
+        result = scheduler.schedule_request([decoder, cached, fresh], set())
+        assert result.generation_requests == [decoder]
+        assert result.context_requests == []
+        assert scheduler._admission_ticket.request is cached
+        assert fresh.py_request_id not in manager.kv_cache_map
+        manager.execution_completion_try_bounded_prefill.assert_not_called()
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks

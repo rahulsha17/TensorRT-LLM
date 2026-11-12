@@ -3432,6 +3432,8 @@ class KVCacheManagerV2(BaseResourceManager):
         claims: Sequence[tuple[LlmRequest, _KVCache, int]],
         request: LlmRequest,
         capacity_blocks: int,
+        *,
+        rejection_observer: Callable[[int], None] | None = None,
     ) -> bool:
         """Retain the exact candidate match before granting immutable-page credit.
 
@@ -3463,6 +3465,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.execution_completion_demand([*claims, (request, allocation, 0)])
                 <= capacity_blocks
             )
+            if not accepted and rejection_observer is not None:
+                rejection_observer(allocation.num_committed_tokens)
             return accepted
         finally:
             if not accepted:
