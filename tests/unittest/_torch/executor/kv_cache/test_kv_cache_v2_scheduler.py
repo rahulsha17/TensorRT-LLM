@@ -8180,13 +8180,13 @@ class TestAdmissionPolicyModes:
 
 
 class TestBoundedAdmissionPreference:
-    def setup(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", "bounded")
+    def setup(self, monkeypatch, *, policy="bounded"):
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", policy)
         return TestAgedCachedAdmission().setup(monkeypatch)
 
-    def rescue(self, monkeypatch):
+    def rescue(self, monkeypatch, *, policy="bounded"):
         helper = TestAgedCachedAdmission()
-        manager, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch)
+        manager, scheduler, decoder, cached, clock, matches = self.setup(monkeypatch, policy=policy)
         helper.age(scheduler, decoder, cached, clock)
         victim = helper.fresh(3, 384)
         clock[0] = 3.0
@@ -8424,3 +8424,109 @@ class TestBoundedAdmissionPreference:
         assert scheduler._admission_ticket is None
         assert (scheduler._admission_fairness_wait is not None) == fairness
         assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+
+
+class TestRemainingWorkAdmission:
+    def setup(self, monkeypatch, *, policy="bounded_work"):
+        helper = TestAgedCachedAdmission()
+        monkeypatch.setenv("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", policy)
+        manager, scheduler, decoder, older, clock, matches = helper.setup(monkeypatch)
+        matches[2] = 288
+        shorter = helper.fresh(3, 512)
+        matches[3] = 448
+        return manager, scheduler, decoder, older, shorter, clock, matches
+
+    def age(self, scheduler, decoder, older, shorter, clock):
+        for now in (0.0, 1.0, 2.1):
+            clock[0] = now
+            result = scheduler.schedule_request([decoder, older, shorter], set())
+            assert result.generation_requests == [decoder]
+            assert result.context_requests == []
+
+    @pytest.mark.parametrize("policy", ["bounded", "bounded_work"])
+    def test_work_ranks_remaining_prompt_without_changing_native_fit(self, monkeypatch, policy):
+        manager, scheduler, decoder, older, shorter, clock, _ = self.setup(
+            monkeypatch, policy=policy
+        )
+        self.age(scheduler, decoder, older, shorter, clock)
+        chosen = shorter if policy == "bounded_work" else older
+        assert scheduler._admission_ticket.request is chosen
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+        assert 2 not in manager.kv_cache_map and 3 not in manager.kv_cache_map
+        del manager.kv_cache_map[1]
+        result = scheduler.schedule_request([older, shorter], set())
+        assert result.context_requests == [chosen]
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+        assert scheduler.execution_scheduling_snapshot()["admission_work_rank_selections"] == int(
+            policy == "bounded_work"
+        )
+
+    def test_work_tie_uses_pending_age_and_stable_arrival_order(self, monkeypatch):
+        _, scheduler, decoder, older, shorter, clock, matches = self.setup(monkeypatch)
+        matches[2] = 320
+        for now, pending in (
+            (0.0, [older, shorter]),
+            (1.0, [shorter, older]),
+            (2.1, [shorter, older]),
+        ):
+            clock[0] = now
+            scheduler.schedule_request([decoder, *pending], set())
+        assert scheduler._admission_waits[2].remaining_prompt_tokens_hint == 64
+        assert scheduler._admission_waits[3].remaining_prompt_tokens_hint == 64
+        assert scheduler._admission_ticket.request is older
+
+    def test_work_retains_seventy_five_percent_native_match_requirement(self, monkeypatch):
+        _, scheduler, decoder, older, shorter, clock, matches = self.setup(monkeypatch)
+        shorter.prompt_len = shorter.context_remaining_length = 256
+        matches[3] = 191
+        self.age(scheduler, decoder, older, shorter, clock)
+        assert scheduler._admission_waits[3].remaining_prompt_tokens_hint == 65
+        assert scheduler._admission_waits[3].blocked_since is None
+        assert scheduler._admission_ticket.request is older
+
+    def test_stale_work_hint_cannot_replace_exact_admission_or_hold_cache(self, monkeypatch):
+        manager, scheduler, decoder, older, shorter, clock, matches = self.setup(monkeypatch)
+        for now in (0.0, 1.0):
+            clock[0] = now
+            scheduler.schedule_request([decoder, older, shorter], set())
+        matches[3] = 0
+        manager.execution_completion_try_admit.reset_mock()
+        clock[0] = 2.1
+        result = scheduler.schedule_request([decoder, older, shorter], set())
+        assert result.context_requests == []
+        assert manager.execution_completion_try_admit.call_count == 2
+        assert manager.execution_completion_try_admit.call_args_list[0].args[1] is shorter
+        assert scheduler._admission_waits[3].remaining_prompt_tokens_hint == 512
+        assert scheduler._admission_ticket is None
+        assert 2 not in manager.kv_cache_map and 3 not in manager.kv_cache_map
+        assert scheduler._completion_demand() <= scheduler._completion_budget_blocks
+
+    def test_uncached_fairness_turn_precedes_small_remaining_work(self, monkeypatch):
+        manager, scheduler, _, cached, victim, _, _ = TestBoundedAdmissionPreference().rescue(
+            monkeypatch, policy="bounded_work"
+        )
+        assert scheduler._admission_waits[victim.py_request_id].remaining_prompt_tokens_hint == 384
+        assert scheduler._admission_waits[cached.py_request_id].remaining_prompt_tokens_hint == 64
+        del manager.kv_cache_map[1]
+        result = scheduler.schedule_request([cached, victim], set())
+        assert result.context_requests == [victim]
+        assert scheduler.execution_scheduling_snapshot()["admission_fairness_fulfilled"] == 1
+
+    @pytest.mark.parametrize("change", ["epoch", "identity"])
+    def test_work_hint_does_not_cross_request_lifetimes(self, monkeypatch, change):
+        from tensorrt_llm.execution_version import ExecutionVersion
+
+        _, scheduler, decoder, older, shorter, clock, _ = self.setup(monkeypatch)
+        self.age(scheduler, decoder, older, shorter, clock)
+        previous = scheduler._admission_waits[3]
+        if change == "epoch":
+            shorter.py_execution_version = ExecutionVersion("tenant", "3", 1)
+        else:
+            shorter = TestAgedCachedAdmission.fresh(3, 512)
+        clock[0] = 3.0
+        scheduler._refresh_admission_waits([decoder, older, shorter])
+        current = scheduler._admission_waits[3]
+        assert current is not previous
+        assert current.pending_since == 3.0
+        assert current.remaining_prompt_tokens_hint == 0
+        assert current.blocked_since is None and current.ticket_seconds == 0.0

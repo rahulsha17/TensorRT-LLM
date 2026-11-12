@@ -69,6 +69,7 @@ class _AdmissionWait:
     last_rejection_pass: int = -1
     bypass_since: float | None = None
     ticket_seconds: float = 0.0
+    remaining_prompt_tokens_hint: int = 0
 
 
 class BudgetTracker:
@@ -357,6 +358,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             admission_ticket_idle_escapes=0,
             admission_bypass_started=0,
             admission_policy_fallbacks=0,
+            admission_work_rank_selections=0,
             admission_fairness_grants=0,
             admission_fairness_fulfilled=0,
             admission_fairness_invalidated=0,
@@ -421,11 +423,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             if not self._shared_completion_budget or self._completion_budget_blocks is None:
                 raise ValueError("Aged RETIRE admission requires shared completion budgeting")
             policy = os.environ.get("TRTLLM_RETIRE_AGED_ADMISSION_POLICY", "legacy")
-            if policy not in ("legacy", "rank_only", "bounded"):
+            if policy not in ("legacy", "rank_only", "bounded", "bounded_work"):
                 raise ValueError("Unknown TRTLLM_RETIRE_AGED_ADMISSION_POLICY")
             self._aged_admission = True
             self._aged_admission_policy = policy
-            self._bounded_admission = policy == "bounded"
+            self._bounded_admission = policy in ("bounded", "bounded_work")
 
     def _enable_revision_policy(self) -> None:
         settings = [
@@ -523,6 +525,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             admission_cooldown_ms=2000,
             admission_min_cached_percent=75,
             admission_tracking_limit=self._ADMISSION_TRACKING_LIMIT,
+            admission_work_rank_metric="prompt_tokens_minus_last_native_match",
+            admission_work_rank_tiebreaker="pending_since_then_ordinal",
         )
 
     _ADMISSION_TRACKING_LIMIT = 128
@@ -602,6 +606,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         if wait is None or wait.request is not req or wait.version != req.py_execution_version:
             return
         self._revision_metrics["admission_match_observations"] += 1
+        # This historical match can be evicted before admission. It estimates
+        # prompt work for ordering only and grants no capacity or reuse credit.
+        wait.remaining_prompt_tokens_hint = max(0, req.prompt_len - cached_tokens)
         # Match evidence is a scheduling hint, never free-page credit. The
         # normal rejected candidate is released before another request runs.
         if req.prompt_len <= 0 or cached_tokens * 4 < req.prompt_len * 3:
@@ -673,7 +680,18 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and (not self._bounded_admission or wait.ticket_seconds < self._ADMISSION_MAX_HOLD)
             ]
             if eligible:
-                self._admission_ticket = min(eligible, key=lambda wait: wait.ordinal)
+                if self._aged_admission_policy == "bounded_work":
+                    self._admission_ticket = min(
+                        eligible,
+                        key=lambda wait: (
+                            wait.remaining_prompt_tokens_hint,
+                            wait.pending_since,
+                            wait.ordinal,
+                        ),
+                    )
+                    self._revision_metrics["admission_work_rank_selections"] += 1
+                else:
+                    self._admission_ticket = min(eligible, key=lambda wait: wait.ordinal)
                 remaining = self._ADMISSION_MAX_HOLD
                 if self._bounded_admission:
                     remaining -= self._admission_ticket.ticket_seconds
